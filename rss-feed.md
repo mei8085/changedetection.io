@@ -186,19 +186,163 @@ for uuid, watch in datastore.data['watching'].items():
 
 ### 4.2 模板系统
 
-RSS 内容使用 Jinja2 模板渲染，模板优先级：
+RSS 内容使用 Jinja2 模板渲染，模板选择逻辑在 `_util.py:71-82` 中定义。
+
+**核心代码（get_rss_template 函数）：**
+
+```python
+def get_rss_template(datastore, watch, rss_content_format, default_html, default_plaintext):
+    """Get the appropriate template for RSS content."""
+    # 优先级 1: 如果 rss_template_type == 'notification_body'，命中即短路返回
+    if datastore.data['settings']['application'].get('rss_template_type') == 'notification_body':
+        return _check_cascading_vars(datastore=datastore, var_name='notification_body', watch=watch)
+
+    # 优先级 2: 仅当优先级 1 不满足时，才判断 rss_template_override
+    override = datastore.data['settings']['application'].get('rss_template_override')
+    if override and override.strip():
+        return override
+
+    # 优先级 3: 以上都不满足时，根据 rss_content_format 使用默认模板
+    elif 'text' in rss_content_format:
+        return default_plaintext
+    else:
+        return default_html
+```
+
+---
+
+#### 模板选择优先级与条件分支（从高到低）
 
 ```
-1. 自定义覆盖模板（rss_template_override）
-2. 通知正文模板（rss_template_type = 'notification_body'）
-   → 使用 _check_cascading_vars 级联查找：
-     - Watch 级别 → Tag 级别 → 全局级别
-3. 默认模板（根据 rss_content_format）
-   - HTML 默认: RSS_TEMPLATE_HTML_DEFAULT
-   - 纯文本默认: RSS_TEMPLATE_PLAINTEXT_DEFAULT
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 优先级 1: rss_template_type == 'notification_body'  [短路返回]          │
+│   条件: application.rss_template_type 的值等于字符串 'notification_body' │
+│   命中则: 立即调用 _check_cascading_vars 获取模板并 return，不再继续     │
+│                                                                         │
+│   └─→ _check_cascading_vars 级联查找（notification_service.py:17-54）:   │
+│       ├─ Watch 级别: watch.get('notification_body')                     │
+│       ├─ Tag 级别: tag.get('notification_body')（第一个匹配）           │
+│       └─ 全局级别: datastore['settings']['application']['notification_body'] │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 优先级 2: rss_template_override [仅优先级 1 不满足时才判断]              │
+│   条件: application.rss_template_type 不等于 'notification_body'，且     │
+│         application.rss_template_override 存在且非空                     │
+│   命中则: 直接 return override 字符串，不再继续                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 优先级 3: 默认模板 [以上都不满足时]                                      │
+│   条件: application.rss_template_type 不等于 'notification_body'，且     │
+│         application.rss_template_override 不存在或为空                   │
+│   命中则: 根据 application.rss_content_format 选择默认模板               │
+│       ├─ 包含 'text' → RSS_TEMPLATE_PLAINTEXT_DEFAULT                   │
+│       └─ 否则 → RSS_TEMPLATE_HTML_DEFAULT                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**默认模板定义**（__init__.py:23-27）：
+---
+
+#### 条件分支依据说明
+
+**1. 优先级 1 短路返回的依据（_util.py:73-74）：**
+
+```python
+if datastore.data['settings']['application'].get('rss_template_type') == 'notification_body':
+    return _check_cascading_vars(...)  # 直接 return，函数在此结束
+```
+
+- **行为**: 函数第一条 `if` 语句直接 `return`，命中后不会执行后续任何代码
+- **效果**: 即使同时设置了 `rss_template_override`，只要 `rss_template_type == 'notification_body'`，`override` 就会被完全忽略
+
+**2. 优先级 2 仅在优先级 1 不满足时判断的依据（_util.py:76-78）：**
+
+```python
+override = datastore.data['settings']['application'].get('rss_template_override')
+if override and override.strip():
+    return override
+```
+
+- **行为**: 这是 `if ... return ...` 之后的第二段代码
+- **效果**: 只有当优先级 1 的 `if` 条件不成立时，代码才会执行到这里
+
+**3. 优先级 3 的依据（_util.py:79-82）：**
+
+```python
+elif 'text' in rss_content_format:
+    return default_plaintext
+else:
+    return default_html
+```
+
+- **行为**: 这是 `if ... return ...` 之后的 `elif/else` 分支
+- **效果**: 只有当前面两个优先级都不满足时，才会使用默认模板
+
+**4. `rss_template_type` 其他值的处理（model/App.py:64）：**
+
+```python
+'rss_template_type': 'system_default',  # 默认值
+```
+
+- **默认值**: `'system_default'`
+- **行为**: 当 `rss_template_type` 为 `'system_default'` 或其他不等于 `'notification_body'` 的值时，优先级 1 条件不成立，继续判断优先级 2 和 3
+
+---
+
+#### 级联优先级详解（_check_cascading_vars，notification_service.py:17-54）
+
+当命中优先级 1 时，`_check_cascading_vars` 内部还会进行三级级联查找：
+
+```python
+def _check_cascading_vars(datastore, var_name, watch):
+    """
+    Check notification variables in cascading priority:
+    Individual watch settings > Tag settings > Global settings
+    """
+    # 第 1 级: Watch 级别
+    v = watch.get(var_name)
+    if v and not watch.get('notification_muted'):
+        return v
+
+    # 第 2 级: Tag 级别（按顺序查找，第一个匹配的返回）
+    tags = datastore.get_all_tags_for_watch(uuid=watch.get('uuid'))
+    if tags:
+        for tag_uuid, tag in tags.items():
+            v = tag.get(var_name)
+            if v and not tag.get('notification_muted'):
+                return v
+
+    # 第 3 级: 全局级别
+    if datastore.data['settings']['application'].get(var_name):
+        return datastore.data['settings']['application'].get(var_name)
+
+    # 默认值
+    if var_name == 'notification_body':
+        return default_notification_body
+    return None
+```
+
+---
+
+#### 测试验证（test_rss_single_watch_follow_notification_body）
+
+测试验证了当 `rss_template_type == 'notification_body'` 时，级联优先级为 **Watch 级别 > Tag 级别 > 全局级别**：
+
+```python
+# 步骤 1: 设置全局 notification_body，rss_template_type = 'notification_body'
+"application-notification_body": 'Boo yeah hello from main settings'
+"application-rss_template_type": 'notification_body'
+# 结果: 使用全局模板
+
+# 步骤 2: 设置 Tag 级别 notification_body
+data={"name": "rss-custom", "notification_body": 'Hello from the group/tag level'}
+# 结果: Tag 级覆盖全局级
+
+# 步骤 3: 设置 Watch 级别 notification_body
+data={"notification_body": "RSS body set from watch level"}
+# 结果: Watch 级覆盖 Tag 级
+```
+
+---
+
+#### 默认模板定义（__init__.py:23-27）
 
 ```python
 RSS_TEMPLATE_PLAINTEXT_DEFAULT = "<pre>{{watch_label}} had a change.\n\n{{diff}}\n</pre>"
@@ -375,8 +519,8 @@ class FormattableDiff(str):
 
 ### 7.1 数据源汇总
 - 来自 `datastore.data['watching']` 中的所有 Watch 对象
-- 按 `last_changed` 排序（主 Feed）
-- 支持按标签过滤
+- 按 `last_changed` 升序排序（主 Feed）
+- 支持按标签过滤（URL 参数 `tag`）
 
 ### 7.2 过滤机制
 - **静音过滤**: 可配置 `rss_hide_muted_watches`
@@ -385,11 +529,22 @@ class FormattableDiff(str):
 - **未查看**: 主 Feed 和标签 Feed 只包含未查看的变更
 
 ### 7.3 排序方式
-- **主 Feed**: `last_changed` 升序（旧的在前）
-- **单 Watch Feed**: 按 `pubDate` 由 feedgen 排序
-- **标签 Feed**: 无显式排序（已知问题）
+- **主 Feed**: 先按 `last_changed` 升序排序，再按排序顺序依次添加，最终输出 Watch 级别按 `last_changed` 升序（最旧的 Watch 在前）
+- **单 Watch Feed**: 从最旧的 diff 开始倒序遍历添加，代码注释 + 测试验证最终**最新的变更在前**
+- **标签 Feed**: 无显式排序（已知问题，代码有 TODO 注释）
 
-### 7.4 内容一致性保障
+### 7.4 模板选择逻辑
+优先级从高到低：
+
+| 优先级 | 条件 | 行为 |
+|--------|------|------|
+| 1 | `rss_template_type == 'notification_body'` | 调用 `_check_cascading_vars` 级联查找：**Watch 级别 > Tag 级别 > 全局级别** |
+| 2 | `rss_template_override` 存在且非空 | 直接使用 override 模板 |
+| 3 | 以上都不满足 | 根据 `rss_content_format` 选择默认模板 |
+
+**测试依据**: `test_rss_single_watch_follow_notification_body` 验证了 Watch > Tag > Global 的级联优先级。
+
+### 7.5 内容一致性保障
 1. **共享 diff 引擎**: `render_diff()` 是唯一的 diff 生成源
 2. **Placemarker 机制**: 先生成带占位符的文本，再按输出格式转换
 3. **统一快照读取**: 使用相同的 `get_history_snapshot()` 方法
