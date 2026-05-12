@@ -77,29 +77,79 @@ for uuid, watch in datastore.data['watching'].items():
 
 ## 3. 排序逻辑
 
-### 3.1 主 Feed 排序（main_feed.py:61）
+### 3.1 主 Feed 排序（main_feed.py:61, 69-100）
+
+**代码流程：**
 
 ```python
+# 步骤 1: 按 last_changed 升序排序
 sorted_watches.sort(key=lambda x: x.last_changed, reverse=False)
+
+# 步骤 2: 按排序后的顺序依次添加 entry
+for watch in sorted_watches:  # 从 last_changed 最小的（最旧）开始遍历
+    if not watch.viewed:
+        fe = fg.add_entry()
+        # entry 的 pubDate 由 timestamp_to（dates[-1]）决定
+        fe.pubDate(dt)
 ```
 
-- **排序键**: `watch.last_changed`（最后一次变更的时间戳）
-- **方向**: 升序（`reverse=False`），即**最旧的变更在前**
-- **注意**: 这是 Watch 级别的排序，不是单 Watch 内多次变更的排序
+**实际输出顺序：**
+
+| 环节 | 行为 |
+|------|------|
+| 排序阶段 | `sorted_watches` 按 `last_changed` **升序**排列（最旧的在前） |
+| 添加阶段 | 按排序后的顺序依次调用 `fg.add_entry()`（先加最旧的 Watch，再加较新的） |
+| 最终 XML 输出 | 与添加顺序一致，即 **Watch 级别按 last_changed 升序（最旧的 Watch 在前）** |
+
+**关键说明：**
+- 主 Feed 每个 Watch 只贡献 **1 个 entry**（最新一次未查看的变更）
+- 排序是 **Watch 级别** 的，不是单 Watch 内多次变更的排序
+- `reverse=False` 表示升序，即 `last_changed` 值较小的（较早变更的 Watch）排在前面
+
+---
 
 ### 3.2 单 Watch Feed 排序（single_watch.py:77-109）
 
+**代码流程：**
+
 ```python
-# 遍历顺序（倒序创建，因为 feedgen 会反转）
-for i in range(num_diffs - 1, -1, -1):
-    # 从最旧到最新依次添加
-    # feedgen 最终会按 pubDate 排序
-    fe = fg.add_entry()
-    fe.pubDate(dt)  # 使用 timestamp_to 设置
+# dates 是按时间顺序存储的，dates[-1] 是最新快照
+# num_diffs = 可用的 diff 数量
+
+# 注释明确说明：倒序添加，因为 feedgen 会反转
+# "Add entries in reverse order because feedgen reverses them"
+# "This way, the newest change appears first in the final RSS"
+for i in range(num_diffs - 1, -1, -1):  # 从 num_diffs-1 递减到 0
+    # i=num_diffs-1 → 最旧的 diff
+    # i=0 → 最新的 diff (dates[-2] vs dates[-1])
+    date_index_to = -(i + 1)
+    timestamp_to = dates[date_index_to]
+    
+    fe = fg.add_entry()  # 先加最旧的 diff，后加最新的 diff
+    fe.pubDate(dt)  # pubDate 与 timestamp_to 对应
 ```
 
-- 单 Watch 内的多次变更按时间戳排序
-- **最终 RSS 结果**: 由 feedgen 根据 `pubDate` 决定，通常最新的在前
+**实际输出顺序（代码注释 + 测试验证）：**
+
+| 环节 | 行为 | 结果 |
+|------|------|------|
+| 遍历顺序 | `i` 从 `num_diffs-1` 递减到 `0` | 从**最旧**的 diff 开始，到**最新**的 diff 结束 |
+| 添加顺序 | 按遍历顺序调用 `fg.add_entry()` | 先添加**最旧**的 diff，后添加**最新**的 diff |
+| 最终 XML | 代码注释 + `test_rss_single_watch_order` 验证 | **最新的变更在最前面** |
+
+**测试验证（test_rss_single_watch_order）：**
+
+```python
+# 测试创建了 Version 1 → 2 → 3 → 4 → 5 共 5 个版本（4 个 diff）
+# 验证：
+assert "5 content" in descriptions[0]  # 第一个 item 是最新的（Version 5）
+assert "4 content" in descriptions[1]  # 第二个 item 是 Version 4
+assert "3 content" in descriptions[2]  # 第三个 item 是 Version 3
+```
+
+**结论：单 Watch Feed 最终输出顺序是最新的变更在前。**
+
+---
 
 ### 3.3 标签 Feed 排序（tag.py:47-91）
 
