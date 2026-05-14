@@ -46,29 +46,33 @@ Restock Processor 是一个专门用于监控电商网站商品库存状态和�
 | `all_changes` | 任何库存状态变化都触发 |
 | `off` | 关闭库存检测 |
 
-#### 2.2.3 配置继承链
+#### 2.2.3 配置覆盖优先级（重要）
 
-配置可以从多个来源获取，优先级从高到低：
+配置加载采用**后加载覆盖**策略，优先级从高到低：
 
-1. **Watch 自身配置** (watch 级别的 restock_diff.json)
-2. **Tag 覆盖配置** (watch 关联的 tag 中 `overrides_watch=True`)
+1. **Tag 覆盖配置** (watch 关联的 tag 中 `overrides_watch=True`)
+2. **Watch 自身配置** (watch 级别的 restock_diff.json)
 3. **系统默认配置**
 
 ```python
-# processor.py:454-467
+# processor.py:455-467
+# 步骤 1: 先加载 watch 自身配置
 _extra_config = self.get_extra_watch_config('restock_diff.json')
 restock_settings = _extra_config.get('restock_diff') or {
     'follow_price_changes': True,
     'in_stock_processing': 'in_stock_only',
 }
 
-# Check if any tags have override enabled
+# 步骤 2: 遍历 tags，如果找到启用了 overrides_watch 的 tag，直接覆盖 restock_settings
 for tag_uuid in watch.get('tags'):
     tag = self.datastore.data['settings']['application']['tags'].get(tag_uuid, {})
     if tag.get('overrides_watch'):
-        restock_settings = tag.get('processor_config_restock_diff') or {}
+        restock_settings = tag.get('processor_config_restock_diff') or {}  # ← 直接覆盖！
+        logger.info(f"Watch {watch.get('uuid')} - Tag '{tag.get('title')}' selected for restock settings override")
         break
 ```
+
+**关键点**: Tag 配置是在 Watch 配置之后加载的，会**完全替换**之前的 `restock_settings`，而不是合并。
 
 ## 三、判定规则
 
@@ -137,60 +141,139 @@ if self.fetcher.instock_data and self.fetcher.instock_data != 'Possibly in stock
 2. **元数据判定** → 作为基础判定
 3. **浏览器脚本判定可能有货** → 补充判定
 
-### 3.2 价格变化判定
+### 3.2 价格阈值的反向覆盖机制（核心）
 
-### 3.2.1 基础价格比较
+**这是最容易被误解的逻辑。价格阈值不是"补充条件"，而是"否决条件"。**
 
-```python
-# processor.py:618-625
-if restock_settings.get('follow_price_changes') and watch.get('restock') and update_obj.get('restock') and update_obj['restock'].get('price'):
-    price = float(update_obj['restock'].get('price'))
-    if watch['restock'].get('original_price'):
-        previous_price = float(watch['restock'].get('original_price'))
-        if price != previous_price:
-            changed_detected = True
+#### 3.2.1 执行顺序和覆盖关系
+
+代码执行顺序 (`processor.py:605-654`):
+
+```
+步骤 1: 初始化 changed_detected = False
+
+步骤 2: 库存变化判定 (609-616)
+        条件: watch['restock']['in_stock'] != update_obj['restock']['in_stock']
+        → 如果满足: changed_detected = True
+
+步骤 3: 价格变化判定 (618-625)
+        条件: follow_price_changes=True 且 price != original_price
+        → 如果满足: changed_detected = True
+
+步骤 4: 价格区间否决 (637-641)  ← 反向覆盖！
+        条件: price 在 [min, max] 区间内
+        → 如果满足: changed_detected = False (强制覆盖)
+
+步骤 5: 百分比阈值否决 (646-652)  ← 反向覆盖！
+        条件: changed_detected=True 且 变化百分比 ≤ 阈值
+        → 如果满足: changed_detected = False (强制覆盖)
 ```
 
-### 3.2.2 价格区间过滤
+#### 3.2.2 关键理解
 
-使用 `is_between()` 函数判断价格是否在允许区间内：
+| 阶段 | 代码行 | 对 changed_detected 的操作 | 影响范围 |
+|-----|-------|---------------------------|---------|
+| 库存变化判定 | 609-616 | 设为 True (条件满足时) | 仅库存变化 |
+| 价格变化判定 | 618-625 | 设为 True (条件满足时) | 仅价格变化 |
+| 价格区间否决 | 637-641 | **强制设为 False** | **库存变化 + 价格变化** |
+| 百分比阈值否决 | 646-652 | **强制设为 False** | **前面已判定的变更** |
+
+**重要结论**: 价格阈值的否决是**无条件覆盖**的，即使已经因为库存变化设置了 `changed_detected=True`，只要价格在区间内，就会被强制改为 `False`。
+
+#### 3.2.3 价格区间否决逻辑
+
+```python
+# processor.py:637-641
+if min_limit or max_limit:
+    if is_between(number=price, lower=min_limit, upper=max_limit):
+        # Price was between min/max limit, so there was nothing todo in any case
+        logger.trace(f"{watch.get('uuid')} {price} is between {min_limit} and {max_limit}, nothing to check, forcing changed_detected = False (was {changed_detected})")
+        changed_detected = False  # ← 不管之前是什么，直接设为 False
+```
+
+**`is_between()` 函数**:
 
 ```python
 # processor.py:388-400
 def is_between(number, lower=None, upper=None):
+    """
+    检查数字是否在区间内
+    - lower=None 表示无下限
+    - upper=None 表示无上限
+    - 两端都是闭区间 (包含边界值)
+    """
     return (lower is None or lower <= number) and (upper is None or number <= upper)
 ```
 
-**区间规则** (`processor.py:627-641`):
-- 当价格在 `[min, max]` 区间内时 → **不触发**变更
-- 当价格超出区间时 → 可能触发变更
+**区间判定示例** (设置 `price_change_min=900`, `price_change_max=1100`):
 
-**示例**:
-- 设置 `price_change_min=900`, `price_change_max=1100`
-- 价格变为 1000 → 在区间内，不触发
-- 价格变为 850 → 低于下限，触发
-- 价格变为 1200 → 高于上限，触发
+| 当前价格 | 判定结果 | 说明 |
+|---------|---------|------|
+| 1000 | `is_between=True` → `changed_detected=False` | 在区间内，否决变更 |
+| 850 | `is_between=False` → 不改变 | 低于下限，不否决 |
+| 1200 | `is_between=False` → 不改变 | 高于上限，不否决 |
+| 900 | `is_between=True` → `changed_detected=False` | 等于下限，属于区间内 |
+| 1100 | `is_between=True` → `changed_detected=False` | 等于上限，属于区间内 |
 
-### 3.2.3 价格变化百分比阈值
+#### 3.2.4 百分比阈值否决逻辑
 
 ```python
-# processor.py:646-654
+# processor.py:646-652
 if watch['restock'].get('original_price') and changed_detected and restock_settings.get('price_change_threshold_percent'):
     previous_price = float(watch['restock'].get('original_price'))
     pc = float(restock_settings.get('price_change_threshold_percent'))
     change = abs((price - previous_price) / previous_price * 100)
     if change and change <= pc:
-        # 变化幅度未超过阈值，不触发
-        changed_detected = False
+        logger.debug(f"{watch.get('uuid')} Override change-detected to FALSE because % threshold ({pc}%) was {change:.3f}%")
+        changed_detected = False  # ← 强制否决
 ```
 
-**示例**:
-- 原价：$1,000
-- 阈值：2%
-- 现价：$1,015 → 变化 1.5% ≤ 2% → **不触发**
-- 现价：$1,030 → 变化 3% > 2% → **触发**
+**百分比判定示例** (原价 = 1000, 阈值 = 5%):
 
-### 3.3 多价格检测规则
+| 当前价格 | 变化量 | 变化百分比 | 判定结果 |
+|---------|--------|-----------|---------|
+| 1030 | +30 | 3.0% | ≤ 5% → `changed_detected=False` |
+| 960 | -40 | 4.0% | ≤ 5% → `changed_detected=False` |
+| 1060 | +60 | 6.0% | > 5% → 保持原值 |
+| 940 | -60 | 6.0% | > 5% → 保持原值 |
+
+### 3.3 完整触发决策表
+
+让我们用具体场景说明价格阈值如何**反向覆盖**库存变更：
+
+#### 场景 1: 缺货 → 有货 + 价格在区间内
+
+配置: `in_stock_processing=in_stock_only`, `price_change_min=900`, `price_change_max=1100`
+
+| 前状态 | 前价格 | 后状态 | 后价格 | 执行过程 | 最终结果 |
+|-------|--------|-------|--------|---------|---------|
+| 缺货 | 1000 | 有货 | 1050 | 1. 库存变化 → changed_detected=True<br>2. 价格未变 → 无影响<br>3. 价格 1050 在 [900, 1100] 区间内 → **changed_detected=False** | **False** (不触发) |
+
+**结论**: 即使商品从缺货变为有货，只要价格仍在区间内，就**不会触发通知**。这意味着价格区间的优先级高于库存变化。
+
+#### 场景 2: 缺货 → 有货 + 价格超出区间
+
+配置: 同上
+
+| 前状态 | 前价格 | 后状态 | 后价格 | 执行过程 | 最终结果 |
+|-------|--------|-------|--------|---------|---------|
+| 缺货 | 1000 | 有货 | 850 | 1. 库存变化 → changed_detected=True<br>2. 价格变化 → changed_detected=True<br>3. 价格 850 不在 [900, 1100] 区间内 → 无否决<br>4. 百分比 15% > 阈值(默认无) → 无否决 | **True** (触发) |
+
+#### 场景 3: 有货 → 有货 + 价格变化在区间内
+
+配置: `follow_price_changes=True`, 阈值 = 5%
+
+| 前状态 | 前价格 | 后状态 | 后价格 | 执行过程 | 最终结果 |
+|-------|--------|-------|--------|---------|---------|
+| 有货 | 1000 | 有货 | 1030 | 1. 库存未变 → 无影响<br>2. 价格变化 3% → changed_detected=True<br>3. 无区间限制 → 无否决<br>4. 变化 3% ≤ 5% → **changed_detected=False** | **False** (不触发) |
+
+#### 场景 4: 有货 → 有货 + 价格变化超出阈值
+
+| 前状态 | 前价格 | 后状态 | 后价格 | 执行过程 | 最终结果 |
+|-------|--------|-------|--------|---------|---------|
+| 有货 | 1000 | 有货 | 1080 | 1. 库存未变 → 无影响<br>2. 价格变化 8% → changed_detected=True<br>3. 无区间限制 → 无否决<br>4. 变化 8% > 5% → 无否决 | **True** (触发) |
+
+### 3.4 多价格检测规则
 
 Restock 处理器专为**单个商品页面**设计，不支持多商品页面：
 
@@ -296,7 +379,7 @@ if not (has_price and has_availability):
 
 ## 五、决策流程
 
-### 5.1 完整流程图
+### 5.1 完整流程图（含价格否决机制）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -316,9 +399,9 @@ if not (has_price and has_availability):
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2. 加载配置                                                         │
 │     ──────────────────────────────────────────────────────────      │
-│     • 读取 restock_diff.json                                         │
-│     • 检查是否有 tag override                                        │
-│     • 确定最终的 restock_settings                                    │
+│     • 读取 restock_diff.json (Watch 级别)                            │
+│     • 遍历 tags，若 tag.overrides_watch=True → 用 tag 配置覆盖       │
+│     • Tag 配置 > Watch 配置 > 默认值                                 │
 └─────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
@@ -380,24 +463,61 @@ if not (has_price and has_availability):
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  5. 变更判定 (是否需要通知)                                           │
+│  5. 变更判定 (核心: 两步设置 + 两步否决)                               │
 │     ──────────────────────────────────────────────────────────      │
+│                                                                      │
+│     初始化: changed_detected = False                                 │
+│                                                                      │
 │     ┌──────────────────────────────────────────────────────┐        │
-│     │ 5.1 库存状态变更检查                                    │        │
-│     │     • in_stock_only: 仅 缺货→有货 触发                 │        │
-│     │     • all_changes: 任何状态变更都触发                   │        │
-│     │     • off: 不检查                                      │        │
+│     │ 5.1 库存变化 → 设置 True                               │        │
+│     │ ──────────────────────────────────────────────────   │        │
+│     │ 条件:                                                  │        │
+│     │   • 前后 in_stock 不同                                  │        │
+│     │   • (in_stock_only 且 当前为 True) OR (all_changes)    │        │
+│     │                                                        │        │
+│     │ 结果: changed_detected = True (条件满足时)              │        │
 │     └──────────────────────────────────────────────────────┘        │
                                    │                                  │
                                    ▼                                  │
 │     ┌──────────────────────────────────────────────────────┐        │
-│     │ 5.2 价格变更检查 (如启用 follow_price_changes)          │        │
-│     │     • 当前价格 ≠ 原始价格 → 标记可能变更                │        │
-│     │     • 检查价格区间 [min, max] → 在区间内则取消变更      │        │
-│     │     • 检查变化百分比阈值 → 未超阈值则取消变更            │        │
+│     │ 5.2 价格变化 → 设置 True                               │        │
+│     │ ──────────────────────────────────────────────────   │        │
+│     │ 条件:                                                  │        │
+│     │   • follow_price_changes = True                        │        │
+│     │   • price != original_price                            │        │
+│     │                                                        │        │
+│     │ 结果: changed_detected = True (条件满足时)              │        │
+│     └──────────────────────────────────────────────────────┘        │
+                                   │                                  │
+                                   ▼                                  │
+│     ┌──────────────────────────────────────────────────────┐        │
+│     │ 5.3 价格区间 → 强制否决 (设为 False)                    │        │
+│     │ ──────────────────────────────────────────────────   │        │
+│     │ ⚠️  反向覆盖！无论前面是什么结果                       │        │
+│     │                                                        │        │
+│     │ 条件:                                                  │        │
+│     │   • min_limit 或 max_limit 已设置                       │        │
+│     │   • price ∈ [min, max] (闭区间)                         │        │
+│     │                                                        │        │
+│     │ 结果: changed_detected = False (强制)                   │        │
+│     │ 影响: 库存变化 和 价格变化 都被否决                       │        │
+│     └──────────────────────────────────────────────────────┘        │
+                                   │                                  │
+                                   ▼                                  │
+│     ┌──────────────────────────────────────────────────────┐        │
+│     │ 5.4 百分比阈值 → 强制否决 (设为 False)                  │        │
+│     │ ──────────────────────────────────────────────────   │        │
+│     │ ⚠️  反向覆盖！仅当 changed_detected=True 时检查         │        │
+│     │                                                        │        │
+│     │ 条件:                                                  │        │
+│     │   • changed_detected = True (来自前两步)                │        │
+│     │   • threshold_percent 已设置                            │        │
+│     │   • |变化百分比| ≤ 阈值                                 │        │
+│     │                                                        │        │
+│     │ 结果: changed_detected = False (强制)                   │        │
 │     └──────────────────────────────────────────────────────┘        │
 │                                                                      │
-│     changed_detected = (库存变更符合条件) OR (价格变更符合条件)        │
+│     最终: changed_detected 经过所有否决后的值                         │
 └─────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
@@ -479,7 +599,7 @@ def run_changedetection(self, watch, force_reprocess=False):
 │ run_changedetection() 核心判定逻辑        │
 │  → 提取元数据                              │
 │  → 判定库存状态                            │
-│  → 判定价格变化                            │
+│  → 判定价格变化 + 价格阈值否决              │
 │  → 生成 changed_detected                  │
 └──────────────────┬───────────────────────┘
                    │
@@ -495,29 +615,26 @@ def run_changedetection(self, watch, force_reprocess=False):
 └──────────────────────────────────────────┘
 ```
 
-### 6.2 触发条件
+### 6.2 触发条件（修正版）
 
-#### 6.2.1 库存状态变更触发
+#### 6.2.1 库存状态变更触发（可能被价格阈值否决）
 
-| 配置 | 前状态 | 后状态 | 是否触发 |
-|-----|--------|--------|---------|
-| `in_stock_only` | 缺货 | 有货 | **是** |
-| `in_stock_only` | 有货 | 缺货 | 否 |
-| `in_stock_only` | 有货 | 有货 | 否 |
-| `in_stock_only` | 缺货 | 缺货 | 否 |
-| `all_changes` | 缺货 | 有货 | **是** |
-| `all_changes` | 有货 | 缺货 | **是** |
-| `all_changes` | 有货 | 有货 | 否 |
-| `all_changes` | 缺货 | 缺货 | 否 |
+| 配置 | 前状态 | 后状态 | 价格是否在区间 | 是否触发 |
+|-----|--------|--------|---------------|---------|
+| `in_stock_only`, min=900, max=1100 | 缺货 | 有货 | 是 (1000) | **否** (被价格区间否决) |
+| `in_stock_only`, min=900, max=1100 | 缺货 | 有货 | 否 (850) | **是** |
+| `in_stock_only` | 有货 | 缺货 | - | 否 |
+| `all_changes`, min=900, max=1100 | 有货 | 缺货 | 是 (1000) | **否** (被价格区间否决) |
+| `all_changes`, min=900, max=1100 | 有货 | 缺货 | 否 (1200) | **是** |
 
-#### 6.2.2 价格变更触发 (需启用 `follow_price_changes`)
+#### 6.2.2 价格变更触发（可能被阈值否决）
 
 | 条件 | 是否触发 |
 |-----|---------|
-| 价格 ≠ 原始价格，且超出区间 [min, max] | **是** |
-| 价格 ≠ 原始价格，但在区间内 | 否 |
-| 价格 ≠ 原始价格，但变化百分比 ≤ 阈值 | 否 |
-| 价格 ≠ 原始价格，且变化百分比 > 阈值 | **是** |
+| 价格 ≠ 原始价格，且超出区间 [min, max]，且变化 > 阈值 | **是** |
+| 价格 ≠ 原始价格，但在区间内 | 否 (被区间否决) |
+| 价格 ≠ 原始价格，超出区间，但变化 ≤ 阈值 | 否 (被百分比否决) |
+| 价格 = 原始价格 | 否 |
 
 ### 6.3 跳过条件
 
@@ -645,9 +762,9 @@ except ProcessorException as e:
 
 ## 九、配置示例
 
-### 9.1 典型配置
+### 9.1 典型配置（结合反向覆盖机制）
 
-#### 场景 1: 仅监控补货
+#### 场景 1: 仅监控补货（不关心价格）
 
 ```python
 {
@@ -659,44 +776,72 @@ except ProcessorException as e:
 }
 ```
 
-**行为**: 商品从缺货变为有货时通知，不关心价格。
+**行为**:
+- 商品从缺货变为有货时 → **触发通知**（无价格阈值否决）
+- 不关心价格
 
-#### 场景 2: 补货 + 降价监控
+#### 场景 2: 补货 + 降价到目标价以下
 
 ```python
 {
     'follow_price_changes': True,
     'in_stock_processing': 'in_stock_only',
-    'price_change_max': 900.0,  # 价格降到 900 以下时通知
-    'price_change_threshold_percent': 5
+    'price_change_max': 900.0,  # 只有价格降到 900 以下才会"不在区间内"
+    'price_change_threshold_percent': None
 }
 ```
 
-**行为**:
-- 补货时通知
-- 价格超过 5% 的下降且低于 900 时通知
+**关键理解**:
+- `price_change_max=900` 表示区间是 `(-∞, 900]`
+- 价格 ≤ 900 时 → 在区间内 → **否决变更**（即使补货也不触发）
+- 价格 > 900 时 → 不在区间内 → 不否决
 
-#### 场景 3: 全状态监控
+**这意味着：**
+- 商品缺货时价格是 950，补货后价格降到 850 → 不在区间内 → **触发**
+- 商品缺货时价格是 1000，补货后价格还是 950 → 在区间内 → **不触发**（虽然补货了，但价格没降到阈值以下）
+
+#### 场景 3: 补货通知不受价格影响
+
+```python
+{
+    'follow_price_changes': False,  # 关键：不跟踪价格变化
+    'in_stock_processing': 'in_stock_only',
+    'price_change_min': None,
+    'price_change_max': None,
+    'price_change_threshold_percent': None
+}
+```
+
+**关键点**: 当 `follow_price_changes=False` 时，价格阈值逻辑不会执行（第 3 步的 `if` 条件不满足），所以补货通知不会被价格区间否决。
+
+#### 场景 4: 全状态监控
 
 ```python
 {
     'follow_price_changes': True,
     'in_stock_processing': 'all_changes',
-    'price_change_threshold_percent': 2
+    'price_change_threshold_percent': 2,
+    'price_change_min': None,
+    'price_change_max': None
 }
 ```
 
 **行为**:
-- 任何库存变化都通知 (有货→缺货也通知)
-- 价格变化超过 2% 时通知
+- 库存任何变化 (缺货↔有货) → 可能触发（无价格区间否决）
+- 价格变化 > 2% → 触发
+- 价格变化 ≤ 2% → 被百分比阈值否决 → 不触发
 
 ## 十、关键代码位置
 
 | 功能 | 文件位置 | 行号 |
 |-----|---------|------|
 | 主判定函数 | `restock_diff/processor.py` | 403-659 |
+| 配置加载 + Tag 覆盖 | `restock_diff/processor.py` | 455-467 |
 | 库存状态判定 | `restock_diff/processor.py` | 553-562 |
-| 价格变化判定 | `restock_diff/processor.py` | 618-654 |
+| 价格变化判定（设置 True） | `restock_diff/processor.py` | 609-625 |
+| 价格区间否决（强制 False） | `restock_diff/processor.py` | 637-641 |
+| 百分比阈值否决（强制 False） | `restock_diff/processor.py` | 646-652 |
+| is_between 区间判定函数 | `restock_diff/processor.py` | 388-400 |
 | 纯 Python 提取器 | `restock_diff/pure_python_extractor.py` | 1-289 |
 | 元数据提取 (extruct) | `restock_diff/processor.py` | 315-385 |
 | 子进程内存管理 | `restock_diff/processor.py` | 249-310 |
@@ -707,6 +852,10 @@ except ProcessorException as e:
 
 ---
 
-**文档版本**: 1.0
+**文档版本**: 2.0 (修正两处关键逻辑)
 **基于代码版本**: 当前仓库版本
-**生成日期**: 2026-05-14
+**更新日期**: 2026-05-14
+
+**修正记录**:
+1. 配置覆盖优先级：Tag(overrides_watch) > Watch 自身配置 > 默认值（后加载覆盖前加载）
+2. 价格阈值反向覆盖：价格区间和百分比阈值是"否决"逻辑，会强制将 `changed_detected` 设为 `False`，即使库存变化已经设置为 `True`
