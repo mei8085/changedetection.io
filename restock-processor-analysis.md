@@ -279,7 +279,7 @@ def _deduplicate_prices(data):
 ### 7.3 系统 Prompt 关键点
 
 - **价格提取规则**: 忽略导航栏购物车价格、推荐商品价格、价格区间
-- **库存判断**: 只看产品区域的 "Add to cart" 等按钮，忽略导航栏（仅作为结构化数据的补充和负向覆盖）
+- **库存判断**: 只看产品区域的 "Add to cart" 等按钮，忽略导航栏，仅在内置提取缺项时补充 price/availability
 - **输出格式**: 严格的 JSON 格式 `{price, currency, availability}`
 - **分类网站特殊处理**: eBay/分类网站有价格 + 卖家联系方式 = 有库存
 
