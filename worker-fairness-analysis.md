@@ -1,134 +1,98 @@
-# 队列 Worker 调度公平性分析报告（证据化校正版）
+# 队列 Worker 调度公平性分析报告（证据化校正 v2.0）
 
 ## 文档信息
 
 | 项目 | 内容 |
 |------|------|
 | 分析日期 | 2026-05-15 |
-| 代码版本 | 当前开发分支 |
-| 分析范围 | 队列实现、优先级设置、调度逻辑、重试机制、入口点去重 |
-| 验证方式 | 代码静态分析、边界条件计算、数学推导、逐行证据核对 |
+| 版本 | v2.0（证据化校正版） |
+| 分析范围 | 队列实现、优先级设置、调度逻辑、重试机制、所有入口点去重 |
+| 验证方式 | 代码静态分析、逐行证据核对、边界条件计算、数学推导 |
 
 ---
 
-## 1. 队列实现位置核对（可验证证据）
+## 1. 所有入口点去重核对表（v2.0 校正版）
 
-### 1.1 核心队列类
+### 1.1 入口点分类总览（共 16 个入口点）
 
-**文件位置**: `changedetectionio/queue_handlers.py`
+| 分类 | 数量 | 占比 |
+|------|------|------|
+| ✅ **有去重**（queued + running 检查） | 6 | 37.5% |
+| ❌ **无去重**（直接排队，无检查） | 8 | 50.0% |
+| 🔄 **新UUID天然不重复** | 2 | 12.5% |
 
-**队列类型**: `RecheckPriorityQueue`
-
-**实现细节**:
-```python
-class RecheckPriorityQueue:
-    def __init__(self, maxsize: int = 0):
-        # 使用 heapq 实现的最小堆
-        self._priority_items = []
-        self._lock = threading.RLock()
-        # 通知队列，用于唤醒等待的 worker
-        self._notification_queue = queue.Queue(maxsize=...)
-```
-
-**证据位置**: `queue_handlers.py:15-62`
+**关键校正**: 
+- API/Watch 的 `recheck_all` 批量路径 **确实有去重**（之前版本遗漏）
+- 新增 "新UUID天然不重复" 分类，避免过度统计
 
 ---
 
-### 1.2 优先级项定义
+### 1.2 ✅ 有去重的入口点（queued + running 双重检查）
 
-**文件位置**: `changedetectionio/queuedWatchMetaData.py`
-
-```python
-@dataclass(order=True)
-class PrioritizedItem:
-    priority: int          # 用于排序，越小优先级越高
-    item: Any = field(compare=False)  # 实际数据，不参与比较
-```
-
-**证据位置**: `queuedWatchMetaData.py:7-10`
+| 序号 | 入口点类型 | 文件位置 | 行号 | 去重代码证据 |
+|------|-----------|---------|------|-------------|
+| 1 | 定时调度线程 | `flask_app.py` | 1227 | `if not uuid in running_uuids and uuid not in queued_uuids:` |
+| 2 | UI单个手动触发 | `blueprint/ui/__init__.py` | 273 | `if worker_pool.is_watch_running(uuid) or uuid in update_q.get_queued_uuids():` |
+| 3 | UI批量手动触发 (<20个) | `blueprint/ui/__init__.py` | 299-301 | `if watch_uuid not in queued_uuids and watch_uuid not in running_uuids:` |
+| 4 | UI后台线程批量触发 (>=20个) | `blueprint/ui/__init__.py` | 330 | 同上 |
+| 5 | API批量 recheck_all (<20个) | `api/Watch.py` | 542-550 | `queued_uuids = set(self.update_q.get_queued_uuids())` <br> `running_uuids = set(worker_pool.get_running_uuids())` <br> 然后过滤 |
+| 6 | API批量 recheck_all (>=20个) | `api/Watch.py` | 565-575 | 同样在启动后台线程前捕获 queued_uuids 和 running_uuids |
 
 ---
 
-### 1.3 Worker 池和调度
+### 1.3 ❌ 无去重的入口点（直接排队，无检查）
 
-**文件位置**: `changedetectionio/worker_pool.py`
-
-**关键机制**:
-```python
-# UUID 认领机制 - 防止重复处理
-def claim_uuid_for_processing(uuid, worker_id):
-    with _uuid_processing_lock:
-        if uuid in currently_processing_uuids:
-            return False  # 已被其他 worker 认领
-        currently_processing_uuids[uuid] = worker_id
-        return True
-```
-
-**证据位置**: `worker_pool.py:218-240`
+| 序号 | 入口点类型 | 文件位置 | 行号 | 风险等级 | 证据 |
+|------|-----------|---------|------|---------|------|
+| 1 | UI批量操作(recheck) | `blueprint/ui/__init__.py` | 66 | 🟡 中 | 循环内直接排队，无检查：`worker_pool.queue_item_async_safe(update_q, PrioritizedItem(priority=1, item={'uuid': uuid}))` |
+| 2 | 编辑后保存触发 | `blueprint/ui/edit.py` | 277 | 🟡 中 | 直接排队，无检查：同上 |
+| 3 | Socket.IO实时触发 | `realtime/events.py` | 44 | 🔴 高 | 直接排队，无检查：同上 |
+| 4 | 价格数据跟踪触发 | `blueprint/price_data_follower/__init__.py` | 24 | 🟡 中 | 直接排队，无检查：同上 |
+| 5 | API单个watch触发 | `api/Watch.py` | 81 | 🔴 高 | 直接排队，无检查：同上 |
+| 6 | API标签recheck（所有路径） | `api/Tags.py` | 41-42, 49-50 | 🔴 高 | 直接排队，无检查：同上 |
+| 7 | 启动时批量排队 | `__init__.py` | 437-442, 469-480 | 🟢 低 | 启动时理论上无重复，但代码中无检查 |
+| 8 | Worker重试机制 | `worker.py` | 74 | 🔴 高 | 重试时直接排队，无检查 |
 
 ---
 
-### 1.4 定时调度线程
+### 1.4 🔄 新UUID天然不重复的入口点
 
-**文件位置**: `changedetectionio/flask_app.py`
+这些入口点处理的是**新创建的 watch**，UUID 是全新生成的，理论上不可能出现重复排队，因此去重检查的必要性较低。
 
-**调度逻辑位置**: `flask_app.py:1107-1270`
-
-**定时任务优先级设置**:
-```python
-# 第1249行 - 使用当前时间戳作为优先级
-priority = int(time.time())  # 约 1.7e9 (17亿)
-```
+| 序号 | 入口点类型 | 文件位置 | 行号 | 说明 |
+|------|-----------|---------|------|------|
+| 1 | Clone后触发 | `blueprint/ui/__init__.py` | 257 | 新 UUID 刚生成，不可能在队列中 |
+| 2 | 添加新watch触发 | `blueprint/ui/views.py` | 41 | 新 UUID 刚生成，不可能在队列中 |
 
 ---
 
-## 2. 入口点分层分析：去重核对表
+### 1.5 去重覆盖率修正统计
 
-### 2.1 所有入口点汇总
+| 统计项 | 修正前(v1.0) | 修正后(v2.0) |
+|--------|-------------|-------------|
+| 总入口点数量 | 14 | 16 |
+| 有去重的入口点 | 4 (28.6%) | 6 (37.5%) |
+| 无去重的入口点 | 10 (71.4%) | 8 (50.0%) |
+| 新UUID天然不重复 | - | 2 (12.5%) |
 
-| 入口点类型 | 文件位置 | 行号 | 有 queued 去重 | 有 running 去重 | 备注 |
-|-----------|---------|------|---------------|----------------|------|
-| **定时调度** | `flask_app.py` | 1227 | ✅ 是 | ✅ 是 | `if not uuid in running_uuids and uuid not in queued_uuids:` |
-| **UI单个手动触发** | `blueprint/ui/__init__.py` | 273 | ✅ 是 | ✅ 是 | `if worker_pool.is_watch_running(uuid) or uuid in update_q.get_queued_uuids():` |
-| **UI批量手动触发** | `blueprint/ui/__init__.py` | 300-301 | ✅ 是 | ✅ 是 | `if watch_uuid not in queued_uuids and watch_uuid not in running_uuids:` |
-| **UI后台线程批量触发** | `blueprint/ui/__init__.py` | 330 | ✅ 是 | ✅ 是 | 同上 |
-| **UI批量操作(recheck)** | `blueprint/ui/__init__.py` | 66 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **Clone后触发** | `blueprint/ui/__init__.py` | 257 | ❌ 否 | ❌ 否 | 新UUID，理论上不需要去重 |
-| **编辑后保存触发** | `blueprint/ui/edit.py` | 277 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **添加新watch触发** | `blueprint/ui/views.py` | 41 | ❌ 否 | ❌ 否 | 新UUID，理论上不需要去重 |
-| **Socket.IO实时触发** | `realtime/events.py` | 44 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **价格数据跟踪触发** | `blueprint/price_data_follower/__init__.py` | 24 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **API单个watch触发** | `api/Watch.py` | 81 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **API其他触发点** | `api/Watch.py` | 554, 576 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **标签批量操作触发** | `api/Tags.py` | 42, 50 | ❌ 否 | ❌ 否 | 直接排队无检查 |
-| **启动时批量排队** | `__init__.py` | 441, 475, 537 | ❌ 否 | ❌ 否 | 启动时调用 |
-| **Worker重试机制** | `worker.py` | 76 | ❌ 否 | ❌ 否 | claim_uuid_for_processing 失败后重试 |
+**关键发现**:
+- API 批量 recheck_all 确实有去重，修正了 v1.0 的错误
+- 新增分类后，无去重的比例从 71.4% 下降到 50%
+- 但仍有 8 个高风险入口点完全无去重保护
 
 ---
 
-### 2.2 关键发现：去重机制覆盖率
+## 2. 永久饥饿结论的成立前提复核（v2.0 校正版）
 
-**有去重保护的入口点**: 4/14 (28.6%)
-**无去重保护的入口点**: 10/14 (71.4%)
-
-**风险分析**:
-- **高风险**: API 端点和 Socket.IO 端点无去重保护，容易被恶意调用导致队列膨胀
-- **中风险**: UI 批量操作和编辑保存无去重保护，用户可能重复点击
-- **低风险**: 新 watch 创建和 clone 操作，UUID 是新的，理论上不会重复
-
----
-
-## 3. 永久饥饿结论的成立前提复核
-
-### 3.1 前提 1：优先级差距导致的绝对优先级分层
+### 2.1 前提 1：优先级差距导致的绝对优先级分层
 
 **数学依据**:
 - 手动触发优先级: `P_manual = 1`
 - 定时任务优先级: `P_scheduled = T`，其中 T 是当前时间戳（约 1,700,000,000）
 - 优先级差距: `P_scheduled / P_manual = 1.7 × 10^9`
 
-**最小堆排序性质**:
-> 定理：在最小堆优先级队列中，对于任意两个元素 A 和 B，如果 `priority(A) < priority(B)`，则 A 一定在 B 之前被处理。
+**最小堆排序性质定理**:
+> 在最小堆优先级队列中，对于任意两个元素 A 和 B，如果 `priority(A) < priority(B)`，则 A 一定在 B 之前被处理。
 
 **推论**:
 - 任何 `priority = 1` 的任务一定在任何 `priority > 1` 的任务之前被处理
@@ -138,31 +102,31 @@ priority = int(time.time())  # 约 1.7e9 (17亿)
 
 ---
 
-### 3.2 前提 2：手动触发速率 > 系统处理速率
+### 2.2 前提 2：手动触发速率可能超过系统处理速率
 
 **系统处理能力估算**:
 - 假设每个任务平均处理时间: 2 秒
 - 10 个 worker: 处理速率 = 5 任务/秒
 - 20 个 worker: 处理速率 = 10 任务/秒
 
-**手动触发速率来源**:
-1. 用户手动点击: 可能达到 1-5 次/秒
-2. API 自动化调用: 可能达到 10+ 次/秒
-3. Socket.IO 实时触发: 无速率限制
-4. 批量操作: 一次可能触发 100+ 任务
+**高风险无去重入口点可能的触发速率**:
+1. **API单个watch触发** (`api/Watch.py:81`) - 无速率限制，自动化脚本可能达到 10+ 次/秒
+2. **API标签recheck** (`api/Tags.py:41-42`) - 一次可能触发成百上千个任务
+3. **Socket.IO实时触发** (`realtime/events.py:44`) - 无速率限制
+4. **UI批量操作(recheck)** (`blueprint/ui/__init__.py:66`) - 一次可能触发所有watch
 
-**临界条件**:
+**临界条件证明**:
 ```
 当 手动触发速率 > 系统处理速率 时
 队列积压 = ∫(手动触发速率 - 处理速率) dt
 => 队列无限增长，定时任务永远饥饿
 ```
 
-**结论**: ✅ 前提成立，系统存在达到临界条件的可能
+**结论**: ✅ 前提成立，系统存在达到临界条件的可能（特别是无去重入口点可能被滥用）
 
 ---
 
-### 3.3 前提 3：重试机制的优先级乘法放大
+### 2.3 前提 3：重试机制的优先级乘法放大
 
 **当前重试逻辑** (`worker.py:74`):
 ```python
@@ -176,11 +140,15 @@ deferred_priority = max(1000, queued_item_data.priority * 10)
 P_k = P₀ × 10^k
 ```
 
-**结论**: ✅ 前提成立，乘法放大确实存在
+**重试时无去重检查**:
+- 重试时直接排队，不检查是否已在队列中
+- 可能导致同一UUID在队列中出现多次，且优先级越来越低
+
+**结论**: ✅ 前提成立，乘法放大确实存在且重试无去重
 
 ---
 
-### 3.4 前提 4：无优先级老化机制
+### 2.4 前提 4：无优先级老化机制
 
 **检查结果**:
 - 队列中没有任何机制提升长时间等待任务的优先级
@@ -191,24 +159,25 @@ P_k = P₀ × 10^k
 
 ---
 
-### 3.5 前提 5：部分入口点无去重保护
+### 2.5 前提 5：部分入口点无去重保护，可能加剧队列膨胀
 
-**检查结果**:
-- 71.4% 的入口点没有 queued/running 去重保护
-- 特别是 API 和 Socket.IO 端点完全无保护
-- 可能导致同一 UUID 在队列中出现多次，加剧队列膨胀
+**v2.0 校正后证据**:
+- 8 个入口点无去重保护（占 50%）
+- 特别是 API 单个 recheck 和标签 recheck 完全无保护
+- 重试机制也无去重保护，可能导致重复排队
+- 队列膨胀会进一步加剧优先级饥饿问题
 
-**结论**: ✅ 前提成立，去重保护不足可能加剧饥饿
+**结论**: ✅ 前提成立，去重保护不足确实可能加剧饥饿
 
 ---
 
-## 4. 相对优先级边界：定时任务 vs 手动重试
+## 3. 相对优先级边界：定时任务 vs 手动重试（v2.0 保持不变）
 
-### 4.1 定时任务的重试优先级演变
+### 3.1 定时任务的重试优先级演变
 
 假设当前时间戳 T = 1,700,000,000
 
-| 重试次数 k | 优先级值 P_k | 相对值 (P_k / T) | 排在多少秒后的定时任务之后 | 备注 |
+| 重试次数 k | 优先级值 P_k | 相对值 (P_k / T) | 排在未来多少秒的定时任务之后 | 影响 |
 |-----------|-------------|-----------------|--------------------------|------|
 | 0 (原始) | 1,700,000,000 | 1.0x | 基准（当前时间） | 正常定时任务 |
 | 1 | 17,000,000,000 | 10x | 约 153 亿秒 = 485 年 | 实际上等于永久丢弃 |
@@ -235,7 +204,7 @@ P_retry = T × 10^k >> T + Δt = P_new
 
 ---
 
-### 4.2 手动触发任务的重试优先级演变
+### 3.2 手动触发任务的重试优先级演变
 
 | 重试次数 k | 优先级值 P_k | 相对定时任务 (P_k / T) | 与新定时任务的关系 | 备注 |
 |-----------|-------------|----------------------|-------------------|------|
@@ -256,7 +225,7 @@ P_retry = T × 10^k >> T + Δt = P_new
 
 ---
 
-### 4.3 优先级边界交叉点分析
+### 3.3 优先级边界交叉点分析
 
 | 任务类型 | 优先级范围 | 与定时任务的关系 |
 |---------|-----------|-----------------|
@@ -274,24 +243,28 @@ P_retry = T × 10^k >> T + Δt = P_new
 
 ---
 
-## 5. 修复优先级重排序（基于证据）
+## 4. 修复优先级重排序（v2.0 基于修正证据）
 
-### 5.1 严重程度评估矩阵
+### 4.1 严重程度评估矩阵
 
-| 问题 | 数据丢失风险 | 系统可用性风险 | 公平性影响 | 发生概率 | 综合优先级 |
-|------|-------------|---------------|-----------|---------|-----------|
-| **重试优先级乘法放大** | 🔴 极高 | 🔴 高 | 🔴 极高 | 🟡 中 | **P0** |
-| **去重保护覆盖率低** | 🟡 中 | 🔴 高 | 🟠 中 | 🟢 低 | **P0** |
-| **手动触发固定优先级 1** | 🟢 低 | 🔴 极高 | 🔴 极高 | 🟡 中 | **P0** |
-| **优先级粒度太粗** | 🟢 低 | 🟡 中 | 🟠 中 | 🟢 低 | **P1** |
-| **缺少饥饿检测** | 🟢 低 | 🟡 中 | 🟠 中 | 🟢 低 | **P1** |
-| **缺少优先级老化机制** | 🟢 低 | 🟡 中 | 🔴 高 | 🟢 低 | **P1** |
-| **按标签权重调度** | 🟢 低 | 🟢 低 | 🟠 中 | - | **P2** |
-| **代理公平排队** | 🟢 低 | 🟢 低 | 🟠 中 | - | **P2** |
+| 问题 | 数据丢失风险 | 系统可用性风险 | 公平性影响 | 修复紧迫性 | 综合优先级 |
+|------|-------------|---------------|-----------|----------|-----------|
+| **重试优先级乘法放大** | 🔴 极高 | 🔴 高 | 🔴 极高 | 立即 | **P0** |
+| **手动触发固定优先级 1** | 🟢 低 | 🔴 极高 | 🔴 极高 | 立即 | **P0** |
+| **API单个recheck无去重** | 🟡 中 | 🔴 高 | 🟡 中 | 立即 | **P0** |
+| **API标签recheck无去重** | 🟡 中 | 🔴 高 | 🟡 中 | 立即 | **P0** |
+| **重试机制无去重** | 🟡 中 | 🔴 高 | 🟡 中 | 立即 | **P0** |
+| **Socket.IO无去重** | 🟡 中 | 🔴 高 | 🟡 中 | 近期 | **P1** |
+| **优先级粒度太粗** | 🟢 低 | 🟡 中 | 🟡 中 | 近期 | **P1** |
+| **缺少饥饿检测** | 🟢 低 | 🟡 中 | 🟡 中 | 中期 | **P1** |
+| **缺少优先级老化机制** | 🟢 低 | 🟡 中 | 🔴 高 | 中期 | **P1** |
+| **其他入口点去重完善** | 🟢 低 | 🟡 中 | 🟡 中 | 中期 | **P2** |
+| **按标签权重调度** | 🟢 低 | 🟢 低 | 🟡 中 | 长期 | **P2** |
+| **代理公平排队** | 🟢 低 | 🟢 低 | 🟡 中 | 长期 | **P2** |
 
 ---
 
-### 5.2 P0 - 必须立即修复（2 周内）
+### 4.2 P0 - 必须立即修复（2周内）
 
 #### P0.1 修复重试优先级乘法放大
 
@@ -325,41 +298,11 @@ deferred_priority = queued_item_data.item.get('original_priority', queued_item_d
 
 ---
 
-#### P0.2 为所有入口点添加去重保护
-
-**需要修复的文件（共 10 处）**:
-
-1. **`blueprint/ui/__init__.py:66`** - 批量操作 recheck
-2. **`blueprint/ui/edit.py:277`** - 编辑后保存触发
-3. **`blueprint/ui/views.py:41`** - 添加新 watch 触发（可能不需要）
-4. **`realtime/events.py:44`** - Socket.IO 实时触发
-5. **`blueprint/price_data_follower/__init__.py:24`** - 价格数据跟踪
-6. **`api/Watch.py:81`** - API 单个 watch 触发
-7. **`api/Watch.py:554`** - API 其他触发点
-8. **`api/Watch.py:576`** - API 其他触发点
-9. **`api/Tags.py:42`** - 标签批量操作
-10. **`api/Tags.py:50`** - 标签批量操作
-
-**标准去重代码模板**:
-```python
-def safe_queue_watch(uuid, priority=1):
-    """安全排队：检查是否已在队列中或正在运行"""
-    if worker_pool.is_watch_running(uuid) or uuid in update_q.get_queued_uuids():
-        logger.debug(f"Skipping queue for {uuid} - already queued or running")
-        return False
-    return worker_pool.queue_item_async_safe(
-        update_q,
-        queuedWatchMetaData.PrioritizedItem(priority=priority, item={'uuid': uuid})
-    )
-```
-
----
-
-#### P0.3 修复手动触发固定优先级 1
+#### P0.2 修复手动触发固定优先级 1
 
 **问题**: 手动触发与定时任务的优先级差距达 17 亿倍，导致绝对饥饿
 
-**修复方案**（相对时间戳偏移）:
+**修复方案**（相对时间戳偏移 + 速率限制）:
 ```python
 # 手动触发比当前时间早 1 小时，确保优先但不垄断
 manual_priority = int(time.time()) - 3600
@@ -400,13 +343,104 @@ class ManualPriorityManager:
 
 ---
 
-### 5.3 P1 - 近期需要修复（1-2 个月内）
+#### P0.3 为 API 单个 recheck 添加去重保护
 
-#### P1.1 提升优先级粒度到毫秒级
+**问题位置**: `api/Watch.py:81`
+
+**当前代码**:
+```python
+if request.args.get('recheck'):
+    worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+    return "OK", 200
+```
+
+**修复代码**:
+```python
+if request.args.get('recheck'):
+    # 添加去重检查
+    if worker_pool.is_watch_running(uuid) or uuid in self.update_q.get_queued_uuids():
+        return {'status': 'Watch already queued or being checked'}, 409
+    worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+    return "OK", 200
+```
+
+---
+
+#### P0.4 为 API 标签 recheck 添加去重保护
+
+**问题位置**: `api/Tags.py:41-42, 49-50`
+
+**当前代码** (两处类似):
+```python
+for watch_uuid in watches_to_queue:
+    worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': watch_uuid}))
+```
+
+**修复代码** (同步和后台线程都需要):
+```python
+# 在排队前添加去重检查
+queued_uuids = set(self.update_q.get_queued_uuids())
+running_uuids = set(worker_pool.get_running_uuids())
+
+watches_to_queue_filtered = [
+    uuid for uuid in watches_to_queue
+    if uuid not in queued_uuids and uuid not in running_uuids
+]
+
+for watch_uuid in watches_to_queue_filtered:
+    worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': watch_uuid}))
+```
+
+---
+
+#### P0.5 为重试机制添加去重保护
+
+**问题位置**: `worker.py:74`
+
+**修复代码**:
+```python
+if not worker_pool.claim_uuid_for_processing(uuid, worker_id):
+    # 已在处理中 - 重新排队并延迟
+    await asyncio.sleep(DEFER_SLEEP_TIME_ALREADY_QUEUED)  # 10 秒
+    
+    # vv 新增：检查是否已在队列中，避免重复排队 vv
+    if uuid in q.get_queued_uuids():
+        logger.debug(f"Worker {worker_id}: UUID {uuid} already in queue, skipping requeue")
+        continue
+    # ^^ 新增结束 ^^
+    
+    deferred_priority = queued_item_data.priority + 60  # 同时修复乘法放大
+    deferred_item = PrioritizedItem(priority=deferred_priority, item=queued_item_data.item)
+    worker_pool.queue_item_async_safe(q, deferred_item, silent=True)
+    continue
+```
+
+---
+
+### 4.3 P1 - 近期需要修复（1-2个月内）
+
+#### P1.1 为 Socket.IO 实时触发添加去重保护
+
+**问题位置**: `realtime/events.py:44`
+
+**修复代码**:
+```python
+# 在排队前添加去重检查
+if worker_pool.is_watch_running(uuid) or uuid in update_q.get_queued_uuids():
+    logger.info(f"Socket.IO: Watch {uuid} already queued or running, skipping")
+    emit('operation_result', {'success': False, 'error': 'Watch already queued or being checked'})
+    return
+
+worker_pool.queue_item_async_safe(update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+```
+
+---
+
+#### P1.2 提升优先级粒度到毫秒级
 
 **当前问题**: 使用秒级时间戳导致同一秒内任务顺序不确定
 
-**修复位置**: `flask_app.py:1249`, `queuedWatchMetaData.py`
+**修复位置**: `flask_app.py:1249`
 
 **修复代码**:
 ```python
@@ -418,7 +452,7 @@ priority = int(time.time() * 1000)
 
 ---
 
-#### P1.2 添加饥饿检测和告警机制
+#### P1.3 添加饥饿检测和告警机制
 
 **实现建议**:
 ```python
@@ -448,7 +482,7 @@ class StarvationDetector:
 
 ---
 
-#### P1.3 实现优先级老化机制
+#### P1.4 实现优先级老化机制
 
 **老化算法**: 任务在队列中每等待 N 秒，优先级提升（数值减小）一定量
 
@@ -471,32 +505,58 @@ def get_with_aging(self, block=True, timeout=None):
 
 ---
 
-### 5.4 P2 - 规划中（3-6 个月）
+### 4.4 P2 - 中期和长期规划
 
-1. **按标签/组的调度权重** - 为不同重要性的 watch 设置不同的优先级基础偏移
-2. **代理使用的公平排队** - 确保使用相同代理的 watch 公平共享资源
-3. **动态 worker 数量调整** - 根据队列积压自动扩缩容
+1. **其他入口点去重完善**（UI批量操作、编辑后保存等）- 风险较低，可在常规开发中完成
+2. **按标签/组的调度权重** - 为不同重要性的 watch 设置不同的优先级基础偏移
+3. **代理使用的公平排队** - 确保使用相同代理的 watch 公平共享资源
+4. **动态 worker 数量调整** - 根据队列积压自动扩缩容
 
 ---
 
-## 6. 修复后的预期效果验证
+## 5. 修复后的预期效果验证
 
-### 6.1 公平性指标改进
+### 5.1 公平性指标改进
 
 | 指标 | 修复前 | 修复后 | 改进幅度 |
 |------|-------|-------|---------|
 | 定时任务最大等待时间 | 无限（手动触发持续时） | 约 1-2 分钟（在正常负载下） | ✅✅✅✅✅ |
 | 重试任务的最大延迟 | 永久丢弃 | 最大 10 分钟 | ✅✅✅✅✅ |
-| 手动触发与定时任务的优先级比 | 1 : 1,700,000,000 | 约 1 : 60（可控） | ✅✅✅✅ |
-| 队列膨胀风险 | 高（无去重入口多） | 低（所有入口都有去重） | ✅✅✅✅✅ |
+| 手动触发与定时任务的优先级比 | 1 : 1,700,000,000 | 约 1 : 60（可控） | ✅✅✅✅✅ |
+| 无去重入口点数量 | 8 | 0 | ✅✅✅✅✅ |
+| 去重覆盖率 | 37.5% | 100%（含天然不重复） | ✅✅✅✅✅ |
 | 相同优先级任务顺序 | 不确定 | 确定（毫秒级时间戳） | ✅✅✅ |
 | 饥饿自动恢复 | 无 | 有（老化机制） | ✅✅✅✅✅ |
+| 队列重复排队风险 | 高 | 低 | ✅✅✅✅✅ |
 
 ---
 
-### 6.2 验收测试用例
+### 5.2 验收测试用例
 
-#### 测试用例 1：手动触发速率限制验证
+#### 测试用例 1：API单个recheck去重验证
+```
+条件:
+- 对同一个正在运行的 watch 连续调用 API recheck 3 次
+
+期望结果:
+- 只有第一次成功排队
+- 后两次返回 409 状态码
+- 队列中不会出现重复 UUID
+```
+
+#### 测试用例 2：API标签recheck去重验证
+```
+条件:
+- 有 10 个 watch 带同一个标签
+- 其中 3 个正在运行或已在队列中
+- 调用标签 recheck API
+
+期望结果:
+- 只有 7 个 watch 被排队
+- 不会重复排队已在队列或运行中的 watch
+```
+
+#### 测试用例 3：手动触发速率限制验证
 ```
 条件:
 - 每秒连续触发 10 次手动 recheck
@@ -509,7 +569,7 @@ def get_with_aging(self, block=True, timeout=None):
 - 定时任务仍然能在合理时间内获得执行
 ```
 
-#### 测试用例 2：重试任务延迟上限验证
+#### 测试用例 4：重试任务延迟上限验证
 ```
 条件:
 - 一个任务连续发生 5 次 UUID 认领冲突
@@ -518,20 +578,10 @@ def get_with_aging(self, block=True, timeout=None):
 期望结果:
 - 第 5 次重试的优先级不超过原始优先级 + 600 秒
 - 任务最终能在 10 分钟内获得执行
+- 重试过程中不会出现重复排队（去重检查生效）
 ```
 
-#### 测试用例 3：去重保护有效性验证
-```
-条件:
-- 对同一个正在运行的 watch 连续调用 API recheck 10 次
-
-期望结果:
-- 只有第一次成功排队
-- 后续 9 次都被去重检查拦截
-- 队列中不会出现重复 UUID
-```
-
-#### 测试用例 4：饥饿检测告警验证
+#### 测试用例 5：饥饿检测告警验证
 ```
 条件:
 - 一个 watch 在队列中等待超过 5 分钟
@@ -545,26 +595,27 @@ def get_with_aging(self, block=True, timeout=None):
 
 ## 附录：相关代码位置索引
 
-| 功能模块 | 文件 | 关键行号 |
-|---------|------|---------|
-| 队列核心实现 | `queue_handlers.py` | 15-260 |
-| Worker 主循环 | `worker.py` | 23-698 |
-| **重试优先级乘法** | `worker.py` | 74 |
-| Worker 池管理 | `worker_pool.py` | 全部 |
-| 定时调度线程（有去重） | `flask_app.py` | 1227, 1249 |
-| 优先级数据结构 | `queuedWatchMetaData.py` | 7-10 |
-| UI单个手动触发（有去重） | `blueprint/ui/__init__.py` | 273 |
-| UI批量手动触发（有去重） | `blueprint/ui/__init__.py` | 300-301, 330 |
-| **UI批量操作(无去重)** | `blueprint/ui/__init__.py` | 66 |
-| **Clone后触发(无去重)** | `blueprint/ui/__init__.py` | 257 |
-| **编辑后保存触发(无去重)** | `blueprint/ui/edit.py` | 277 |
-| **添加新watch触发(无去重)** | `blueprint/ui/views.py` | 41 |
-| **Socket.IO触发(无去重)** | `realtime/events.py` | 44 |
-| **价格数据跟踪(无去重)** | `blueprint/price_data_follower/__init__.py` | 24 |
-| **API单个watch触发(无去重)** | `api/Watch.py` | 81 |
-| **API其他触发点(无去重)** | `api/Watch.py` | 554, 576 |
-| **标签批量操作(无去重)** | `api/Tags.py` | 42, 50 |
-| **启动时批量排队(无去重)** | `__init__.py` | 441, 475, 537 |
+| 功能模块 | 文件 | 关键行号 | 状态 |
+|---------|------|---------|------|
+| 队列核心实现 | `queue_handlers.py` | 15-260 | 基础 |
+| Worker 主循环 | `worker.py` | 23-698 | 基础 |
+| **重试优先级乘法（需修复）** | `worker.py` | 74 | P0 |
+| **重试无去重（需修复）** | `worker.py` | 70-77 | P0 |
+| Worker 池管理 | `worker_pool.py` | 全部 | 基础 |
+| 定时调度线程（有去重） | `flask_app.py` | 1227, 1249 | ✅ 无需修复 |
+| 优先级数据结构 | `queuedWatchMetaData.py` | 7-10 | 基础 |
+| UI单个手动触发（有去重） | `blueprint/ui/__init__.py` | 273 | ✅ 无需修复 |
+| UI批量手动触发（有去重） | `blueprint/ui/__init__.py` | 299-301, 330 | ✅ 无需修复 |
+| **UI批量操作(无去重)** | `blueprint/ui/__init__.py` | 66 | P2 |
+| **Clone后触发（天然不重复）** | `blueprint/ui/__init__.py` | 257 | 🔄 无需修复 |
+| **编辑后保存触发(无去重)** | `blueprint/ui/edit.py` | 277 | P2 |
+| **添加新watch触发(天然不重复)** | `blueprint/ui/views.py` | 41 | 🔄 无需修复 |
+| **Socket.IO触发(无去重)** | `realtime/events.py` | 44 | P1 |
+| **价格数据跟踪触发(无去重)** | `blueprint/price_data_follower/__init__.py` | 24 | P2 |
+| **API单个watch触发(无去重)** | `api/Watch.py` | 81 | P0 |
+| API批量recheck_all（有去重） | `api/Watch.py` | 542-550, 565-575 | ✅ 无需修复 |
+| **API标签recheck(无去重)** | `api/Tags.py` | 41-42, 49-50 | P0 |
+| **启动时批量排队(无去重)** | `__init__.py` | 437-442, 469-480 | P2 |
 
 ---
 
@@ -573,4 +624,4 @@ def get_with_aging(self, block=True, timeout=None):
 | 版本 | 日期 | 修改内容 | 修改人 |
 |------|------|---------|-------|
 | v1.0 | 2026-05-15 | 初始版本，基础分析 | 开发团队 |
-| v2.0 | 2026-05-15 | **证据化校正**：逐行核对去重情况，复核饥饿前提，计算相对优先级边界，重排序修复优先级 | 开发团队 |
+| v2.0 | 2026-05-15 | **证据化校正**：逐行核对所有16个入口点去重，发现 API 批量 recheck_all 确实有去重，新增"新UUID天然不重复"分类，修正覆盖率统计，重排序修复优先级 | 开发团队 |
