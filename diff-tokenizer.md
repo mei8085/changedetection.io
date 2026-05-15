@@ -2,328 +2,674 @@
 
 ## 概述
 
-本文档分析了 changedetection.io 系统中文本差异比较（Diff）的分词器（Tokenizer）选择机制，以及不同切分方式对最终差异结果的影响。
+本文档深入分析 changedetection.io 系统中文本差异比较（Diff）的分词器（Tokenizer）机制，包括：
+- 内容类型信号来源与检测流程
+- Tokenizer 参数在系统中的完整传递路径
+- 两种 Tokenizer（`words` vs `words_and_html`）的切分边界对比
+- 不同切分方式如何触发不同的差异标记
+- 自动选择 Tokenizer 的设计方案与回退顺序
 
 ---
 
-## 一、当前系统中的 Tokenizer 实现
+## 一、内容类型信号来源
 
-### 1.1 可用 Tokenizer 列表
+### 1.1 信号检测链
 
-系统目前实现了两种 tokenizer，注册在 `changedetectionio/diff/tokenizers/__init__.py` 中：
+内容类型检测发生在内容获取与处理流程的早期阶段：
 
-| Tokenizer 名称 | 实现文件 | 功能描述 |
-|---------------|---------|---------|
-| `words` | `natural_text.py` | 基于空白字符分割的简单分词器 |
-| `words_and_html` | `words_and_html.py` | 保留 HTML 标签为原子单元的分词器（**默认**） |
-
-### 1.2 Tokenizer 实现细节
-
-#### 1.2.1 `words` - 纯文本分词器
-
-**切分规则**：
-- 遇到任何空白字符（空格、制表符等）时进行分割
-- 空白字符本身也作为独立 token 保留
-- 非空白字符连续累积形成一个 token
-
-**示例**：
-```python
-tokenize_words("Hello   world")  # ['Hello', ' ', ' ', ' ', 'world']
-tokenize_words("Price $90.00")   # ['Price', ' ', '$90.00']
+```
+HTTP 响应头
+    ↓ (Content-Type)
+guess_stream_type()  ← processors/magic.py
+    ↓ (is_html / is_json / is_plaintext 等标记)
+文本提取与预处理
+    ↓
+Diff 渲染
 ```
 
-#### 1.2.2 `words_and_html` - HTML 感知分词器
+### 1.2 guess_stream_type() 多信号融合机制
 
-**切分规则**：
-- 遇到 `<` 时开始 HTML 标签，直到 `>` 结束，整个标签作为单个 token
-- HTML 标签外的空白字符触发分割（与 `words` 相同）
-- 空白字符本身也作为独立 token 保留
+`processors/magic.py` 中的 `guess_stream_type` 类采用**多信号融合**策略：
 
-**示例**：
+| 信号来源 | 检测方式 | 优先级 | 说明 |
+|---------|---------|--------|------|
+| **HTTP 头** | `Content-Type` 字段 | 高 | 最可信的来源 |
+| **文件魔术** | `puremagic` 库检测 | 中 | 用于二进制文件识别 |
+| **内容模式** | 前 200 字符模式匹配 | 高 | 检测 HTML 标签、JSON 结构、RSS 标记 |
+
+**关键检测逻辑：**
 ```python
-tokenize_words_and_html("<p>Hello <b>world</b></p>")
-# ['<p>', 'Hello', ' ', '<b>', 'world', '</b>', '</p>']
+# 1. HTML 模式检测（前200字符）
+has_html_patterns = any(p in test_content_normalized for p in HTML_PATTERNS)
+# HTML_PATTERNS = ['<!doctype html', '<html', '<head', '<body', '<script', '<iframe', '<div']
 
-tokenize_words_and_html("<a href='test.com'>link</a>")
-# ['<a href=\'test.com\'>', 'link', '</a>']
+# 2. JSON 检测（同时排除 JSONP 误报）
+if re.match(r'^\w[\w.]*\s*\(', test_content):
+    is_plaintext = True  # JSONP 视为纯文本
+
+# 3. RSS/Feed 检测
+if '<rss' in test_content or '<feed' in test_content:
+    is_rss = True
+
+# 4. PDF 检测
+if '%pdf-1' in test_content:
+    is_pdf = True
 ```
+
+### 1.3 检测结果（状态标记）
+
+最终产生的布尔标记：
+- `is_html` - HTML 内容
+- `is_json` - JSON 内容  
+- `is_plaintext` - 纯文本内容
+- `is_rss` - RSS/Atom feed
+- `is_pdf` - PDF 文档
+- `is_xml` - 通用 XML（非 RSS）
+
+**重要：** 这些标记目前**仅用于内容提取预处理**，**尚未传递到 Diff 层**用于自动选择 Tokenizer。
 
 ---
 
-## 二、当前 Tokenizer 选择机制
+## 二、Tokenizer 参数传递完整路径
 
-### 2.1 现状：无自动选择
+### 2.1 当前调用链概览
 
-**重要发现**：当前系统**没有**根据内容类型自动选择 tokenizer 的逻辑。所有调用点都硬编码使用 `words_and_html` 作为默认值：
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  渲染层调用点                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. processors/text_json_diff/difference.py: render()             │
+│     → diff.render_diff(..., word_diff=True)                        │
+│     ⚠️  未传递 tokenizer 参数，使用默认值                          │
+│                                                                     │
+│  2. notification_service.py: add_rendered_diff_to_notification_vars │
+│     → diff.render_diff(...)                                         │
+│     ⚠️  未传递 tokenizer 参数，使用默认值                          │
+│                                                                     │
+│  3. tests/unit/test_notification_diff.py                           │
+│     → diff.render_diff(..., tokenizer=?)                           │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  diff/__init__.py: render_diff()                                   │
+│  默认值: tokenizer='words_and_html'                                │
+├─────────────────────────────────────────────────────────────────────┤
+│  → customSequenceMatcher(..., tokenizer=tokenizer)                 │
+│     → 当 word_diff=True 且单行变化时                                │
+│        → render_inline_word_diff(..., tokenizer=tokenizer)         │
+│           → TOKENIZERS.get(tokenizer, tokenize_words_and_html)     │
+│              → 实际分词函数                                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-| 函数 | 默认 tokenizer | 位置 |
-|------|---------------|------|
-| `render_inline_word_diff()` | `'words_and_html'` | `diff/__init__.py:79` |
-| `render_nested_line_diff()` | `'words_and_html'` | `diff/__init__.py:214` |
-| `customSequenceMatcher()` | `'words_and_html'` | `diff/__init__.py:321` |
-| `render_diff()` | `'words_and_html'` | `diff/__init__.py:437` |
+### 2.2 详细传递路径
 
-### 2.2 为什么 `words_and_html` 是默认？
+**调用入口 1: Web UI 历史对比**
+```python
+# processors/text_json_diff/difference.py:183-191
+content = diff.render_diff(
+    previous_version_file_contents=from_version_file_contents,
+    newest_version_file_contents=to_version_file_contents,
+    include_replaced=diff_prefs['replaced'],
+    include_added=diff_prefs['added'],
+    include_removed=diff_prefs['removed'],
+    include_equal=diff_prefs['changesOnly'],
+    ignore_junk=diff_prefs['ignoreWhitespace'],
+    word_diff=diff_prefs['type'] == 'diffWords',
+    # ⚠️ 缺失: tokenizer=? 参数
+)
+```
 
-1. **通用性**：既能正确处理纯文本，也能正确处理 HTML 内容
-2. **HTML 标签完整性**：避免将 HTML 标签拆分成多个 token（如 `<`, `div`, `>`），确保标签不会被 diff 算法误判为变化
-3. **向后兼容**：系统早期主要用于网页监控，HTML 内容是主要场景
+**调用入口 2: 通知渲染**
+```python
+# notification_service.py:106
+raw = diff_module.render_diff(prev_snapshot or '', current_snapshot or '', word_diff=True)
+# ⚠️ tokenizer 使用默认值 'words_and_html'
+```
+
+**调用入口 3: 自定义序列匹配器**
+```python
+# diff/__init__.py:404-405
+# 当 word_diff=True 且是单行变化时
+inline_diff, has_changes = render_inline_word_diff(
+    before_lines[0], after_lines[0], 
+    ignore_junk=ignore_junk, 
+    tokenizer=tokenizer,  # 传递 tokenizer
+    include_change_type_prefix=include_change_type_prefix
+)
+```
+
+**Tokenzier 注册表查找**
+```python
+# diff/__init__.py:107
+tokenizer_func = TOKENIZERS.get(tokenizer, tokenize_words_and_html)
+# 注册表在 diff/tokenizers/__init__.py 中定义
+# TOKENIZERS = {
+#     'words': tokenize_words,
+#     'words_and_html': tokenize_words_and_html,
+# }
+```
+
+### 2.3 当前硬编码现状
+
+| 调用位置 | 是否传递 tokenizer | 使用的值 |
+|---------|-------------------|---------|
+| Web UI diff render | ❌ 否 | 默认 `words_and_html` |
+| 通知系统 diff | ❌ 否 | 默认 `words_and_html` |
+| 单元测试 | ⚠️ 部分是 | 测试特定场景 |
+| API 端点 | ❌ 否 | 默认 `words_and_html` |
+
+**结论：** 系统所有主要路径都硬编码使用 `words_and_html`，没有利用内容类型检测结果。
 
 ---
 
-## 三、Tokenizer 切分边界对 Diff 结果的影响
+## 三、两种 Tokenizer 的切分边界对比（实测数据）
 
-### 3.1 核心原理
+基于真实测试数据，以下是两种 tokenizer 的详细对比。
 
-系统使用 `diff-match-patch` 库进行词级 diff，工作流程如下：
+### 3.1 Tokenizer 实现源码
 
-```
-输入文本 → Tokenizer 切分 → 每个 token 视为原子单元
-                                              ↓
-                         diff-match-patch 比较 token 序列
-                                              ↓
-                                  标记哪些 token 发生了变化
-```
-
-**关键**：token 边界决定了 diff 算法能识别的最小变化单元。
-
-### 3.2 典型场景对比分析
-
-#### 场景 1：数字变化（价格）
-
-**测试用例** (`test_notification_diff.py:419-429`):
+**`words` tokenizer (`natural_text.py`):**
 ```python
-before = "for sale $90.00"
-after  = "for sale $9.00"
+def tokenize_words(text: str) -> List[str]:
+    tokens = []
+    current = ''
+    for char in text:
+        if char.isspace():
+            if current:
+                tokens.append(current)
+                current = ''
+            tokens.append(char)  # 空格本身也作为 token 保留
+        else:
+            current += char
+    if current:
+        tokens.append(current)
+    return tokens
 ```
 
-**`words_and_html` 切分结果**：
-- before tokens: `['for', ' ', 'sale', ' ', '$90.00']`
-- after tokens:  `['for', ' ', 'sale', ' ', '$9.00']`
+**`words_and_html` tokenizer (`words_and_html.py`):**
+```python
+def tokenize_words_and_html(text: str) -> List[str]:
+    tokens = []
+    current = ''
+    in_tag = False
+    for char in text:
+        if char == '<':
+            if current:
+                tokens.append(current)
+                current = ''
+            current = '<'
+            in_tag = True
+        elif char == '>' and in_tag:
+            current += '>'
+            tokens.append(current)
+            current = ''
+            in_tag = False
+        elif char.isspace() and not in_tag:
+            if current:
+                tokens.append(current)
+                current = ''
+            tokens.append(char)
+        else:
+            current += char
+    if current:
+        tokens.append(current)
+    return tokens
+```
 
-**Diff 结果**：
-- ✅ **整个** `$90.00` 被标记为删除
-- ✅ **整个** `$9.00` 被标记为添加
-- ❌ 不会出现只高亮 `0.00` 这种无意义的部分匹配
+### 3.2 对比测试 1: 纯文本（无 HTML）
 
-**意义**：对于价格、版本号等语义单元，保持完整性非常重要。
+**输入:**
+```
+Before: Product Price: $99.99 - In Stock
+After:  Product Price: $129.99 - In Stock
+```
+
+**切分结果（两种 Tokenizer 完全相同）:**
+```
+Token 序列: ['Product', ' ', 'Price:', ' ', '$99.99', ' ', '-', ' ', 'In', ' ', 'Stock']
+Token 数量: 11 个
+```
+
+**关键观察:**
+- ✅ 两种 tokenizer 对纯文本**输出完全一致**
+- ✅ 价格 `$99.99` 是单个 token（无空格分隔）
+- ✅ 空格都作为独立 token 保留（用于准确重建文本）
+
+### 3.3 对比测试 2: 带 HTML 标签内容
+
+**输入:**
+```html
+Before: <span class="price">Price: $99</span><span class="stock">In Stock</span>
+After:  <span class="price">Price: $149</span><span class="stock">In Stock</span>
+```
+
+#### `words` tokenizer 切分结果（9 个 tokens）:
+```
+[0] '<span'
+[1] ' '
+[2] 'class="price">Price:'
+[3] ' '
+[4] '$99</span><span'       ⚠️ HTML 标签与内容混在一起
+[5] ' '
+[6] 'class="stock">In'
+[7] ' '
+[8] 'Stock</span>'           ⚠️ 结束标签与文本混在一起
+```
+
+#### `words_and_html` tokenizer 切分结果（10 个 tokens）:
+```
+[0] '<span class="price">'  ✅ 完整 HTML 标签
+[1] 'Price:'
+[2] ' '
+[3] '$99'                   ✅ 价格单独 token
+[4] '</span>'               ✅ 完整结束标签
+[5] '<span class="stock">'  ✅ 下一个开始标签
+[6] 'In'
+[7] ' '
+[8] 'Stock'
+[9] '</span>'               ✅ 完整结束标签
+```
+
+#### Token 交集分析（影响差异标记）:
+| Tokenizer | 共同 token 数量 | 说明 |
+|-----------|----------------|------|
+| `words` | **5 个** | 碎片化，标签被拆分 |
+| `words_and_html` | **7 个** | 4 个 HTML 标签都保持完整 |
+
+### 3.4 对比测试 3: 复杂 HTML（带多个属性）
+
+**输入:**
+```html
+<div class="product" data-id="123"><h1>Old Title</h1><p>Description here</p></div>
+```
+
+#### `words` tokenizer 结果（9 个 tokens，高度碎片化）:
+```
+[0] '<div'
+[1] ' '
+[2] 'class="product"'
+[3] ' '
+[4] 'data-id="123"><h1>Old'
+[5] ' '
+[6] 'Title</h1><p>Description'
+[7] ' '
+[8] 'here</p></div>'
+```
+
+#### `words_and_html` tokenizer 结果（12 个 tokens，结构清晰）:
+```
+[0] '<div class="product" data-id="123">'  ✅ 完整标签 + 属性
+[1] '<h1>'
+[2] 'Old'
+[3] ' '
+[4] 'Title'
+[5] '</h1>'
+[6] '<p>'
+[7] 'Description'
+[8] ' '
+[9] 'here'
+[10] '</p>'
+[11] '</div>'
+```
+
+### 3.5 对比测试 4: JSON 内容
+
+**输入:**
+```json
+{"price": 99, "stock": true, "name": "Product A"}
+```
+
+**结果:** 两种 tokenizer **输出完全相同**（13 个 tokens），因为没有 `<` 和 `>` 字符触发 HTML 标签识别。
+
+### 3.6 边界情况: 格式不规范的 HTML
+
+**输入:** `< div >Hello< /div >`
+
+| Tokenizer | 结果 | 问题 |
+|-----------|------|------|
+| `words` | `['<', ' ', 'div', ' ', '>Hello<', ' ', '/div', ' ', '>']` | 极度碎片化 |
+| `words_and_html` | `['< div >', 'Hello', '< /div >']` | ⚠️ 把空格也包含在 "标签" 中，但至少保持了单元完整性 |
+
+### 3.7 切分边界总结表
+
+| 场景 | `words` tokenizer | `words_and_html` tokenizer | 最优选择 |
+|------|------------------|---------------------------|---------|
+| 纯英文文章 | 按空格切分，正确 | 与 words 完全相同 | 任意 |
+| 带 HTML 的网页 | ❌ 标签被空格拆分 | ✅ 标签保持完整 | `words_and_html` |
+| JSON 数据 | 按空格切分 | 与 words 完全相同 | 任意 |
+| 价格变化 ($99→$149) | ✅ 单个 token | ✅ 单个 token | 任意 |
+| 代码片段 | 按空格切分 | 与 words 相同（无 <>） | 需专用 tokenizer |
+| 格式不规范 HTML | 极度碎片化 | 保持单元（但包含空格） | `words_and_html` |
 
 ---
 
-#### 场景 2：多词变化
+## 四、切分边界如何触发不同的差异标记
 
-**测试用例** (`test_notification_diff.py:443-453`):
+### 4.1 Diff 标记类型
+
+系统使用三种占位符（Placemarker）标记差异：
+
+| 标记类型 | 触发条件 | 占位符 |
+|---------|---------|--------|
+| **REMOVED** | 纯删除（对应行在新版本不存在） | `@removed_PLACEMARKER_OPEN...CLOSED` |
+| **ADDED** | 纯新增（对应行在旧版本不存在） | `@added_PLACEMARKER_OPEN...CLOSED` |
+| **CHANGED** | 整行替换（无共同 token 时） | `@changed_PLACEMARKER_OPEN...CLOSED` |
+| **CHANGED_INTO** | 替换后的新内容 | `@changed_into_PLACEMARKER_OPEN...CLOSED` |
+
+### 4.2 整行替换判定逻辑
+
 ```python
-before = "quick brown fox jumps"
-after  = "slow brown fox hops"
+# render_inline_word_diff 中的判定
+whole_line_replaced = not any(op == 0 and text.strip() for op, text in diffs)
+#                      ↑ 没有任何相等（op==0）的非空白 token → 判定为整行替换
+
+if whole_line_replaced:
+    # 使用 CHANGED / CHANGED_INTO 标记
+    result = f'{CHANGED_PLACEMARKER_OPEN}{removed_full}{CHANGED_PLACEMARKER_CLOSED}'
+    result += f'{CHANGED_INTO_PLACEMARKER_OPEN}{added_full}{CHANGED_INTO_PLACEMARKER_CLOSED}'
+else:
+    # 混合模式，分别使用 REMOVED / ADDED
+    for op, text in diffs:
+        if op == -1:  # 删除
+            result += f'{REMOVED_PLACEMARKER_OPEN}{text}{REMOVED_PLACEMARKER_CLOSED}'
+        elif op == 1:  # 新增
+            result += f'{ADDED_PLACEMARKER_OPEN}{text}{ADDED_PLACEMARKER_CLOSED}'
 ```
 
-**切分结果**：
-- 共同 token: `brown`, `fox`, （空格）
-- 变化 token: `quick` → `slow`, `jumps` → `hops`
+### 4.3 Tokenizer 选择对标记的实际影响
 
-**Diff 结果**：
-```
-@removed_PLACEMARKER_OPENquick@removed_PLACEMARKER_CLOSED
-@added_PLACEMARKER_OPENslow@added_PLACEMARKER_CLOSED
-brown fox
-@removed_PLACEMARKER_OPENjumps@removed_PLACEMARKER_CLOSED
-@added_PLACEMARKER_OPENhops@added_PLACEMARKER_CLOSED
+**场景：HTML 内容中仅价格变化**
+
+```html
+版本 A: <span class="price">$99</span>
+版本 B: <span class="price">$149</span>
 ```
 
-**意义**：准确识别独立变化的单词，保留共同上下文。
+#### 情况 1: 使用 `words` tokenizer
+
+```
+tokens A: ['<span', ' ', 'class="price">$99</span>']
+tokens B: ['<span', ' ', 'class="price">$149</span>']
+                 ↑         ↑
+              这两个相等    ↑
+                         这个不同
+
+共同 token: 2 个 ('<span', ' ')
+→ ❗ 有共同 token → 不会触发整行替换
+→ 使用 REMOVED/ADDED 标记分别标记删除和新增
+→ 但被删除和新增的 token 包含了整个 class="price">...</span>
+→ 高亮区域过大，视觉噪声多
+```
+
+#### 情况 2: 使用 `words_and_html` tokenizer
+
+```
+tokens A: ['<span class="price">', '$99', '</span>']
+tokens B: ['<span class="price">', '$149', '</span>']
+                 ↑                    ↑
+             这两个完全相等         只有价格不同
+
+共同 token: 2 个完整标签 + 1 个结束标签 = 3 个
+→ ✅ 只有 `$99` ↔ `$149` 被标记为变化
+→ HTML 标签被正确识别为相等，不高亮
+→ 高亮区域精确，视觉干净
+```
+
+### 4.4 标记影响总结表
+
+| 场景 | `words` tokenizer 效果 | `words_and_html` 效果 |
+|------|----------------------|----------------------|
+| **纯文本变化** | 精确高亮变化词 | 与 words 相同，精确 |
+| **HTML + 价格变化** | ❌ 整段标签 + 价格被高亮 | ✅ 只有价格被高亮 |
+| **整句变化（无共同词）** | 触发 CHANGED 标记 | 触发 CHANGED 标记（相同） |
+| **多词同行变化** | 每个变化词独立标记 | 每个变化词独立标记（相同） |
+| **通知模板提取** | `extract_changed_from/to` 可能包含多余 HTML 标签 | ✅ 提取更干净，只有变化内容 |
 
 ---
 
-#### 场景 3：整行替换
+## 五、自动选择 Tokenizer 设计方案
 
-**测试用例** (`test_notification_diff.py:431-441`):
-```python
-before = "$99"
-after  = "$109"
+### 5.1 自动选择回退顺序
+
+基于内容类型检测结果，建议以下优先级顺序：
+
+```
+                        ┌─────────────────┐
+                        │  检测内容类型    │
+                        └────────┬────────┘
+                                 ↓
+          ┌─────────────────────────────────────┐
+          │  1. is_html == True ?               │
+          │     → 使用 words_and_html           │
+          └───────────────────┬─────────────────┘
+                              ↓ 否
+          ┌─────────────────────────────────────┐
+          │  2. is_json == True ?               │
+          │     → 使用 words（JSON无HTML标签）   │
+          └───────────────────┬─────────────────┘
+                              ↓ 否
+          ┌─────────────────────────────────────┐
+          │  3. is_plaintext == True ?          │
+          │     → 使用 words                     │
+          └───────────────────┬─────────────────┘
+                              ↓ 否/不确定
+          ┌─────────────────────────────────────┐
+          │  4. 安全回退                        │
+          │     → 使用 words_and_html           │
+          └─────────────────────────────────────┘
 ```
 
-**判定逻辑**：
-- 检查是否存在**任何**相等的 token（包括空格）
-- 如果没有相等 token → 判定为整行替换
-- 使用 `CHANGED_PLACEMARKER` 而非 `REMOVED/ADDED` 标记
+### 5.2 实现方案：render_diff 层自动检测
 
-**Diff 结果**：
-```
-@changed_PLACEMARKER_OPEN$99@changed_PLACEMARKER_CLOSED
-@changed_into_PLACEMARKER_OPEN$109@changed_into_PLACEMARKER_CLOSED
-```
-
-**意义**：视觉上更清晰地表示"旧值 → 新值"的对应关系。
-
----
-
-#### 场景 4：HTML 标签处理
-
-**假设输入**：
-```python
-before = "<span class='price'>$99</span>"
-after  = "<span class='price'>$149</span>"
-```
-
-**`words_and_html` 切分**：
-- before: `['<span class=\'price\'>', '$99', '</span>']`
-- after:  `['<span class=\'price\'>', '$149', '</span>']`
-
-**Diff 结果**：
-- ✅ HTML 标签被正确识别为相等
-- ✅ 仅价格部分高亮为变化
-
-**如果使用 `words` 切分**：
-- before: `['<span', ' ', 'class=\'price\'>', '$99', '</span>']`
-- ❌ 标签被拆碎，可能导致大量误报的高亮
-
----
-
-## 四、Tokenizer 自动选择规则设计
-
-### 4.1 建议的自动选择策略
-
-基于内容类型自动选择最优 tokenizer：
-
-| 内容类型 | 检测条件 | 推荐 Tokenizer | 理由 |
-|---------|---------|----------------|------|
-| **HTML** | 包含 `<tag>` 模式或 `Content-Type: text/html` | `words_and_html` | 保留标签完整性 |
-| **JSON** | 以 `{` 或 `[` 开头，或 `Content-Type: application/json` | 建议新增 `json_structure` | 保留 JSON 键名完整性 |
-| **纯文本** | 其他情况 | `words` | 更轻量，无额外开销 |
-| **代码** | 包含编程语言特征 | 建议新增 `code_tokens` | 按语法单元切分 |
-
-### 4.2 内容类型检测实现建议
-
-在 `render_diff()` 或更上层添加自动检测逻辑：
+**修改位置:** `changedetectionio/diff/__init__.py`
 
 ```python
-def detect_content_type(text: str) -> str:
+import re
+
+def detect_content_type_for_tokenizer(text: str) -> str:
     """
-    检测内容类型以选择合适的 tokenizer
+    轻量级内容类型检测，用于选择合适的 tokenizer
+    只检测前 500 字符以保证性能
     """
-    # 1. 检测 HTML
+    if not text:
+        return 'text'
+    
+    sample = text[:500].lower()
+    
+    # 检测 HTML 标签模式（查找完整的标签）
+    # 注意：必须是 <tag...> 格式，不能有空格紧跟 <
     html_pattern = re.compile(r'<[a-zA-Z][^>]*>')
-    if html_pattern.search(text[:1000]):  # 只检查前 1000 字符
+    if html_pattern.search(sample):
         return 'html'
     
-    # 2. 检测 JSON
-    stripped = text.strip()
-    if (stripped.startswith('{') and stripped.endswith('}')) or \
-       (stripped.startswith('[') and stripped.endswith(']')):
-        return 'json'
-    
-    # 3. 默认纯文本
+    # 纯文本/其他
     return 'text'
 
 def auto_select_tokenizer(text: str) -> str:
-    content_type = detect_content_type(text)
+    """
+    根据内容自动选择最优 tokenizer
+    """
+    content_type = detect_content_type_for_tokenizer(text)
     mapping = {
         'html': 'words_and_html',
-        'json': 'words_and_html',  # 暂时复用
         'text': 'words',
     }
     return mapping.get(content_type, 'words_and_html')
 ```
 
-### 4.3 边界情况处理
+**修改 render_diff 签名:**
+```python
+def render_diff(
+    previous_version_file_contents: str,
+    newest_version_file_contents: str,
+    include_equal: bool = False,
+    include_removed: bool = True,
+    include_added: bool = True,
+    include_replaced: bool = True,
+    include_change_type_prefix: bool = True,
+    patch_format: bool = False,
+    word_diff: bool = True,
+    context_lines: int = 0,
+    case_insensitive: bool = False,
+    ignore_junk: bool = False,
+    tokenizer: str = 'auto'  # ← 新增默认值 'auto'
+) -> str:
+    """
+    Args:
+        tokenizer: Tokenizer 名称，支持 'auto'（自动检测）, 'words', 'words_and_html'
+    """
+    # 自动检测逻辑
+    if tokenizer == 'auto':
+        # 使用两个版本的内容联合检测
+        combined_sample = (previous_version_file_contents or '')[:250] + (newest_version_file_contents or '')[:250]
+        tokenizer = auto_select_tokenizer(combined_sample)
+    
+    # 原有逻辑继续...
+```
 
-| 场景 | 处理策略 |
-|------|---------|
-| 混合内容（HTML + 纯文本） | 保守使用 `words_and_html` |
-| 内容过少（< 50 字符） | 使用 `words_and_html` 确保安全 |
-| 检测不确定 | 回退到 `words_and_html`（默认更安全） |
+### 5.3 上层调用修改
+
+**processor 层传递内容类型信息:**
+```python
+# processors/text_json_diff/difference.py
+# 在 render 函数中，我们已经有 stream_content_type 对象！
+
+content = diff.render_diff(
+    previous_version_file_contents=from_version_file_contents,
+    newest_version_file_contents=to_version_file_contents,
+    # ... 其他参数
+    word_diff=diff_prefs['type'] == 'diffWords',
+    # ↓ 新增：传递已有的检测结果
+    tokenizer='words_and_html' if stream_content_type.is_html else 'words'
+)
+```
+
+**优势：** 使用已有的检测结果，避免重复检测开销。
+
+### 5.4 兼容性考虑
+
+| 变更点 | 影响 | 处理方案 |
+|-------|------|---------|
+| tokenizer 默认值改为 `'auto'` | 现有代码如果依赖旧默认值 | 保持向后兼容：`'auto'` 在无 HTML 时回退到 `words`，有 HTML 时用 `words_and_html` |
+| 纯文本内容现在用 `words` | 行为变化 | 两种 tokenizer 对纯文本输出相同，无影响 |
+| API 响应格式 | 可能变化 | 变化更精确是改进 |
 
 ---
 
-## 五、不同切分方式的性能与效果对比
+## 六、性能与效果权衡分析
 
-### 5.1 性能对比
+### 6.1 性能开销
 
-| Tokenizer | 时间复杂度 | 典型耗时（10KB 文本） | 适用场景 |
-|-----------|-----------|----------------------|---------|
-| `words` | O(n) | ~0.1ms | 纯文本、日志 |
-| `words_and_html` | O(n) | ~0.15ms | HTML、通用场景 |
-| （建议）`json_structure` | O(n) | ~0.2ms | JSON API 响应 |
+| 操作 | 耗时估计 | 说明 |
+|------|---------|------|
+| `tokenize_words` | O(n) | 最快 |
+| `tokenize_words_and_html` | O(n) | 稍慢（多一个状态变量检查） |
+| `detect_content_type_for_tokenizer` | O(500) | 只检查前 500 字符，可忽略 |
+| 每次 diff 的总开销 | < 1ms | 与页面抓取相比可忽略 |
 
-### 5.2 差异精度对比
+### 6.2 效果对比矩阵
 
-| 场景 | `words` 效果 | `words_and_html` 效果 | 最优选择 |
-|------|-------------|----------------------|---------|
-| 纯英文文章 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 任意 |
-| 带 HTML 的网页 | ⭐⭐ | ⭐⭐⭐⭐⭐ | `words_and_html` |
-| JSON 数据 | ⭐⭐⭐ | ⭐⭐⭐⭐ | `words_and_html` |
-| 价格/数字变化 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 两者一致 |
-| 代码片段 | ⭐⭐⭐ | ⭐⭐⭐ | 需专用 tokenizer |
-
----
-
-## 六、关键设计决策与边界
-
-### 6.1 已确立的边界
-
-1. **Token 是原子单元**：一旦切分，diff 算法不会在 token 内部进行更细粒度的比较
-2. **空白字符是 token**：保留空格有助于准确重建原始文本结构
-3. **不应用语义清理**：`diff-match-patch` 的 `diff_cleanupSemantic()` 被禁用，避免破坏 token 边界
-4. **整行替换判定**：当无共同 token 时，使用特殊的 `CHANGED` 标记而非 `REMOVED/ADDED`
-
-### 6.2 待优化的边界
-
-1. **数字/符号边界**：
-   - 当前：`$90.00` 是单个 token（因为没有空格）
-   - 可优化：`$` + `90.00` 分离，或识别小数点
-
-2. **URL/路径边界**：
-   - 当前：`https://example.com/path` 是单个 token
-   - 可优化：按路径段切分，便于检测细微 URL 变化
-
-3. **JSON 键值边界**：
-   - 当前：`"price": 99` 可能被切分为多个 token
-   - 可优化：专用 JSON tokenizer 保持键名完整性
+| 维度 | 硬编码 `words_and_html` | 自动选择 | 纯 `words` |
+|------|-----------------------|---------|-----------|
+| HTML 高亮精度 | ✅ 优秀 | ✅ 优秀 | ❌ 差 |
+| 纯文本高亮精度 | ✅ 优秀 | ✅ 优秀 | ✅ 优秀 |
+| JSON 高亮精度 | ✅ 良好 (与 words 相同) | ✅ 良好 | ✅ 良好 |
+| 通知变更提取 | ⚠️ 可能包含多余标签 | ✅ 优化 | ❌ 更差 |
+| 代码复杂度 | 低 | 中等 | 低 |
+| 向后兼容性 | 100% | >99% | 低（破坏HTML场景） |
 
 ---
 
-## 七、测试覆盖的关键场景
+## 七、关键设计决策记录
 
-系统测试 (`test_notification_diff.py`) 已覆盖：
+### 7.1 已确定的设计边界
 
-- ✅ 基本词级 diff 功能
-- ✅ 数字/价格变化（保持原子性）
-- ✅ 多词同线变化
-- ✅ 整行替换判定
+1. **Token 是原子比较单元**
+   - diff-match-patch 不会在 token 内部比较字符
+   - token 边界直接决定高亮精度
+
+2. **空白字符必须保留为独立 token**
+   - 用于准确重建原始文本格式
+   - 否则无法正确还原空格位置
+
+3. **不应用语义清理（diff_cleanupSemantic）**
+   - 避免破坏 token 边界完整性
+   - 例如 `$90.00` → `$9.00` 保持为整体变化，不拆分成字符级
+
+4. **整行替换判定是用户体验优化**
+   - 无共同 token 时使用 CHANGED 标记而非 REMOVED+ADDED
+   - 视觉上更清晰表达"旧值 → 新值"关系
+
+### 7.2 待验证的边界问题
+
+1. **JSON 专用 tokenizer**
+   - 当前两种 tokenizer 对 JSON 的切分是相同的
+   - 但 JSON 的键值对可以有更智能的切分
+   - 例如：`"price": 99` 切分为 `['"price":', ' ', '99']` 是正确的
+
+2. **正则表达式提取后的内容**
+   - 用户自定义提取规则可能产生混合内容
+   - 需要更灵活的策略
+
+3. **RSS/XML 内容**
+   - 标签格式与 HTML 类似但语义不同
+   - 是否需要专用处理？
+
+---
+
+## 八、实施建议
+
+### 8.1 短期方案（低风险）
+
+1. 在 `render_diff` 中添加 `tokenizer='auto'` 选项
+2. 实现轻量级的 HTML 检测（前 500 字符）
+3. 保持 `words_and_html` 为默认回退值
+
+### 8.2 中期方案
+
+1. 利用 processor 层已有的 `stream_content_type` 检测结果
+2. 在所有调用点传递 tokenizer 参数（不再依赖默认值）
+3. 添加单元测试覆盖 tokenizer 自动选择逻辑
+
+### 8.3 长期优化方向
+
+1. 考虑 JSON 专用 tokenizer（按结构切分但不破坏格式）
+2. 考虑 URL 专用 tokenizer（按路径段切分）
+3. 为高级用户添加 tokenizer 选择 UI（如在 Watch 设置中）
+
+---
+
+## 九、测试用例覆盖
+
+系统现有测试已覆盖 (`test_notification_diff.py`):
+
+- ✅ 基础 diff 输出
+- ✅ 词级 diff（word_diff=True/False）
+- ✅ 价格变化原子性 (`$90.00` → `$9.00`)
+- ✅ 多词同行变化
+- ✅ 整行替换标记触发
 - ✅ 上下文行数控制
 - ✅ 空白字符忽略
 - ✅ 标记前缀开关
 - ✅ 变更提取函数 (`extract_changed_from/to`)
 
----
-
-## 八、总结与建议
-
-### 8.1 核心结论
-
-1. **当前无自动选择**：所有场景默认使用 `words_and_html`
-2. **Tokenizer 边界决定 Diff 精度**：切分方式直接影响哪些内容会被高亮为变化
-3. **`words_and_html` 是安全默认**：虽然对纯文本略有额外开销，但能正确处理 HTML 这种最常见场景
-4. **整行替换判定是重要优化**：提供更好的用户体验
-
-### 8.2 改进建议
-
-1. **实现自动检测**：按 4.1 节建议添加内容类型检测和自动选择
-2. **新增专用 Tokenizer**：
-   - `json_tokens`：针对 JSON 结构优化
-   - `url_tokens`：针对 URL 路径优化
-3. **暴露配置选项**：允许用户在监控页面手动选择 tokenizer
-4. **文档完善**：在用户文档中说明不同 tokenizer 的适用场景
-
-### 8.3 风险提示
-
-- 改变 tokenizer 可能影响历史 diff 的显示一致性
-- 过于激进的切分可能产生"过度高亮"（太多小片段被标记）
-- 过于保守的切分可能产生"高亮不足"（整段内容被标记但只有小部分变化）
+**需新增测试：**
+- ⏳ tokenizer 自动选择逻辑
+- ⏳ 不同内容类型的 diff 输出对比
+- ⏳ 边界情况（混合内容、空内容、极短内容）
 
 ---
 
-**文档版本**：1.0  
-**最后更新**：2024  
-**对应代码版本**：changedetection.io current
+## 总结
+
+| 关键发现 | 说明 |
+|---------|------|
+| **当前现状** | 所有调用硬编码使用 `words_and_html` |
+| **内容检测已存在** | `guess_stream_type` 在 processor 层运行，但结果未传递到 diff 层 |
+| **纯文本等价性** | 对无 HTML 的内容，两种 tokenizer 输出完全相同 |
+| **HTML 场景差异大** | `words` 会拆分 HTML 标签，导致高亮区域过大 |
+| **自动选择低风险** | 纯文本场景无变化，只改进 HTML 场景 |
+| **回退安全** | 不确定时回退到 `words_and_html` 总是安全的 |
+
+**推荐行动：** 实施短期方案，在 `render_diff` 层添加轻量级自动检测，风险极低但能显著提升 HTML 内容的 diff 高亮精度。
