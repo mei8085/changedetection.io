@@ -1,368 +1,388 @@
-# Restock Processor 分析报告
+# Restock & Price Detection Processor 分析报告
 
-## 概述
+## 1. 概述
 
-`restock_diff` 是 changedetection.io 项目中的补货检测处理器，专门用于监控电商产品页面的库存状态和价格变化。当产品从"缺货"变为"有货"时，或者价格发生变化时，触发通知。
-
-**定位**: 适用于单个产品页面，检测产品补货和价格变动场景。
+**处理器名称**: Re-stock & Price Detection for pages with a SINGLE product  
+**文件位置**: `changedetectionio/processors/restock_diff/`  
+**核心功能**: 专门针对单一产品页面，检测商品库存状态变化和价格波动。
 
 ---
 
-## 核心架构
+## 2. 架构设计
 
-### 文件结构
-
-```
-changedetectionio/processors/restock_diff/
-├── __init__.py              # Restock 数据模型定义
-├── processor.py             # 主处理器逻辑
-├── forms.py                 # 配置表单定义
-├── api.yaml                 # API 规范扩展
-├── pure_python_extractor.py # 纯 Python 元数据提取器
-└── plugins/
-    └── llm_restock.py       # LLM 回退提取插件
-```
-
-### 类继承关系
+### 2.1 核心类结构
 
 ```
 difference_detection_processor (base.py)
     └── perform_site_check (processor.py)
+        ├── Restock 数据模型
+        ├── 多层提取策略
+        └── 变更检测逻辑
 ```
+
+### 2.2 主要模块文件
+
+| 文件 | 功能 |
+|------|------|
+| `__init__.py` | Restock 数据模型定义、Watch 扩展、价格解析 |
+| `processor.py` | 核心处理器、提取管道、检测逻辑 |
+| `pure_python_extractor.py` | 纯Python元数据提取器（无lxml） |
+| `forms.py` | WTForms 配置表单 |
+| `plugins/llm_restock.py` | LLM 备用提取插件 |
+| `api.yaml` | API 规范定义 |
 
 ---
 
-## 数据提取策略
+## 3. 核心数据模型
 
-### 三层提取架构
-
-处理器采用**渐进式三层提取策略**，优先使用轻量级方法，必要时回退到重量级方案：
-
-#### 第一层: 纯 Python 提取器 (pure_python_extractor.py)
-
-**优点**: 无内存泄漏、无外部依赖（C 扩展）
-
-**支持的格式**:
-1. **JSON-LD** - 最可靠的结构化数据格式
-2. **OpenGraph** meta 标签
-3. **Microdata** 属性
-
-**工作流程**:
-- 使用 Python 内置 `html.parser` 解析 HTML
-- 通过正则和字符串匹配提取元数据
-- 使用 `jsonpath_ng` 查询提取的数据
-
-#### 第二层: extruct 提取器 (get_itemprop_availability)
-
-**触发条件**: 纯 Python 提取器未能获取完整的 price + availability 数据
-
-**支持格式**:
-- dublincore
-- json-ld
-- microdata
-- microformat
-- opengraph
-
-**内存管理策略 (Linux)**:
-- 使用 `spawn` 多进程模式
-- 通过 Pipe 传递 HTML 字节数据
-- 子进程退出时 OS 强制回收所有内存（包括 lxml C 级分配）
-
-#### 第三层: LLM 回退插件 (llm_restock.py)
-
-**触发条件**: 内置提取器无法获取有效的 price 和 availability 数据
-
-**处理流程**:
-1. 移除网站 chrome（导航、页脚等）
-2. 提取 JSON-LD 数据块
-3. 清理 HTML，转换为纯文本
-4. 发送给 LLM 生成结构化 JSON
-
-**LLM 返回格式**:
-```json
-{
-  "price": 29.99,
-  "currency": "USD",
-  "availability": "instock"
-}
-```
-
----
-
-## 核心数据结构
-
-### Restock 类 (__init__.py)
+### 3.1 Restock 类
 
 ```python
 class Restock(dict):
     default_values = {
-        'in_stock': None,      # 库存状态
-        'price': None,         # 当前价格
-        'currency': None,      # 货币代码
-        'original_price': None # 首次检测时的价格
+        'in_stock': None,        # 布尔值 - 是否有库存
+        'price': None,           # float - 当前价格
+        'currency': None,        # str - 货币代码 (USD/EUR等)
+        'original_price': None   # float - 首次检测的价格
     }
 ```
 
-**特殊处理**:
-- `price` 和 `original_price` 设置时自动调用 `parse_currency()` 解析
-- 支持多种货币格式（1,400.00 → 1400.00）
-
-### parse_currency() 货币解析逻辑
-
-```python
-def parse_currency(self, raw_value: str) -> Union[float, None]:
-    # 1. 处理千分位和小数位混淆的情况
-    # 2. 移除非数字字符（保留小数点和负号）
-    # 3. 使用 babel.parse_decimal 解析
-```
+**关键功能**:
+- 自动将字符串价格转换为浮点数
+- 处理不同地区的数字格式（逗号/小数点）
+- 使用 Babel 库进行本地化解析
 
 ---
 
-## 变更检测逻辑 (run_changedetection)
+## 4. 多层提取策略（关键设计）
 
-### 检测触发条件
+### 4.1 提取管道优先级
 
-#### 1. 库存状态变化
-
-```python
-if watch['restock']['in_stock'] != update_obj['restock']['in_stock']:
-    # 缺货 → 有货 且配置为 "in_stock_only"
-    if restock_settings['in_stock_processing'] == 'in_stock_only' and new_in_stock:
-        changed_detected = True
-    # 或配置为 "all_changes"
-    if restock_settings['in_stock_processing'] == 'all_changes':
-        changed_detected = True
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    提取管道优先级排序                        │
+├─────────────────────────────────────────────────────────────┤
+│  1. 纯 Python 元数据提取  (pure_python_extractor.py)        │
+│     → JSON-LD / OpenGraph / Microdata                       │
+│     → 无 lxml，避免内存泄漏                                 │
+│     → 覆盖 80%+ 现代电商网站                                │
+├─────────────────────────────────────────────────────────────┤
+│  2. 内置 Extruct 提取  (processor.py)                       │
+│     → 使用 extruct 库解析所有结构化数据                      │
+│     → JSON-LD / Microdata / OpenGraph / RDFa                │
+│     → Linux 下通过 subprocess 隔离防止内存泄漏               │
+├─────────────────────────────────────────────────────────────┤
+│  3. LLM 备用提取  (plugins/llm_restock.py)                  │
+│     → 当前两种方法均失败时触发                               │
+│     → 发送清理后的页面文本给 LLM 进行结构化提取              │
+│     → 可配置开关                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-#### 2. 价格变化 (follow_price_changes)
+### 4.2 纯 Python 提取器详解
 
+**设计目标**:
+- 避免使用 lxml 导致的 C 级内存泄漏
+- 快速、轻量级，覆盖大部分场景
+- 使用 Python 内置 html.parser
+
+**提取顺序**:
+1. **JSON-LD** - `<script type="application/ld+json">` 块
+2. **OpenGraph** - `<meta property="og:*">` 标签
+3. **Microdata** - itemprop 属性元素
+
+### 4.3 内存管理优化（Linux）
+
+**问题背景**:
+- lxml 解析大型 HTML 时会分配大量 C 级内存
+- Python GC 无法释放这些内存，导致进程内存持续增长
+- 5MB+ 页面可能导致每次解析增长 50-500MB
+
+**解决方案**:
 ```python
-# 比较当前价格与原始价格
-if current_price != original_price:
-    changed_detected = True
+# Linux 平台使用 multiprocessing spawn 模式
+# subprocess 完成后 OS 自动回收所有内存
+ctx = multiprocessing.get_context('spawn')
+parent_conn, child_conn = ctx.Pipe()
+p = ctx.Process(target=_extract_itemprop_availability_worker, args=(child_conn,))
+p.start()
+# 通过管道传输 HTML 和结果
+# 进程退出后 OS 强制回收所有内存
 ```
 
-**可选阈值限制**:
-- `price_change_min`: 价格低于此值才触发
-- `price_change_max`: 价格高于此值才触发
-- `price_change_threshold_percent`: 价格变化百分比阈值
+**性能权衡**:
+- ✅ 完全消除内存泄漏
+- ✅ 内存增长稳定在 35MB 左右
+- ⚠️ 额外的进程启动开销（约 100-200ms）
 
-### 元数据可用性检测
+---
+
+## 5. 库存状态检测规则
+
+### 5.1 结构化数据中的 Availability 值
 
 ```python
-# 支持的库存状态关键词
+# 视为 "有库存" 的值
 in_stock_keywords = [
     'instock', 'instoreonly', 'limitedavailability',
     'onlineonly', 'presale'
 ]
+
+# 视为 "无库存" 的值
+out_of_stock_keywords = [
+    'outofstock', 'soldout', 'discontinued',
+    'temporarilyoutofstock'
+]
 ```
 
-### 谎言检测机制
+### 5.2 浏览器 JS 级检测（fallback）
+
+当页面没有结构化数据时，使用前端 JS 检测页面文本：
+
+```javascript
+// stock-not-in-stock.js 检测关键字
+// 忽略页面顶部 300px 内的内容（避免导航栏误判）
+检测关键词:
+  - 有库存: "Add to cart", "Buy now", "Available", "In stock"
+  - 无库存: "Out of stock", "Sold out", "Unavailable"
+```
+
+### 5.3 真相源优先级
+
+```
+最高优先级: 浏览器 JS 文本检测结果
+    ↓
+中等优先级: 页面结构化元数据
+    ↓
+最低优先级: LLM 推断结果
+```
+
+> **重要**: 网站经常在元数据中撒谎（显示有货但实际缺货）。因此当浏览器检测到"无库存"时，会覆盖结构化数据的结果。
+
+---
+
+## 6. 价格变更检测
+
+### 6.1 检测参数
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `follow_price_changes` | Boolean | 是否启用价格追踪 |
+| `price_change_min` | Float | 触发通知的价格下限 |
+| `price_change_max` | Float | 触发通知的价格上限 |
+| `price_change_threshold_percent` | Float | 价格变化百分比阈值 |
+
+### 6.2 价格去重逻辑
 
 ```python
-# 当网页内容明确显示缺货时，覆盖元数据的"有货"声明
-if scraper.says_NOT_in_stock_but_metadata.says_in_stock:
-    update_obj['restock']['in_stock'] = False
+def _deduplicate_prices(data):
+    # 处理以下情况:
+    # 1. 同一价格的不同表示: "$159", "159", 159
+    # 2. 多个数据源重复: JSON-LD 和 Microdata 都有价格
+    # 3. 千位分隔符差异: "1,299" vs "1299"
+    #
+    # 返回去重后的唯一价格集合
+```
+
+### 6.3 变更触发条件
+
+```
+触发通知当:
+  (价格 != 原始价格) 
+    AND
+  (价格 < price_change_min OR 价格 > price_change_max)
+    AND
+  (变化百分比 >= threshold_percent)
 ```
 
 ---
 
-## 配置选项 (forms.py)
+## 7. LLM 备用提取插件
 
-### RestockSettingsForm
+### 7.1 触发条件
 
-| 配置项 | 类型 | 说明 |
-|--------|------|------|
-| `in_stock_processing` | Radio | `in_stock_only`(仅缺货→有货) / `all_changes`(所有变化) / `off`(关闭) |
-| `follow_price_changes` | Boolean | 是否跟踪价格变化 |
-| `price_change_min` | Float | 最低价格阈值 |
-| `price_change_max` | Float | 最高价格阈值 |
-| `price_change_threshold_percent` | Float | 价格变化百分比阈值 (0-100) |
-
-### 标签覆盖机制
-
-支持通过标签（Tag）覆盖单个监控的配置：
 ```python
-if tag.get('overrides_watch'):
-    restock_settings = tag.get('processor_config_restock_diff')
+# 当以下条件满足时启用 LLM 提取:
+1. 纯 Python 提取未同时获得 price + availability
+2. Extruct 提取也未同时获得两者
+3. 系统配置中启用了 LLM fallback
+4. LLM API key 已配置
+```
+
+### 7.2 预处理优化
+
+**降噪步骤** (`_strip_html`):
+1. 提取 JSON-LD 块前置（可靠结构化数据）
+2. 移除 nav/header/footer/aside 标签
+3. 移除推荐商品区块（避免混淆价格）
+4. 删除 script/style 块和 HTML 注释
+5. 剥离所有 HTML 标签
+6. 压缩空白字符
+7. 截断至 8000 字符
+
+### 7.3 系统 Prompt 关键点
+
+- **价格提取规则**: 忽略导航栏购物车价格、推荐商品价格、价格区间
+- **库存判断**: 只看产品区域的 "Add to cart" 等按钮，忽略导航栏
+- **输出格式**: 严格的 JSON 格式 `{price, currency, availability}`
+- **分类网站特殊处理**: eBay/分类网站有价格 + 卖家联系方式 = 有库存
+
+---
+
+## 8. 处理器能力声明
+
+```python
+supports_visual_selector = True           # 支持视觉选择器
+supports_browser_steps = True             # 支持浏览器步骤
+supports_text_filters_and_triggers = True # 支持文本过滤触发器
+supports_request_type = True              # 支持自定义请求方法
 ```
 
 ---
 
-## 内存管理策略
+## 9. 检测流程时序图
 
-### lxml/extruct 内存泄漏问题
-
-**问题根源**:
-1. lxml 使用 libxml2 C 库分配内存
-2. Python GC 无法释放 C 级内存分配
-3. 大量 HTML 解析后内存持续增长
-
-**解决方案: 多进程隔离 (Linux)**
-
-```python
-# 使用 spawn 创建子进程
-ctx = multiprocessing.get_context('spawn')
-p = ctx.Process(target=_extract_itemprop_availability_worker, args=(child_conn,))
-
-# 子进程退出时 OS 强制回收所有内存
-p.join()
 ```
-
-### 纯 Python 提取器优化
-
-未来可能的优化方向：
-1. 使用正则提取 JSON-LD 块（避免解析整个 HTML）
-2. 减少 lxml 的使用场景
-3. 仅解析元数据相关的小部分 HTML
+调用 perform_site_check()
+    │
+    ├─► 计算 HTML MD5 校验和
+    │   └─► 如果校验和相同 + 未编辑配置 → 跳过处理
+    │
+    ├─► 读取 restock_diff.json 配置
+    │   └─► 检查是否有 Tag 覆盖本 watch 配置
+    │
+    ├─► 第一层: 纯 Python 元数据提取
+    │   └─► 成功(price+avail)? → 用此结果
+    │
+    ├─► 第二层: Extruct 提取 (Linux subprocess)
+    │   └─► 成功(price+avail)? → 用此结果
+    │
+    ├─► 第三层: 检查 LLM 插件覆盖
+    │   └─► LLM 可用且需要? → 调用 LLM 提取
+    │
+    ├─► 检查多价格异常
+    │   └─► 多价格且插件也失败 → 抛出异常
+    │
+    ├─► 浏览器 JS 库存检测结果覆盖
+    │   └─► JS 检测无库存 → 强制覆盖 in_stock=False
+    │
+    ├─► 生成快照内容: "In Stock: {x} - Price: {y}"
+    │
+    ├─► 计算快照 MD5
+    │
+    └─► 变更检测判断
+        ├─► 库存状态变更检测
+        │   └─► 仅缺货→有货? 还是所有变更?
+        ├─► 价格变更检测
+        │   └─► 应用 min/max/百分比阈值
+        └─► 返回 (changed_detected, update_obj, snapshot)
+```
 
 ---
 
-## 通知令牌 (Notification Tokens)
+## 10. 关键配置选项
 
-### 可用令牌
+### 10.1 库存检测模式
 
-| 令牌 | 说明 |
+| 模式 | 行为 |
 |------|------|
-| `restock.price` | 当前价格 |
-| `restock.in_stock` | 库存状态 |
-| `restock.original_price` | 首次检测价格 |
-| `restock.previous_price` | 上次历史价格 |
+| `in_stock_only` | **默认** - 仅当从"缺货"变为"有货"时触发 |
+| `all_changes` | 任何库存状态变更都触发通知 |
+| `off` | 完全关闭库存检测 |
 
-### extra_notification_token_values() 实现
+### 10.2 价格检测配置
+
+- **follow_price_changes**: 开启/关闭价格追踪
+- **price_change_min/max**: 价格区间过滤（只在区间外触发）
+- **price_change_threshold_percent**: 相对于原始价格的变化百分比阈值
+
+---
+
+## 11. 异常处理
+
+### 11.1 异常类型
 
 ```python
-def extra_notification_token_values(self):
-    values = super().extra_notification_token_values()
-    values['restock'] = self.get('restock', {})
-    # 从历史快照中获取上一次价格
-    if history_n >= 2:
-        values['restock']['previous_price'] = get_price_from_history_str(
-            self.get_history_snapshot(timestamp=sorted_keys[-1])
-        )
-    return values
+class UnableToExtractRestockData(Exception):
+    # 无法从页面提取任何库存/价格数据
+    # 可能原因: 页面非产品页、结构化数据缺失
+
+class MoreThanOnePriceFound(Exception):
+    # 页面检测到多个不同价格
+    # 触发条件: 去重后仍有多个价格
+    # 处理: 尝试用 LLM 确定正确价格，仍失败则报错
+
+class ProcessorException(基类):
+    # 通用处理器异常
 ```
 
+### 11.2 错误恢复策略
+
+1. **多价格错误**: 先尝试 LLM 插件提取正确价格，仍失败才报错
+2. **提取失败降级**: 结构化数据失败 → 降级到 JS 文本检测
+3. **内存隔离失败**: subprocess 失败 → 降级到直接调用
+
 ---
 
-## 快照内容格式
+## 12. 测试覆盖
 
-```python
-snapshot_content = f"In Stock: {in_stock} - Price: {price}"
-# 示例: "In Stock: True - Price: 29.99"
+### 12.1 现有测试文件
+
+| 测试文件 | 覆盖内容 |
+|----------|----------|
+| `tests/restock/test_restock.py` | 端到端库存检测流程 |
+| `tests/test_restock_itemprop.py` | 结构化数据提取 |
+| `tests/unit/test_restock_logic.py` | 核心逻辑单元测试 |
+| `tests/llm/test_llm_restock_plugin.py` | LLM 插件测试 |
+
+### 12.2 关键测试场景
+
+- 缺货 → 有货 通知触发（默认行为）
+- 有货 → 缺货 不通知（默认）
+- 价格变化检测与阈值
+- 多价格页面的错误处理
+- 标签配置覆盖 watch 配置
+- LLM fallback 触发条件
+
+---
+
+## 13. 设计亮点与优化点
+
+### 13.1 优秀设计
+
+1. **分层提取策略**: 从快到慢、从可靠到 fallback 的多级提取
+2. **内存隔离**: Linux 下 subprocess 彻底解决 lxml 内存泄漏
+3. **真相源优先级**: 浏览器实际可见内容优先级高于元数据
+4. **降噪处理**: LLM 提取前智能移除导航栏/推荐区块噪声
+5. **配置可覆盖**: 支持 Tag 级别配置覆盖单个 watch
+
+### 13.2 潜在优化方向
+
+1. **正则预提取**: 在 extruct 之前先用正则提取 JSON-LD 等小块，避免解析整个 5MB HTML
+2. **价格历史**: 当前只比较原始价格，可增加历史波动分析
+3. **变体支持**: 增加对多变体产品（颜色/尺码）的库存检测支持
+4. **缓存优化**: 提取的元数据可缓存，避免重复解析相同内容
+
+---
+
+## 14. 通知占位符
+
+```jinja2
+{{ restock.price }}              # 当前价格
+{{ restock.in_stock }}           # 库存状态布尔值
+{{ restock.original_price }}     # 首次检测的价格
+{{ restock.previous_price }}     # 上一次检测的价格
 ```
-
-快照内容用于生成 MD5 校验和，作为变更检测的依据。
-
----
-
-## 性能考量
-
-### 1. 校验跳过机制
-
-```python
-# 仅当 HTML 内容未变化且配置未修改时跳过处理
-if (not force_reprocess and
-    not watch.was_edited and
-    last_raw_content_checksum == current_raw_document_checksum):
-    raise checksumFromPreviousCheckWasTheSame()
-```
-
-### 2. 提取优先级
-
-| 层级 | 方法 | 性能 | 覆盖率 |
-|------|------|------|--------|
-| 1 | 纯 Python | 最快 | 80%+ |
-| 2 | extruct | 较慢 | 90%+ |
-| 3 | LLM | 最慢 | ~100% |
-
-### 3. Linux 多进程开销
-
-- 每次 extruct 提取约 35MB 额外开销
-- 但避免了 500MB+ 的内存泄漏累积
-
----
-
-## 错误处理
-
-### 异常类型
-
-| 异常 | 说明 | 处理方式 |
-|------|------|----------|
-| `UnableToExtractRestockData` | 无法提取数据 | 记录状态码 |
-| `MoreThanOnePriceFound` | 发现多个价格 | 仅支持单产品页面 |
-| `checksumFromPreviousCheckWasTheSame` | 内容未变化 | 跳过处理 |
-
-### 错误恢复策略
-
-```python
-# 多个价格时的处理流程
-1. 记录警告
-2. 尝试插件提取
-3. 插件也失败 → 抛出 ProcessorException
-```
-
----
-
-## 测试覆盖
-
-### 单元测试
-- `test_restock_logic.py` - 核心逻辑测试（is_between 函数）
-
-### 集成测试
-- `test_restock.py` - 完整补货检测流程测试
-- `test_restock_itemprop.py` - itemprop 提取测试
-- `test_llm_restock_plugin.py` - LLM 插件测试
-
----
-
-## API 扩展 (api.yaml)
-
-处理器通过 `api.yaml` 扩展了 Watch 和 Tag 的 API schema：
-
-```yaml
-processor_config_restock_diff:
-  in_stock_processing: string (enum)
-  follow_price_changes: boolean
-  price_change_min: number
-  price_change_max: number
-  price_change_threshold_percent: number (0-100)
-```
-
----
-
-## 使用场景
-
-### 适用场景
-- 电商产品页面监控
-- 限量商品补货提醒
-- 价格波动跟踪
-- 多个商品同时监控
-
-### 不适用场景
-- 分类页面/搜索结果页
-- 多个产品混合页面
-- 需要登录才能看到库存的页面
-- SPA 动态渲染页面（建议配合 html_webdriver 使用）
-
----
-
-## 技术债务与未来优化
-
-1. **正则提取替代 lxml**: 避免 C 级内存泄漏
-2. **locale 感知的价格解析**: 当前硬编码 `locale='en'`
-3. **更细粒度的价格阈值**: 支持百分比和绝对值的组合
-4. **历史价格图表**: 可视化价格走势
-5. **多产品支持**: 扩展为监控页面上的多个产品
 
 ---
 
 ## 总结
 
-restock_diff 处理器是一个设计良好的电商监控解决方案，具有：
+Restock 处理器是一个高度优化的电商产品监控模块，其核心优势在于：
 
-1. **健壮的三层提取架构** - 平衡性能和覆盖率
-2. **完善的内存管理** - 特别是 Linux 下的多进程隔离
-3. **灵活的配置选项** - 支持细粒度的触发控制
-4. **智能的谎言检测** - 优先信任网页内容而非元数据
-5. **完整的错误处理** - 多层次的重试和回退机制
+1. **多层提取架构**确保了对各种网站的广泛兼容性
+2. **内存泄漏防护**使其适合大规模部署
+3. **智能降噪和优先级机制**提高了检测准确率
+4. **灵活的阈值配置**满足不同用户的监控需求
+
+该处理器特别适合电商价格监控、补货提醒等场景，是 changedetection.io 中最复杂也最强大的处理器之一。
