@@ -557,79 +557,138 @@ class RecheckPriorityQueue:
 
 ---
 
-## 九、触发源 × 门槛条件判定矩阵
+## 九、触发源 × 门槛条件判定矩阵（事实校准版）
 
-### 9.1 四类触发路径的门槛执行情况
+### 9.1 四类触发路径的门槛执行情况（基于真实代码）
 
 | 门槛条件 | Ticker周期调度 | 单项recheck | recheck_all | Batch mode自动入队 |
 |---------|---------------|------------|-------------|-------------------|
 | **全局暂停(all_paused)** | ✅ 执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
-| **单项暂停(watch.paused)** | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 执行 |
+| **单项暂停(watch.paused)** | ✅ 执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
 | **时间窗口(is_in_schedule)** | ✅ 执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
-| **运行中去重(running_uuids)** | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 执行 |
-| **已入队去重(queued_uuids)** | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 执行 |
-| **队列上限(maxsize)** | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 执行 |
-| **代理复用冷却(reuse_time_minimum)** | ✅ 执行(常规) / ❌ 跳过(首次) | ✅ 执行 | ✅ 执行 | ✅ 执行(常规) / ❌ 跳过(首次) |
+| **运行中去重(running_uuids)** | ✅ 执行 | ❌ 不执行 | ✅ 执行 | ❌ 不执行 |
+| **已入队去重(queued_uuids)** | ✅ 执行 | ❌ 不执行 | ✅ 执行 | ❌ 不执行 |
+| **队列上限(MAX_QUEUE_SIZE)** | ✅ 执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
+| **代理复用冷却(reuse_time_minimum)** | ✅ 执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
+| **时间阈值检查(threshold)** | ✅ 执行 | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 |
 
-### 9.2 判定顺序差异：首次检查 vs 常规周期检查
+### 9.2 各触发源代码逻辑详解
 
-#### 9.2.1 Ticker周期调度 - 首次检查判定顺序
+#### 9.2.1 Ticker周期调度 (`flask_app.py:1130-1270`)
 
+```python
+# 1. 全局暂停检查（最外层）
+if datastore.data['settings']['application'].get('all_paused', False):
+    continue
+
+# 2. 队列上限检查（每100个watch检查一次）
+if watch_index % 100 == 0:
+    if update_q.qsize() >= MAX_QUEUE_SIZE:
+        break
+
+# 3. 单项暂停检查
+if watch['paused']:
+    continue
+
+# 4. 时间窗口检查
+if time_schedule_limit and time_schedule_limit.get('enabled'):
+    result = is_within_schedule(...)
+    if not result:
+        continue
+
+# 5. 时间阈值检查
+if seconds_since_last_recheck >= (threshold + watch.jitter_seconds) and ...:
+    # 6. 运行中/已入队去重检查
+    if not uuid in running_uuids and uuid not in queued_uuids:
+        # 7. 代理复用冷却检查
+        if proxy_list_reuse_time_minimum:
+            if time_since_proxy_used < proxy_list_reuse_time_minimum:
+                continue
+            else:
+                proxy_last_called_time[watch_proxy] = int(time.time())
+        # 8. 入队
+        worker_pool.queue_item_async_safe(update_q, ...)
 ```
-触发 → 全局暂停检查 → 单项暂停检查 → 时间窗口检查 → 运行中/已入队去重 → 时间阈值检查(自动通过) → 队列入队
-                                                                           ↑
-                                                                  last_checked=0，必然满足
+
+**门槛执行顺序**：全局暂停 → 队列上限 → 单项暂停 → 时间窗口 → 时间阈值 → 运行中/已入队去重 → 代理冷却 → 入队
+
+#### 9.2.2 单项recheck (`api/Watch.py:80-82`)
+
+```python
+# 直接入队，无任何门槛检查！
+if request.args.get('recheck'):
+    worker_pool.queue_item_async_safe(self.update_q, 
+        queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+    return "OK", 200
+```
+
+**门槛执行情况**：无任何检查，直接入队
+
+**设计意图**：手动触发应立即执行，不受任何限制
+
+#### 9.2.3 recheck_all (`api/Watch.py:536-590`)
+
+```python
+if request.args.get('recheck_all'):
+    watches_to_queue = self.datastore.data['watching'].keys()
+    
+    if len(watches_to_queue) < 20:
+        # 仅检查运行中/已入队去重
+        queued_uuids = set(self.update_q.get_queued_uuids())
+        running_uuids = set(worker_pool.get_running_uuids())
+        
+        watches_to_queue_filtered = [
+            uuid for uuid in watches_to_queue
+            if uuid not in queued_uuids and uuid not in running_uuids
+        ]
+        
+        for uuid in watches_to_queue_filtered:
+            worker_pool.queue_item_async_safe(update_q, ...)
+```
+
+**门槛执行情况**：仅执行运行中/已入队去重，无其他检查
+
+#### 9.2.4 Batch mode自动入队 (`__init__.py:430-445`)
+
+```python
+if batch_mode and added_watch_uuids:
+    for watch_uuid in added_watch_uuids:
+        # 直接入队，无任何门槛检查！
+        worker_pool.queue_item_async_safe(
+            update_q,
+            queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': watch_uuid})
+        )
+```
+
+**门槛执行情况**：无任何检查，直接入队
+
+**设计意图**：批量模式下用户明确要求立即执行，不受限制
+
+### 9.3 首次检查与常规周期检查的差异
+
+#### 9.3.1 Ticker首次检查（last_checked=0）
+
+```python
+seconds_since_last_recheck = now - watch['last_checked']  # now - 0 = now
+if seconds_since_last_recheck >= (threshold + watch.jitter_seconds):
+    # 必然满足，因为 now >> threshold
 ```
 
 **特点**：
-- 代理复用冷却**跳过**（首次检查无前序调用）
-- 时间阈值检查**自动通过**（`now - 0` 远大于阈值）
+- 时间阈值检查**自动通过**
+- 代理冷却检查**仍然执行**（但首次检查时 proxy_last_called_time 为0，可能触发冷却）
 
-#### 9.2.2 Ticker周期调度 - 常规周期检查判定顺序
+#### 9.3.2 Ticker常规周期检查
 
-```
-触发 → 全局暂停检查 → 单项暂停检查 → 时间窗口检查 → 运行中/已入队去重 → 时间阈值检查 → 代理复用冷却检查 → 队列入队
-                                                                              ↑
-                                                                     需要等待threshold秒
-```
-
-**特点**：
-- 代理复用冷却**执行**（需检查时间间隔）
-- 时间阈值检查**需满足**（等待threshold秒后）
-
-#### 9.2.3 单项recheck判定顺序
-
-```
-触发 → 单项暂停检查 → 运行中/已入队去重 → 队列入队
+```python
+seconds_since_last_recheck = now - watch['last_checked']
+if seconds_since_last_recheck >= (threshold + watch.jitter_seconds):
+    # 需要等待threshold秒后才满足
 ```
 
 **特点**：
-- **绕过**全局暂停、时间窗口限制
-- **跳过**时间阈值检查、代理复用冷却检查
-- 优先级为 **1**（立即执行）
-
-#### 9.2.4 recheck_all判定顺序
-
-```
-触发 → 单项暂停检查 → 运行中/已入队去重 → 队列入队（逐项）
-```
-
-**特点**：
-- **绕过**全局暂停、时间窗口限制
-- **跳过**时间阈值检查、代理复用冷却检查
-- 优先级为 **1**（立即执行）
-- 20项以下同步处理，20项以上后台异步处理
-
-#### 9.2.5 Batch mode自动入队判定顺序
-
-```
-触发 → 单项暂停检查 → 运行中/已入队去重 → 队列入队（逐项）
-```
-
-**特点**：
-- **绕过**全局暂停、时间窗口限制
-- **跳过**时间阈值检查、代理复用冷却检查（首次检查）
-- 优先级为 **1**（立即执行）
+- 时间阈值检查**需等待**
+- 代理冷却检查**正常执行**
 
 ---
 
