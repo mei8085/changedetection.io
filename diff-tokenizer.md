@@ -527,7 +527,459 @@ tokens B: ['<span class="price">', '$149', '</span>']
 
 ---
 
-## 七、自动选择 Tokenizer 设计方案
+## 七、四组合 Diff 输出对照分析
+
+基于同一组输入，在四种参数组合下的原始 diff 输出逐条对比，解释标记出现原因。
+
+### 7.1 测试用例说明
+
+**标准输入：**
+```
+BEFORE: '<div class="price">$99</div>'      # 原始价格
+AFTER:  '<div class="price">$149</div>'      # 涨价后
+```
+
+**四种参数组合：**
+| 编号 | `word_diff` | `tokenizer` | 预期行为 |
+|-----|-------------|-------------|---------|
+| ① | `False` | `words` | 行级 diff，无 tokenizer |
+| ② | `False` | `words_and_html` | 行级 diff，无 tokenizer |
+| ③ | `True` | `words` | 词级 diff，按空格切分 |
+| ④ | `True` | `words_and_html` | 词级 diff，保留 HTML 标签 |
+
+---
+
+### 7.2 组合 ①：`word_diff=False, words`
+
+**原始输出：**
+```
+[@changed_PLACEMARKER_OPEN<div class="price">$99</div>@changed_PLACEMARKER_CLOSED,
+ @changed_into_PLACEMARKER_OPEN<div class="price">$149</div>@changed_into_PLACEMARKER_CLOSED]
+```
+
+**标记分析：**
+- ✅ **出现 `CHANGED` + `CHANGED_INTO` 标记**
+- ❌ **无 `REMOVED` / `ADDED` 内联标记**
+- **原因：** `word_diff=False` 强制降级为行级 diff，整行被标记为"变更"，不进行词级切分和比较
+
+**高亮效果：** 整行 `<div class="price">$99</div>` 被高亮（移除），整行 `<div class="price">$149</div>` 被高亮（新增），HTML 标签和价格一起被标为变更。
+
+---
+
+### 7.3 组合 ②：`word_diff=False, words_and_html`
+
+**原始输出：**
+```
+[@changed_PLACEMARKER_OPEN<div class="price">$99</div>@changed_PLACEMARKER_CLOSED,
+ @changed_into_PLACEMARKER_OPEN<div class="price">$149</div>@changed_into_PLACEMARKER_CLOSED]
+```
+
+**标记分析：**
+- ✅ **与组合 ① 输出完全相同**
+- **原因：** `word_diff=False` 时，tokenizer 参数被完全忽略，根本不会传递到 `render_inline_word_diff` 分支
+
+**结论：** 当 `word_diff=False` 时，**任何 tokenizer 选择都无效果**。
+
+---
+
+### 7.4 组合 ③：`word_diff=True, words`
+
+**原始输出：**
+```
+[@removed_PLACEMARKER_OPEN<div@removed_PLACEMARKER_CLOSED
+ @removed_PLACEMARKER_OPENclass="price">$99</div>@removed_PLACEMARKER_CLOSED
+ @added_PLACEMARKER_OPENclass="price">$149</div>@added_PLACEMARKER_CLOSED]
+```
+
+**实际格式化输出（简化）：**
+```
+@removed_PLACEMARKER_OPEN<div@removed_PLACEMARKER_CLOSED @removed_PLACEMARKER_OPENclass="price">$99</div>@removed_PLACEMARKER_CLOSED
+@added_PLACEMARKER_OPENclass="price">$149</div>@added_PLACEMARKER_CLOSED
+```
+
+**标记分析：**
+- ✅ **出现 `REMOVED` + `ADDED` 标记**（内联词级）
+- ❌ **无 `CHANGED` 标记**（因为存在共同 token）
+- **问题：** HTML 标签被空格错误拆分！
+
+**token 切分过程：**
+```
+words tokenizer 对 '<div class="price">$99</div>' 的切分结果：
+[ '<div', ' ', 'class="price">$99</div>' ]
+  ↑        ↑        ↑
+  token1  空格    token2
+
+words tokenizer 对 '<div class="price">$149</div>' 的切分结果：
+[ '<div', ' ', 'class="price">$149</div>' ]
+  ↑        ↑        ↑
+  token1  空格    token2
+```
+
+**差异比较：**
+- `'<div'` → **EQUAL**（共同 token，不标记）
+- `' '` → **EQUAL**（空格 token，不标记）
+- `'class="price">$99</div>'` vs `'class="price">$149</div>'`
+  → **DIFFERENT**（被标记为 REMOVED + ADDED）
+
+**高亮效果：**
+```
+<div <REMOVED:class="price">$99</div></REMOVED>
+     <ADDED:class="price">$149</div></ADDED>
+```
+⚠️ **问题：** 本应只高亮 `$99` → `$149`，但 `words` tokenizer 把 `class="price">$99</div>` 作为单个 token，导致**HTML 属性和标签一起被错误高亮**。
+
+---
+
+### 7.5 组合 ④：`word_diff=True, words_and_html`
+
+**原始输出：**
+```
+<div class="price">@removed_PLACEMARKER_OPEN$99@removed_PLACEMARKER_CLOSED
+@added_PLACEMARKER_OPEN$149@added_PLACEMARKER_CLOSED</div>
+```
+
+**标记分析：**
+- ✅ **出现 `REMOVED` + `ADDED` 标记**（内联词级）
+- ✅ **标记精确落在 `$99` 和 `$149` 上**
+- ✅ **HTML 标签完全保留且未被标记**
+
+**token 切分过程：**
+```
+words_and_html tokenizer 对 '<div class="price">$99</div>' 的切分结果：
+[ '<div class="price">', '$99', '</div>' ]
+  ↑                       ↑      ↑
+  HTML 标签 token         价格    结束标签
+
+words_and_html tokenizer 对 '<div class="price">$149</div>' 的切分结果：
+[ '<div class="price">', '$149', '</div>' ]
+  ↑                       ↑      ↑
+  完全相同（EQUAL）      变化    完全相同（EQUAL）
+```
+
+**差异比较：**
+- `'<div class="price">'` → **EQUAL**（完整 HTML 标签，共同 token）
+- `'$99'` vs `'$149'` → **DIFFERENT**（精确标记为 REMOVED + ADDED）
+- `'</div>'` → **EQUAL**（完整 HTML 结束标签）
+
+**高亮效果：**
+```
+<div class="price"><REMOVED:$99</REMOVED><ADDED:$149</ADDED></div>
+```
+✅ **完美：** 只有价格变化被精确高亮，HTML 标签结构完全保留且未被标记。
+
+---
+
+### 7.6 四组合总结对照表
+
+| 组合 | `word_diff` | `tokenizer` | 标记类型 | 高亮精度 | tokenizer 是否生效 |
+|-----|-------------|-------------|---------|---------|-------------------|
+| ① | False | words | `CHANGED` | ❌ 整行 | ❌ **不生效** |
+| ② | False | words_and_html | `CHANGED` | ❌ 整行 | ❌ **不生效** |
+| ③ | True | words | `REMOVED+ADDED` | ⚠️ 包含多余 HTML | ✅ 生效 |
+| ④ | True | words_and_html | `REMOVED+ADDED` | ✅ 精确 | ✅ 生效 |
+
+**关键结论：**
+1. **tokenizer 生效的前提是 `word_diff=True`**
+2. **`word_diff=False` 时，tokenizer 参数被完全忽略**
+3. **只有 `word_diff=True + 单行替换 + words_and_html` 才能实现精确高亮**
+
+---
+
+## 八、单行 Replace 与 多行 Replace 并排对照
+
+### 8.1 分支判断关键代码
+
+```python
+# changedetectionio/diff/__init__.py:403-417
+if word_diff and len(before_lines) == 1 and len(after_lines) == 1:
+    # 分支 A：单行替换 → 进入词级 diff，tokenizer 生效
+    inline_diff, has_changes = render_inline_word_diff(
+        before_lines[0], after_lines[0],
+        ignore_junk=ignore_junk,
+        tokenizer=tokenizer,  # ← tokenizer 被传递
+        include_change_type_prefix=include_change_type_prefix
+    )
+    yield [inline_diff]
+else:
+    # 分支 B：多行替换 → 降级为行级 diff，tokenizer 完全不生效
+    yield [f'{CHANGED_PLACEMARKER_OPEN}{line}...' for line in before_lines]
+    yield [f'{CHANGED_INTO_PLACEMARKER_OPEN}{line}...' for line in after_lines]
+```
+
+---
+
+### 8.2 并排对照分析表
+
+| 维度 | 单行 Replace（分支 A） | 多行 Replace（分支 B） |
+|-----|----------------------|----------------------|
+| **触发条件** | `len(before_lines) == 1` AND `len(after_lines) == 1` | `len(before_lines) > 1` OR `len(after_lines) > 1` |
+| **调用函数** | `render_inline_word_diff()` | 直接格式化输出 |
+| **tokenizer 状态** | ✅ **被传递并生效** | ❌ **完全不生效** |
+| **标记类型** | `REMOVED` + `ADDED`（内联） | `CHANGED` + `CHANGED_INTO`（整行） |
+| **高亮粒度** | 词级精确 | 行级粗略 |
+| **HTML 感知** | 依赖 tokenizer 选择 | 无（整行标记） |
+| **通知提取精度** | 可精确提取变化值 | 提取整行包含多余内容 |
+
+---
+
+### 8.3 实际示例：多行 HTML 变化
+
+**输入（多行）：**
+```
+BEFORE (3 lines):
+  <div class="product">
+    <span class="price">$99</span>
+    <span class="stock">In Stock</span>
+  </div>
+
+AFTER (3 lines):
+  <div class="product">
+    <span class="price">$149</span>
+    <span class="stock">In Stock</span>
+  </div>
+```
+
+**输出（无论 tokenizer 如何选择）：**
+```
+@changed_PLACEMARKER_OPEN<span class="price">$99</span>@changed_PLACEMARKER_CLOSED
+@changed_into_PLACEMARKER_OPEN<span class="price">$149</span>@changed_into_PLACEMARKER_CLOSED
+```
+
+**标记分析：**
+- ✅ **总是 `CHANGED` + `CHANGED_INTO` 标记**
+- ❌ **tokenizer 参数被完全忽略**（即使设置 `words_and_html`）
+- ❌ **整行被高亮**，无法精确只标价格
+- **原因：** `len(before_lines) = 3 > 1`，触发分支 B（多行降级）
+
+---
+
+### 8.4 边缘情况：看似单行实际多行
+
+**问题场景：**
+```
+# 看似单行的 HTML，但实际包含换行符
+BEFORE: '<div>\n$99\n</div>'    # 包含 \n → 3 行
+AFTER:  '<div>\n$149\n</div>'   # 包含 \n → 3 行
+```
+
+**结果：** `len(before_lines) = 3`，触发**多行分支 B**，tokenizer 不生效。
+
+**解决方案：** 在 diff 前进行 HTML 压缩，去除换行符使内容真正成为单行。
+
+---
+
+### 8.5 Tokenizer 生效边界总览
+
+```
+                        ┌─────────────────────────────┐
+                        │     输入 Replace 场景        │
+                        └──────────────┬──────────────┘
+                                       │
+                       ┌───────────────┴───────────────┐
+                       │  word_diff == True ?          │
+                       └───────────────┬───────────────┘
+                                   否 / \ 是
+                                    /     \
+                                   /       \
+                    ┌─────────────┐      ┌──────────────────┐
+                    │  降级行级    │      │  len(before) == 1 │
+                    │  CHANGED 标记│      │  len(after) == 1  │
+                    │  ❌ tokenizer│      └────────┬─────────┘
+                    └─────────────┘             否 / \ 是
+                                                /       \
+                                               /         \
+                                    ┌───────────┐     ┌───────────────┐
+                                    │  多行降级  │     │  进入词级 diff │
+                                    │  CHANGED   │     │  ✅ tokenizer  │
+                                    │  ❌ tokenizer│    │  REMOVED+ADDED │
+                                    └───────────┘     └───────────────┘
+```
+
+**三个必要条件（逻辑 AND）：**
+1. ✅ `word_diff == True`
+2. ✅ `len(before_lines) == 1`
+3. ✅ `len(after_lines) == 1`
+
+**缺少任一条件 → tokenizer 完全不生效。**
+
+---
+
+## 九、映射到 text_json_diff 两条内容路径
+
+### 9.1 路径回顾
+
+```
+                              ┌───────────────────────┐
+                              │   text_json_diff 处理器  │
+                              └───────────┬───────────┘
+                                          │
+                          ┌───────────────┴───────────────┐
+                          │  watch.is_source_type_url ?    │
+                          │  OR content.is_plaintext ?     │
+                          └───────────────┬───────────────┘
+                                      是 / \ 否
+                                        /     \
+                                       /       \
+                        ┌──────────────┐      ┌──────────────────┐
+                        │  路径一：保留  │      │  路径二：提取     │
+                        │  HTML 原文     │      │  纯文本内容       │
+                        │  (源代码模式)   │      │  (常规网页监控)   │
+                        └──────┬─────────┘      └─────────┬────────┘
+                               │                          │
+                    tokenizer 选择**有影响**        tokenizer 选择**无影响**
+```
+
+---
+
+### 9.2 路径一：保留 HTML 原文（源代码模式）
+
+**触发条件：**
+- `watch.is_source_type_url = True`（监控 HTML/JSON/XML 等源文件）
+- 或者 `stream_content_type.is_plaintext = True`
+
+**内容特征：**
+- ✅ 保留 `<`、`>` 等 HTML 标记字符
+- ✅ 可能包含复杂的标签结构和属性
+- ✅ 价格变化通常内嵌在标签中
+
+**Tokenizer 影响矩阵：**
+
+| `word_diff` | `tokenizer` | 效果 | 推荐 |
+|-------------|-------------|------|------|
+| `False` | 任意 | 整行标记，HTML 被整体高亮 | ❌ 不推荐 |
+| `True` | `words` | 标签被空格拆分，高亮区域过大 | ⚠️ 谨慎 |
+| `True` | `words_and_html` | 标签保留完整，精确高亮变化值 | ✅ **推荐** |
+
+**监控场景示例（受 tokenizer 影响）：**
+1. ✅ **REST API JSON 监控**：`{"price": 99}` → `{"price": 149}`
+2. ✅ **XML 产品源监控**：`<price>99</price>` → `<price>149</price>`
+3. ✅ **静态 HTML 文件监控**：`<span>$99</span>` → `<span>$149</span>`
+4. ✅ **RSS/Atom Feed 监控**：包含 HTML 标记的摘要内容
+
+**通知模板提取效果：**
+```
+words_and_html tokenizer:
+  {{diff_changed_from}} → "$99"
+  {{diff_changed_to}}   → "$149"
+  ✅ 纯净，无多余 HTML 标签
+
+words tokenizer:
+  {{diff_changed_from}} → 'class="price">$99</span>'
+  {{diff_changed_to}}   → 'class="price">$149</span>'
+  ⚠️ 包含多余 HTML 属性和标签
+```
+
+---
+
+### 9.3 路径二：提取纯文本（常规网页监控）
+
+**触发条件：**
+- 非源代码模式的普通网页监控
+- `watch.is_source_type_url = False` 且内容非 plaintext
+
+**处理流程：**
+```python
+# 路径二：从 HTML 中提取纯文本（去掉所有标签）
+stripped_text = content_processor.extract_text_from_html(
+    html_content, stream_content_type
+)
+```
+
+**内容特征：**
+- ❌ 所有 HTML 标签被剥离
+- ❌ 无 `<`、`>` 字符触发 HTML token 识别
+- ✅ 只剩纯文本内容
+
+**Tokenizer 影响矩阵：**
+
+| `word_diff` | `tokenizer` | 效果 | 差异 |
+|-------------|-------------|------|------|
+| `False` | 任意 | 整行标记 | 相同 |
+| `True` | `words` | 按空格切分的词级 diff | 相同 |
+| `True` | `words_and_html` | 按空格切分的词级 diff | **完全相同** |
+
+**关键发现：** 路径二下，`words` 和 `words_and_html` 输出**完全相同**。
+
+**原因：** 没有 `<` 和 `>` 字符，`words_and_html` tokenizer 的 HTML 标签特殊处理分支永不触发，实际行为与 `words` 完全一致。
+
+**监控场景示例（tokenizer 无影响）：**
+1. ✅ **电商产品页**：HTML 标签被提取后只剩价格文本
+2. ✅ **新闻文章页**：提取后只剩纯文本内容
+3. ✅ **博客更新监控**：标签剥离后只剩正文
+4. ✅ **论坛帖子变化**：BBCODE/HTML 被清理
+
+**Token 切分示例：**
+```
+HTML 原文: '<span class="price">$99</span> in stock'
+提取后:   '$99 in stock'
+
+words tokenizer:          ['$99', ' ', 'in', ' ', 'stock']
+words_and_html tokenizer: ['$99', ' ', 'in', ' ', 'stock']
+                          ↑ 完全相同（无 < > 字符）
+```
+
+---
+
+### 9.4 两条路径的最终决策矩阵
+
+| 路径 | 内容类型 | Tokenizer 选择影响 | 推荐 Tokenizer | `word_diff` 建议 |
+|-----|---------|------------------|----------------|-----------------|
+| **路径一** | 保留 HTML 原文 | ✅ **显著影响** | `words_and_html` | `True`（精确高亮） |
+| **路径二** | 提取纯文本 | ❌ **无影响** | 任意（两者相同） | `True`（仍有词级收益） |
+
+**自动选择策略建议：**
+```python
+# 在 render_diff 层自动选择 tokenizer
+def auto_select_tokenizer(content, is_source_type):
+    if is_source_type or '<' in content[:1000]:
+        # 路径一或包含明显 HTML 标记 → 使用 words_and_html
+        return 'words_and_html'
+    else:
+        # 路径二纯文本 → 两者相同，任选其一
+        return 'words'  # 或保持默认 words_and_html
+```
+
+---
+
+## 十、完整影响链总结
+
+```
+监控设置
+   ↓
+[is_source_type_url?]
+   ↓   ↘
+   是    否
+   ↓      ↓
+路径一   路径二
+保留HTML → 提取纯文本
+   ↓        ↓
+[有< >标记?] → 影响 tokenizer 行为
+   ↓
+[word_diff=True?]
+   ↓   ↘
+   是    否 → 整行标记，tokenizer 无效
+   ↓
+[单行替换?]
+   ↓   ↘
+   是    否 → 多行降级，tokenizer 无效
+   ↓
+[选择 tokenizer]
+   ↓   ↘
+ words   words_and_html
+   ↓        ↓
+标签拆分   标签完整
+高亮过大   精确高亮
+```
+
+**最终建议：**
+1. **源代码监控** 务必开启 `word_diff=True` 并使用 `words_and_html`
+2. **常规网页监控** `word_diff=True` 仍有价值（纯文本的词级高亮）
+3. **自动选择** 可基于内容路径自动设置，无需用户干预
+4. **多行内容** 考虑预处理（如 HTML 压缩）使 tokenizer 能够生效
+
+---
+
+## 十一、自动选择 Tokenizer 设计方案
 
 ### 7.1 自动选择回退顺序
 
@@ -656,7 +1108,7 @@ content = diff.render_diff(
 
 ---
 
-## 八、性能与效果权衡分析
+## 十二、性能与效果权衡分析
 
 ### 8.1 性能开销
 
@@ -680,7 +1132,7 @@ content = diff.render_diff(
 
 ---
 
-## 九、关键设计决策记录
+## 十三、关键设计决策记录
 
 ### 9.1 已确定的设计边界
 
@@ -717,7 +1169,7 @@ content = diff.render_diff(
 
 ---
 
-## 十、实施建议
+## 十四、实施建议
 
 ### 10.1 短期方案（低风险）
 
@@ -739,7 +1191,7 @@ content = diff.render_diff(
 
 ---
 
-## 十一、测试用例覆盖
+## 十五、测试用例覆盖
 
 系统现有测试已覆盖 (`test_notification_diff.py`):
 
