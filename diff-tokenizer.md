@@ -163,11 +163,108 @@ tokenizer_func = TOKENIZERS.get(tokenizer, tokenize_words_and_html)
 
 ---
 
-## 三、两种 Tokenizer 的切分边界对比（实测数据）
+
+---
+
+## 三、Tokenizer 实际生效边界分析
+
+Tokenizer **仅在特定条件下生效**，超出边界则自动降级为行级 diff。
+
+### 3.1 生效三要素
+
+| 条件 | 说明 |
+|------|------|
+| `word_diff=True` | 开关必须显式打开 |
+| `len(before_lines) == 1` | 变更前只有一行 |
+| `len(after_lines) == 1` | 变更后也只有一行 |
+
+### 3.2 生效边界判定代码
+
+```python
+if word_diff and len(before_lines) == 1 and len(after_lines) == 1:
+    inline_diff, has_changes = render_inline_word_diff(
+        before_lines[0], after_lines[0], 
+        ignore_junk=ignore_junk, 
+        tokenizer=tokenizer, 
+        include_change_type_prefix=include_change_type_prefix
+    )
+    yield [inline_diff]
+else:
+    # 降级：行级 diff
+    pass
+```
+
+### 3.3 单行 vs 多行 replace 分支差异
+
+| 场景 | 处理方式 | tokenizer 是否生效 |
+|------|----------|-------------------|
+| **单行替换** | 进入 `render_inline_word_diff` 分支 | ✅ 生效 |
+| **多行替换** | 降级为行级 diff | ❌ 不生效 |
+| **纯删除** | 行级处理 | ❌ 不生效 |
+| **纯新增** | 行级处理 | ❌ 不生效 |
+| **`word_diff=False`** | 强制行级 diff | ❌ 不生效 |
+
+### 3.4 边界情况：接近单行的多行
+
+当内容看似单行但实际包含换行符（如 HTML 被格式化为多行），tokenizer **不生效**。
+
+---
+
+## 四、text_json_diff 处理器中的内容路径分析
+
+在 `text_json_diff` 处理器中，存在 **两条完全不同的内容路径**，决定 tokenizer 是否有意义。
+
+### 4.1 路径一：保留 HTML 原文（tokenizer 有意义）
+
+```python
+if watch.is_source_type_url:
+    # Path 1: 直接保留 HTML 原文
+    stripped_text = html_content
+elif stream_content_type.is_plaintext:
+    # Path 1b: 纯文本也直接保留
+    stripped_text = html_content
+```
+
+**触发条件：**
+- `watch.is_source_type_url = True` （源代码监控，如直接监控 HTML 文件）
+- 或者 `stream_content_type.is_plaintext = True` （纯文本类型）
+
+**对 tokenizer 的影响：**
+- ✅ `words_and_html` 能正确识别并保留 HTML 标签为原子单元
+- ❌ `words` 会错误地拆分 HTML 标签
+
+### 4.2 路径二：提取纯文本（tokenizer 差异消失）
+
+```python
+else:
+    # Path 2: 从 HTML 中提取纯文本（去掉所有标签）
+    stripped_text = content_processor.extract_text_from_html(html_content, stream_content_type)
+```
+
+**触发条件：**
+- 常规网页监控（非源代码模式）
+- Content-Type 既不是 plaintext 也不是特殊类型
+
+**对 tokenizer 的影响：**
+- 所有 HTML 标签已被剥离
+- 只剩下纯文本内容
+- `words` 和 `words_and_html` 输出 **完全相同**
+- ⚠️ 此时选择任何 tokenizer **没有差异**
+
+### 4.3 两条路径的对比矩阵
+
+| 维度 | 路径一：保留 HTML | 路径二：提取纯文本 |
+|------|-----------------|-----------------|
+| **内容** | 包含 `<`、`>`、标签 | 只有纯文本，无标签 |
+| **tokenizer 差异** | `words_and_html` 显著更优 | 两种 tokenizer 输出相同 |
+| **适用场景** | 源码监控、API 响应监控 | 常规网页内容监控 |
+| **高亮精度** | 取决于 tokenizer 选择 | 与 tokenizer 无关 |
+
+## 五、两种 Tokenizer 的切分边界对比（实测数据）
 
 基于真实测试数据，以下是两种 tokenizer 的详细对比。
 
-### 3.1 Tokenizer 实现源码
+### 5.1 Tokenizer 实现源码
 
 **`words` tokenizer (`natural_text.py`):**
 ```python
@@ -217,7 +314,7 @@ def tokenize_words_and_html(text: str) -> List[str]:
     return tokens
 ```
 
-### 3.2 对比测试 1: 纯文本（无 HTML）
+### 5.2 对比测试 1: 纯文本（无 HTML）
 
 **输入:**
 ```
@@ -236,7 +333,7 @@ Token 数量: 11 个
 - ✅ 价格 `$99.99` 是单个 token（无空格分隔）
 - ✅ 空格都作为独立 token 保留（用于准确重建文本）
 
-### 3.3 对比测试 2: 带 HTML 标签内容
+### 5.3 对比测试 2: 带 HTML 标签内容
 
 **输入:**
 ```html
@@ -277,7 +374,7 @@ After:  <span class="price">Price: $149</span><span class="stock">In Stock</span
 | `words` | **5 个** | 碎片化，标签被拆分 |
 | `words_and_html` | **7 个** | 4 个 HTML 标签都保持完整 |
 
-### 3.4 对比测试 3: 复杂 HTML（带多个属性）
+### 5.4 对比测试 3: 复杂 HTML（带多个属性）
 
 **输入:**
 ```html
@@ -313,7 +410,7 @@ After:  <span class="price">Price: $149</span><span class="stock">In Stock</span
 [11] '</div>'
 ```
 
-### 3.5 对比测试 4: JSON 内容
+### 5.5 对比测试 4: JSON 内容
 
 **输入:**
 ```json
@@ -322,7 +419,7 @@ After:  <span class="price">Price: $149</span><span class="stock">In Stock</span
 
 **结果:** 两种 tokenizer **输出完全相同**（13 个 tokens），因为没有 `<` 和 `>` 字符触发 HTML 标签识别。
 
-### 3.6 边界情况: 格式不规范的 HTML
+### 5.6 边界情况: 格式不规范的 HTML
 
 **输入:** `< div >Hello< /div >`
 
@@ -331,7 +428,7 @@ After:  <span class="price">Price: $149</span><span class="stock">In Stock</span
 | `words` | `['<', ' ', 'div', ' ', '>Hello<', ' ', '/div', ' ', '>']` | 极度碎片化 |
 | `words_and_html` | `['< div >', 'Hello', '< /div >']` | ⚠️ 把空格也包含在 "标签" 中，但至少保持了单元完整性 |
 
-### 3.7 切分边界总结表
+### 5.7 切分边界总结表
 
 | 场景 | `words` tokenizer | `words_and_html` tokenizer | 最优选择 |
 |------|------------------|---------------------------|---------|
@@ -344,9 +441,9 @@ After:  <span class="price">Price: $149</span><span class="stock">In Stock</span
 
 ---
 
-## 四、切分边界如何触发不同的差异标记
+## 六、切分边界对差异标记的影响汇总
 
-### 4.1 Diff 标记类型
+### 6.1 Diff 标记类型
 
 系统使用三种占位符（Placemarker）标记差异：
 
@@ -357,7 +454,7 @@ After:  <span class="price">Price: $149</span><span class="stock">In Stock</span
 | **CHANGED** | 整行替换（无共同 token 时） | `@changed_PLACEMARKER_OPEN...CLOSED` |
 | **CHANGED_INTO** | 替换后的新内容 | `@changed_into_PLACEMARKER_OPEN...CLOSED` |
 
-### 4.2 整行替换判定逻辑
+### 6.2 整行替换判定逻辑
 
 ```python
 # render_inline_word_diff 中的判定
@@ -377,7 +474,7 @@ else:
             result += f'{ADDED_PLACEMARKER_OPEN}{text}{ADDED_PLACEMARKER_CLOSED}'
 ```
 
-### 4.3 Tokenizer 选择对标记的实际影响
+### 6.3 Tokenizer 选择对标记的实际影响
 
 **场景：HTML 内容中仅价格变化**
 
@@ -416,7 +513,7 @@ tokens B: ['<span class="price">', '$149', '</span>']
 → 高亮区域精确，视觉干净
 ```
 
-### 4.4 标记影响总结表
+### 6.4 标记影响总结表
 
 | 场景 | `words` tokenizer 效果 | `words_and_html` 效果 |
 |------|----------------------|----------------------|
@@ -428,9 +525,11 @@ tokens B: ['<span class="price">', '$149', '</span>']
 
 ---
 
-## 五、自动选择 Tokenizer 设计方案
+---
 
-### 5.1 自动选择回退顺序
+## 七、自动选择 Tokenizer 设计方案
+
+### 7.1 自动选择回退顺序
 
 基于内容类型检测结果，建议以下优先级顺序：
 
@@ -460,7 +559,7 @@ tokens B: ['<span class="price">', '$149', '</span>']
           └─────────────────────────────────────┘
 ```
 
-### 5.2 实现方案：render_diff 层自动检测
+### 7.2 实现方案：render_diff 层自动检测
 
 **修改位置:** `changedetectionio/diff/__init__.py`
 
@@ -528,7 +627,7 @@ def render_diff(
     # 原有逻辑继续...
 ```
 
-### 5.3 上层调用修改
+### 7.3 上层调用修改
 
 **processor 层传递内容类型信息:**
 ```python
@@ -547,7 +646,7 @@ content = diff.render_diff(
 
 **优势：** 使用已有的检测结果，避免重复检测开销。
 
-### 5.4 兼容性考虑
+### 7.4 兼容性考虑
 
 | 变更点 | 影响 | 处理方案 |
 |-------|------|---------|
@@ -557,9 +656,9 @@ content = diff.render_diff(
 
 ---
 
-## 六、性能与效果权衡分析
+## 八、性能与效果权衡分析
 
-### 6.1 性能开销
+### 8.1 性能开销
 
 | 操作 | 耗时估计 | 说明 |
 |------|---------|------|
@@ -568,7 +667,7 @@ content = diff.render_diff(
 | `detect_content_type_for_tokenizer` | O(500) | 只检查前 500 字符，可忽略 |
 | 每次 diff 的总开销 | < 1ms | 与页面抓取相比可忽略 |
 
-### 6.2 效果对比矩阵
+### 8.2 效果对比矩阵
 
 | 维度 | 硬编码 `words_and_html` | 自动选择 | 纯 `words` |
 |------|-----------------------|---------|-----------|
@@ -581,9 +680,9 @@ content = diff.render_diff(
 
 ---
 
-## 七、关键设计决策记录
+## 九、关键设计决策记录
 
-### 7.1 已确定的设计边界
+### 9.1 已确定的设计边界
 
 1. **Token 是原子比较单元**
    - diff-match-patch 不会在 token 内部比较字符
@@ -601,7 +700,7 @@ content = diff.render_diff(
    - 无共同 token 时使用 CHANGED 标记而非 REMOVED+ADDED
    - 视觉上更清晰表达"旧值 → 新值"关系
 
-### 7.2 待验证的边界问题
+### 9.2 待验证的边界问题
 
 1. **JSON 专用 tokenizer**
    - 当前两种 tokenizer 对 JSON 的切分是相同的
@@ -618,21 +717,21 @@ content = diff.render_diff(
 
 ---
 
-## 八、实施建议
+## 十、实施建议
 
-### 8.1 短期方案（低风险）
+### 10.1 短期方案（低风险）
 
 1. 在 `render_diff` 中添加 `tokenizer='auto'` 选项
 2. 实现轻量级的 HTML 检测（前 500 字符）
 3. 保持 `words_and_html` 为默认回退值
 
-### 8.2 中期方案
+### 10.2 中期方案
 
 1. 利用 processor 层已有的 `stream_content_type` 检测结果
 2. 在所有调用点传递 tokenizer 参数（不再依赖默认值）
 3. 添加单元测试覆盖 tokenizer 自动选择逻辑
 
-### 8.3 长期优化方向
+### 10.3 长期优化方向
 
 1. 考虑 JSON 专用 tokenizer（按结构切分但不破坏格式）
 2. 考虑 URL 专用 tokenizer（按路径段切分）
@@ -640,7 +739,7 @@ content = diff.render_diff(
 
 ---
 
-## 九、测试用例覆盖
+## 十一、测试用例覆盖
 
 系统现有测试已覆盖 (`test_notification_diff.py`):
 
