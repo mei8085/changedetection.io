@@ -1,20 +1,353 @@
 # 备份恢复与 Datastore 合并机制深度分析报告
 
 ## 目录
-1. [存储主体架构](#1-存储主体架构)
-2. [核心组合关系](#2-核心组合关系)
-3. [恢复分支逻辑详解](#3-恢复分支逻辑详解)
-4. [同一实体的覆盖与跳过顺序](#4-同一实体的覆盖与跳过顺序)
-5. [更新机制的执行流程](#5-更新机制的执行流程)
+1. [核心计数字段统一定义](#1-核心计数字段统一定义)
+2. [四开关恢复分支断言映射矩阵](#2-四开关恢复分支断言映射矩阵)
+3. [同一 UUID 双文件执行顺序与日志信号](#3-同一-uuid-双文件执行顺序与日志信号)
+4. [存储主体架构](#4-存储主体架构)
+5. [恢复分支逻辑详解](#5-恢复分支逻辑详解)
 6. [测试验证方式分析](#6-测试验证方式分析)
 7. [代码分支覆盖情况](#7-代码分支覆盖情况)
 8. [关键发现与建议](#8-关键发现与建议)
 
 ---
 
-## 1. 存储主体架构
+## 1. 核心计数字段统一定义
 
-### 1.1 实体类继承体系
+### 1.1 字段命名规范（严格统一）
+
+| 字段名 | 类型 | 含义 | 生效条件 |
+|--------|------|------|---------|
+| **restored_groups** | int | 成功恢复的 Tag 数量 | `include_groups=True` 时递增 |
+| **skipped_groups** | int | 跳过的已存在 Tag 数量 | `include_groups=True AND include_groups_replace=False AND uuid exists` 时递增 |
+| **restored_watches** | int | 成功恢复的 Watch 数量 | `include_watches=True` 时递增 |
+| **skipped_watches** | int | 跳过的已存在 Watch 数量 | `include_watches=True AND include_watches_replace=False AND uuid exists` 时递增 |
+
+### 1.2 代码中实际赋值位置
+
+```python
+# restore.py 第 90-94 行 - Tag 跳过计数
+if uuid in current_tags and not include_groups_replace:
+    logger.debug(f"Restore: skipping existing group {uuid} (replace not requested)")
+    skipped_groups += 1
+    continue
+
+# restore.py 第 122 行 - Tag 恢复计数
+restored_groups += 1
+logger.success(f"Restore: group '{title}' ({uuid}) restored")
+
+# restore.py 第 128-131 行 - Watch 跳过计数
+if uuid in current_watches and not include_watches_replace:
+    logger.debug(f"Restore: skipping existing watch {uuid} (replace not requested)")
+    skipped_watches += 1
+    continue
+
+# restore.py 第 154 行 - Watch 恢复计数
+restored_watches += 1
+logger.success(f"Restore: watch '{url}' ({uuid}) restored")
+```
+
+### 1.3 命名空间约定说明
+
+| 场景 | 术语 | 备注 |
+|------|------|------|
+| **代码内部** | `groups` | `import_from_zip` 函数内的变量和日志统一使用 `groups` |
+| **UI 展示** | `tags` | 用户界面可能显示为 "Tags" 或 "标签" |
+| **数据结构** | `tags` | `datastore.data['settings']['application']['tags']` |
+| **文件名** | `tag.json` | 每个 Tag 目录下的 JSON 文件名 |
+
+> 🔍 **重要：恢复代码内部 100% 使用 `_groups` 后缀，不使用 `_tags`。**
+> 变量命名完全一致：`current_tags` 是个例外（来自 datastore 数据结构），但计数全部使用 `*_groups`。
+
+---
+
+## 2. 四开关恢复分支断言映射矩阵
+
+### 2.1 测试用例设计总览
+
+四个开关：`include_groups(G)`、`include_groups_replace(Rg)`、`include_watches(W)`、`include_watches_replace(Rw)`
+
+每个开关 2 种状态 → 总计 2^4 = **16 种独立分支组合**
+
+### 2.2 分支映射表（可直接转换为测试代码）
+
+#### 前置条件约定
+
+| 符号 | 含义 |
+|------|------|
+| `T1` | 已存在 Tag（恢复前 datastore 中有此 UUID） |
+| `T1'` | 备份 zip 中的 T1（内容可能不同） |
+| `W1` | 已存在 Watch（恢复前 datastore 中有此 UUID） |
+| `W1'` | 备份 zip 中的 W1（内容可能不同） |
+| `T2`, `W2` | 备份 zip 中存在，但 datastore 中不存在（新增） |
+| `{T1, T2}` | zip 中包含 2 个 Tag 目录 |
+| `{W1, W2}` | zip 中包含 2 个 Watch 目录 |
+
+---
+
+### 矩阵 1：Tag 相关分支（8 种组合）
+
+| 测试 ID | G | Rg | W | Rw | 输入构造 | 期望计数值 | 期望对象状态 |
+|---------|---|---|---|---|---------|-----------|------------|
+| **T-001** | ❌ | ❌ | ✅ | ✅ | zip={T1, T2}, datastore={T1} | restored_groups=0, skipped_groups=0 | T1 保持不变，T2 不创建 |
+| **T-002** | ❌ | ✅ | ✅ | ✅ | zip={T1, T2}, datastore={T1} | restored_groups=0, skipped_groups=0 | T1 保持不变，T2 不创建（Rg 不影响因为 G=False） |
+| **T-003** | ✅ | ❌ | ✅ | ✅ | zip={T1, T2}, datastore={T1} | restored_groups=1, skipped_groups=1 | T1 保持不变（未替换），T2 被新增 |
+| **T-004** | ✅ | ✅ | ✅ | ✅ | zip={T1, T2}, datastore={T1} | restored_groups=2, skipped_groups=0 | T1 被替换为 T1'，T2 被新增 |
+| **T-005** | ✅ | ❌ | ✅ | ✅ | zip={T2}, datastore={} | restored_groups=1, skipped_groups=0 | T2 被新增（无冲突） |
+| **T-006** | ✅ | ✅ | ✅ | ✅ | zip={T2}, datastore={} | restored_groups=1, skipped_groups=0 | T2 被新增（Rg 对新增无影响） |
+| **T-007** | ✅ | ❌ | ✅ | ✅ | zip={T1}, datastore={T1} | restored_groups=0, skipped_groups=1 | T1 保持不变（全部跳过） |
+| **T-008** | ✅ | ✅ | ✅ | ✅ | zip={T1}, datastore={T1} | restored_groups=1, skipped_groups=0 | T1 被替换（全部恢复） |
+
+> Tag 分支可观测日志信号：
+> - 跳过：`logger.debug("Restore: skipping existing group {uuid} (replace not requested)")`
+> - 恢复：`logger.success("Restore: group '{title}' ({uuid}) restored")`
+
+---
+
+### 矩阵 2：Watch 相关分支（8 种组合）
+
+| 测试 ID | G | Rg | W | Rw | 输入构造 | 期望计数值 | 期望对象状态 |
+|---------|---|---|---|---|---------|-----------|------------|
+| **W-001** | ✅ | ✅ | ❌ | ❌ | zip={W1, W2}, datastore={W1} | restored_watches=0, skipped_watches=0 | W1 保持不变，W2 不创建 |
+| **W-002** | ✅ | ✅ | ❌ | ✅ | zip={W1, W2}, datastore={W1} | restored_watches=0, skipped_watches=0 | W1 保持不变，W2 不创建（Rw 不影响因为 W=False） |
+| **W-003** | ✅ | ✅ | ✅ | ❌ | zip={W1, W2}, datastore={W1} | restored_watches=1, skipped_watches=1 | W1 保持不变（未替换），W2 被新增 |
+| **W-004** | ✅ | ✅ | ✅ | ✅ | zip={W1, W2}, datastore={W1} | restored_watches=2, skipped_watches=0 | W1 被替换为 W1'，W2 被新增 |
+| **W-005** | ✅ | ✅ | ✅ | ❌ | zip={W2}, datastore={} | restored_watches=1, skipped_watches=0 | W2 被新增（无冲突） |
+| **W-006** | ✅ | ✅ | ✅ | ✅ | zip={W2}, datastore={} | restored_watches=1, skipped_watches=0 | W2 被新增（Rw 对新增无影响） |
+| **W-007** | ✅ | ✅ | ✅ | ❌ | zip={W1}, datastore={W1} | restored_watches=0, skipped_watches=1 | W1 保持不变（全部跳过） |
+| **W-008** | ✅ | ✅ | ✅ | ✅ | zip={W1}, datastore={W1} | restored_watches=1, skipped_watches=0 | W1 被替换（全部恢复） |
+
+> Watch 分支可观测日志信号：
+> - 跳过：`logger.debug("Restore: skipping existing watch {uuid} (replace not requested)")`
+> - 恢复：`logger.success("Restore: watch '{url}' ({uuid}) restored")`
+
+---
+
+### 矩阵 3：混合场景分支（覆盖 16 种组合的关键子集）
+
+| 测试 ID | G | Rg | W | Rw | 输入构造 | 期望计数值 | 期望对象状态 |
+|---------|---|---|---|---|---------|-----------|------------|
+| **M-001** | ❌ | ❌ | ❌ | ❌ | zip={T1, W1}, datastore={} | restored_*=0, skipped_*=0 | 什么都不恢复 |
+| **M-002** | ❌ | ❌ | ✅ | ✅ | zip={T1, W1}, datastore={} | restored_groups=0, restored_watches=1 | W1 被恢复，T1 不恢复 |
+| **M-003** | ✅ | ✅ | ❌ | ❌ | zip={T1, W1}, datastore={} | restored_groups=1, restored_watches=0 | T1 被恢复，W1 不恢复 |
+| **M-004** | ✅ | ❌ | ✅ | ❌ | zip={T1, W1}, datastore={T1, W1} | restored_groups=0, skipped_groups=1, restored_watches=0, skipped_watches=1 | T1、W1 均保持不变 |
+| **M-005** | ✅ | ✅ | ✅ | ❌ | zip={T1, W1}, datastore={T1, W1} | restored_groups=1, skipped_groups=0, restored_watches=0, skipped_watches=1 | T1 被替换，W1 保持不变 |
+| **M-006** | ✅ | ❌ | ✅ | ✅ | zip={T1, W1}, datastore={T1, W1} | restored_groups=0, skipped_groups=1, restored_watches=1, skipped_watches=0 | T1 保持不变，W1 被替换 |
+| **M-007** | ✅ | ✅ | ✅ | ✅ | zip={T1, W1}, datastore={T1, W1} | restored_groups=1, skipped_groups=0, restored_watches=1, skipped_watches=0 | T1、W1 均被替换 |
+| **M-008** | ✅ | ❌ | ✅ | ❌ | zip={T2, W2}, datastore={T1, W1} | restored_groups=1, skipped_groups=0, restored_watches=1, skipped_watches=0 | T2、W2 新增，T1、W1 不变 |
+
+---
+
+### 2.3 可执行断言模板（Python）
+
+```python
+from changedetectionio.blueprint.backups.restore import import_from_zip
+
+def assert_restore_scenario(
+    # 四开关参数
+    include_groups, include_groups_replace,
+    include_watches, include_watches_replace,
+    # 输入数据
+    zip_content,          # zip 内的 UUID-内容 映射
+    initial_datastore,    # 初始 datastore 状态
+    # 期望输出
+    expected_restored_groups, expected_skipped_groups,
+    expected_restored_watches, expected_skipped_watches,
+    # 期望对象状态： {uuid: expected_title_or_url}
+    expected_object_states
+):
+    """
+    通用恢复场景断言模板
+    
+    使用示例：
+        assert_restore_scenario(
+            include_groups=True, include_groups_replace=False,
+            include_watches=True, include_watches_replace=True,
+            zip_content={
+                'uuid-t1': {'tag.json': {'title': 'T1-new'}},
+                'uuid-w1': {'watch.json': {'url': 'http://w1-new.com'}},
+            },
+            initial_datastore={'tags': {'uuid-t1': {'title': 'T1-old'}}, 'watches': {'uuid-w1': {'url': 'http://w1-old.com'}}},
+            expected_restored_groups=0, expected_skipped_groups=1,
+            expected_restored_watches=1, expected_skipped_watches=0,
+            expected_object_states={
+                'uuid-t1': 'T1-old',    # 未替换
+                'uuid-w1': 'http://w1-new.com',  # 已替换
+            }
+        )
+    """
+    # 步骤 1：构造测试 zip
+    test_zip = create_test_zip(zip_content)
+    
+    # 步骤 2：初始化 datastore 状态
+    datastore = setup_datastore(initial_datastore)
+    
+    # 步骤 3：执行恢复（捕获返回值）
+    result = import_from_zip(
+        zip_stream=test_zip,
+        datastore=datastore,
+        include_groups=include_groups,
+        include_groups_replace=include_groups_replace,
+        include_watches=include_watches,
+        include_watches_replace=include_watches_replace
+    )
+    
+    # 步骤 4：断言计数值
+    assert result['restored_groups'] == expected_restored_groups, \
+        f"restored_groups mismatch: expected {expected_restored_groups}, got {result['restored_groups']}"
+    assert result['skipped_groups'] == expected_skipped_groups, \
+        f"skipped_groups mismatch: expected {expected_skipped_groups}, got {result['skipped_groups']}"
+    assert result['restored_watches'] == expected_restored_watches, \
+        f"restored_watches mismatch: expected {expected_restored_watches}, got {result['restored_watches']}"
+    assert result['skipped_watches'] == expected_skipped_watches, \
+        f"skipped_watches mismatch: expected {expected_skipped_watches}, got {result['skipped_watches']}"
+    
+    # 步骤 5：断言对象状态
+    for uuid, expected_value in expected_object_states.items():
+        if uuid in datastore.data['settings']['application']['tags']:
+            actual = datastore.data['settings']['application']['tags'][uuid].get('title')
+            assert actual == expected_value, \
+                f"Tag {uuid} title mismatch: expected {expected_value}, got {actual}"
+        elif uuid in datastore.data['watching']:
+            actual = datastore.data['watching'][uuid].get('url')
+            assert actual == expected_value, \
+                f"Watch {uuid} url mismatch: expected {expected_value}, got {actual}"
+```
+
+---
+
+## 3. 同一 UUID 双文件执行顺序与日志信号
+
+### 3.1 问题背景
+
+**关键代码结构：**
+```python
+# restore.py 第 89-155 行
+if include_groups and os.path.exists(tag_json_path):
+    # --- Tag 恢复分支 ---
+    # (执行后 continue 跳到下一个目录)
+elif include_watches and os.path.exists(watch_json_path):
+    # --- Watch 恢复分支 ---
+    # (只有 if 分支不执行才会走到这里)
+```
+
+**结论：这是 `if-elif` 结构，**不是**两个独立的 `if`！**
+
+### 3.2 执行顺序决策树
+
+```
+对单个 UUID 目录进行恢复处理：
+├── 先检查 tag.json 是否存在 AND include_groups=True
+│   ├── 是 → 进入 Tag 分支：
+│   │   ├── 执行覆盖/跳过逻辑
+│   │   ├── 更新 restored_groups 或 skipped_groups
+│   │   └── continue → 结束此 UUID 处理（跳过 Watch 分支）
+│   │
+│   └── 否 → 继续检查 watch.json
+│       ├── 检查 watch.json 是否存在 AND include_watches=True
+│       │   ├── 是 → 进入 Watch 分支：
+│       │   │   ├── 执行覆盖/跳过逻辑
+│       │   │   └── 更新 restored_watches 或 skipped_watches
+│       │   │
+│       │   └── 否 → 静默跳过（无日志）
+│       │
+│       └── 结束
+│
+└── 结果：
+    如果同一 UUID 目录同时含有 tag.json 和 watch.json：
+    → 当 include_groups=True 时，Watch 分支永远不会执行！
+```
+
+### 3.3 组合枚举表（2 × 2 × 2 = 8 种场景）
+
+| 场景 | tag.json | watch.json | include_groups | include_watches | 实际行为 | 计数值变化 | 日志信号 |
+|------|---------|-----------|---------------|-----------------|---------|-----------|---------|
+| **C-001** | ✅ | ✅ | ✅ | ✅ | 只恢复 Tag，Watch 静默丢失 | restored_groups +1 | Tag 分支的 success 日志 |
+| **C-002** | ✅ | ✅ | ✅ | ❌ | 只恢复 Tag | restored_groups +1 | Tag 分支的 success 日志 |
+| **C-003** | ✅ | ✅ | ❌ | ✅ | 只恢复 Watch | restored_watches +1 | Watch 分支的 success 日志 |
+| **C-004** | ✅ | ✅ | ❌ | ❌ | 都不恢复 | 无变化 | 无日志（静默跳过） |
+| **C-005** | ✅ | ❌ | ✅ | ✅ | 只恢复 Tag | restored_groups +1 | 正常 Tag 日志 |
+| **C-006** | ❌ | ✅ | ✅ | ✅ | 只恢复 Watch | restored_watches +1 | 正常 Watch 日志 |
+| **C-007** | ✅ | ❌ | ❌ | ✅ | 都不恢复 | 无变化 | 无日志 |
+| **C-008** | ❌ | ✅ | ✅ | ❌ | 都不恢复 | 无变化 | 无日志 |
+
+### 3.4 关键场景的可观测日志信号
+
+**场景 C-001：双文件 + 双开启 = Watch 丢失**
+```python
+# 输入构造
+zip_content = {
+    'same-uuid-123': {
+        'tag.json': {'title': 'My Group'},
+        'watch.json': {'url': 'http://example.com'}
+    }
+}
+include_groups = True
+include_watches = True
+
+# 可观测日志：
+logger.success("Restore: group 'My Group' (same-uuid-123) restored")
+# 🔴 注意：没有任何 Watch 相关日志！也没有警告说明 Watch 被丢弃！
+
+# 计数值结果：
+restored_groups = 1
+skipped_groups = 0
+restored_watches = 0    # 🔴 静默丢失
+skipped_watches = 0
+```
+
+**场景 C-003：双文件 + 只开 Watch = 正常恢复**
+```python
+# 输入构造
+zip_content = {
+    'same-uuid-123': {
+        'tag.json': {'title': 'My Group'},
+        'watch.json': {'url': 'http://example.com'}
+    }
+}
+include_groups = False
+include_watches = True
+
+# 可观测日志：
+logger.success("Restore: watch 'http://example.com' (same-uuid-123) restored")
+
+# 计数值结果：
+restored_groups = 0
+skipped_groups = 0
+restored_watches = 1
+skipped_watches = 0
+```
+
+**场景 C-001 + 已存在 + 不替换：Tag 跳过，Watch 也跳过**
+```python
+# 输入构造
+datastore 已有 same-uuid-123 Tag
+zip_content same-uuid-123 含 tag.json + watch.json
+include_groups=True, include_groups_replace=False
+include_watches=True
+
+# 可观测日志：
+logger.debug("Restore: skipping existing group same-uuid-123 (replace not requested)")
+# 🔴 Watch 分支也不会执行，因为走到 Tag 的 continue 了！
+
+# 计数值结果：
+skipped_groups = 1
+restored_groups = 0
+restored_watches = 0    # 🔴 即使 include_watches=True，也不会检查 Watch！
+skipped_watches = 0     # 🔴 即使 UUID 已存在，也不会递增 skipped_watches！
+```
+
+> ⚠️ **严重风险警告：** 当同一 UUID 目录同时有两种文件时，如果 Tag 分支触发了 `continue`（不管是恢复成功还是跳过），**Watch 分支的所有逻辑都不会执行**，包括：
+> 1. 不会检查 watch.json 是否存在
+> 2. 不会检查 Watch 是否已存在
+> 3. 不会递增 skipped_watches
+> 4. 完全静默——没有日志、没有警告、没有任何反馈
+
+---
+
+## 4. 存储主体架构
+
+### 4.1 实体类继承体系
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -40,7 +373,7 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 关键类职责划分
+### 4.2 关键类职责划分
 
 | 类/模块 | 核心职责 | 关键方法 |
 |--------|---------|---------|
@@ -50,7 +383,7 @@
 | **Watch.model** | Watch 专用逻辑、历史记录管理 | `rehydrate_entity()` (datastore) |
 | **Tag.model** | Tag 专用逻辑、URL 匹配规则 | `matches_url()` |
 
-### 1.3 文件系统存储结构
+### 4.3 文件系统存储结构
 
 ```
 datastore/
@@ -76,93 +409,12 @@ datastore/
 
 ---
 
-## 2. 核心组合关系
+## 5. 恢复分支逻辑详解
 
-### 2.1 存储主体与持久化机制的组合
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  存储主体 × 持久化机制 组合矩阵                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │ 组合 1: Watch + 文件系统存储                              │  │
-│  │   = watch_base (字段定义 + commit)                       │  │
-│  │   + EntityPersistenceMixin (_save_to_disk)              │  │
-│  │   + save_entity_atomic (原子写入)                        │  │
-│  │                                                           │  │
-│  │   结果: {uuid}/watch.json (10MB 限制)                    │  │
-│  └─────────────────────────────────────────────────────────┘  │
-│                           │                                     │
-│                           ▼                                     │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │ 组合 2: Tag + 文件系统存储                                │  │
-│  │   = watch_base (字段定义 + commit)                       │  │
-│  │   + EntityPersistenceMixin (_save_to_disk)              │  │
-│  │   + save_entity_atomic (原子写入)                        │  │
-│  │                                                           │  │
-│  │   结果: {uuid}/tag.json (1MB 限制)                       │  │
-│  └─────────────────────────────────────────────────────────┘  │
-│                           │                                     │
-│                           ▼                                     │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │ 组合 3: 全局设置 + 文件系统存储                            │  │
-│  │   = datastore.commit()                                   │  │
-│  │   + save_json_atomic (直接调用)                          │  │
-│  │                                                           │  │
-│  │   结果: changedetection.json                              │  │
-│  └─────────────────────────────────────────────────────────┘  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 组合关键点
-
-**关键点 1：EntityPersistenceMixin 的动态类型识别**
-
-```python
-# persistence.py: _determine_entity_type()
-# 通过类继承层级动态识别实体类型（类级别缓存）
-for base_class in inspect.getmro(cls):
-    module_name = base_class.__module__
-    if module_name.startswith('changedetectionio.model.'):
-        # "changedetectionio.model.Watch" -> "watch"
-        return module_name.split('.')[-1].lower()
-
-# 结果:
-# - Watch.model → entity_type = 'watch' → filename = 'watch.json' → max_size = 10MB
-# - Tag.model → entity_type = 'tag' → filename = 'tag.json' → max_size = 1MB
-```
-
-**关键点 2：watch_base.commit() 的通用流程**
-
-```python
-# model/__init__.py: commit()
-def commit(self):
-    # 1. 校验：必须有 data_dir 和 UUID
-    if not self.data_dir:
-        logger.error("Cannot commit without datastore_path")
-        return
-    
-    # 2. 获取待提交数据（子类可过滤）
-    data_dict = self._get_commit_data()
-    
-    # 3. 委托给 Mixin 的 _save_to_disk()
-    self._save_to_disk(data_dict, uuid)
-```
-
----
-
-## 3. 恢复分支逻辑详解
-
-### 3.1 import_from_zip 完整分支树
+### 5.1 import_from_zip 完整分支树
 
 ```python
 # restore.py: import_from_zip()
-#
-# ┌─────────────────────────────────────────────────────────────────┐
-# │                  恢复函数完整分支树                               │
-# └─────────────────────────────────────────────────────────────────┘
 #
 # 入口: import_from_zip(zip_stream, datastore, 
 #                      include_groups, include_groups_replace,
@@ -264,182 +516,6 @@ def commit(self):
 
 ---
 
-## 4. 同一实体的覆盖与跳过顺序
-
-### 4.1 优先级规则：Tag 优先于 Watch
-
-**关键发现：一个 UUID 目录中如果同时存在 tag.json 和 watch.json，只会恢复 Tag**
-
-```python
-# restore.py 第 89-131 行
-# ┌─────────────────────────────────────────────────────────┐
-# │ 注意: 这是 if-elif 结构，不是两个独立的 if！              │
-# └─────────────────────────────────────────────────────────┘
-
-if include_groups and os.path.exists(tag_json_path):
-    # --- Tag 恢复逻辑 ---
-    # (如果进入此分支，后续 elif 不会执行)
-elif include_watches and os.path.exists(watch_json_path):
-    # --- Watch 恢复逻辑 ---
-    # (只有当 tag.json 不存在或 include_groups=False 时才会执行)
-```
-
-**结论：**
-| 目录内容 | include_groups | include_watches | 实际恢复 |
-|---------|---------------|-----------------|---------|
-| tag.json + watch.json | True | True | **仅恢复 Tag** (优先级更高) |
-| tag.json + watch.json | False | True | 恢复 Watch |
-| tag.json + watch.json | True | False | 恢复 Tag |
-| 只有 tag.json | True | True | 恢复 Tag |
-| 只有 watch.json | True | True | 恢复 Watch |
-
-### 4.2 覆盖 vs 跳过的判断顺序
-
-```
-对于每个实体（Tag 或 Watch）：
-┌─────────────────────────────────────────────────────────────────┐
-│              覆盖 / 跳过 判断决策树                              │
-└─────────────────────────────────────────────────────────────────┘
-                                         │
-                                         ▼
-                          ┌─────────────────────────┐
-                          │ UUID 是否已存在？       │
-                          └─────────────────────────┘
-                                         │
-                       ┌─────────────────┴─────────────────┐
-                       │                                   │
-                       ▼                                   ▼
-              ┌─────────────┐                    ┌──────────────┐
-              │   不存在    │                    │    已存在     │
-              └─────────────┘                    └──────────────┘
-                       │                                   │
-                       ▼                                   ▼
-              ┌───────────────────┐          ┌─────────────────────────┐
-              │ 直接恢复（新增）  │          │ replace 参数是否为 True？│
-              └───────────────────┘          └─────────────────────────┘
-                       │                                   │
-                       ▼                       ┌───────────┴───────────┐
-              ┌───────────────────┐          │                       │
-              │ 1. 删除旧目录（如有）│         ▼                       ▼
-              │ 2. 复制新目录        │  ┌─────────────┐       ┌─────────────┐
-              │ 3. 重新水化对象      │  │   覆盖      │       │    跳过     │
-              │ 4. 存入内存          │  └─────────────┘       └─────────────┘
-              │ 5. commit() 持久化   │          │                       │
-              └───────────────────┘          ▼                       ▼
-                                           ┌──────────────────┐   ┌─────────────┐
-                                           │ 同"不存在"流程  │   │ 计数 + 跳过 │
-                                           └──────────────────┘   └─────────────┘
-```
-
-### 4.3 四种恢复选项的组合效果矩阵
-
-| include_groups | include_groups_replace | include_watches | include_watches_replace | 效果 |
-|---------------|------------------------|----------------|-------------------------|------|
-| **False** | 任意 | **False** | 任意 | 完全不恢复 |
-| **True** | **False** | **False** | 任意 | 仅新增 Tags，跳过已存在的 Tags |
-| **True** | **True** | **False** | 任意 | 新增 + 覆盖 Tags |
-| **False** | 任意 | **True** | **False** | 仅新增 Watches，跳过已存在的 Watches |
-| **False** | 任意 | **True** | **True** | 新增 + 覆盖 Watches |
-| **True** | **False** | **True** | **False** | 仅新增 Tags 和 Watches |
-| **True** | **True** | **True** | **False** | Tags 全覆盖 + Watches 仅新增 |
-| **True** | **False** | **True** | **True** | Tags 仅新增 + Watches 全覆盖 |
-| **True** | **True** | **True** | **True** | Tags 和 Watches 全覆盖（测试用例使用此组合） |
-
----
-
-## 5. 更新机制的执行流程
-
-### 5.1 恢复时的完整数据流动
-
-```
-ZIP 文件
-   │
-   ▼
- 解压到临时目录 ────────────┐
-   │                         │ 安全检查：
-   ▼                         │ - 总大小限制
-遍历每个 UUID 目录            │ - 路径遍历防护
-   │                         │
-   ▼                         │
-判断实体类型 (Tag / Watch)  │
-   │                         │
-   ▼                         │
-覆盖 / 跳过 决策             │
-   │                         │
-   ├─ 跳过 → 计数 + continue │
-   │                         │
-   ▼                         │
-删除目标目录（如果存在）◀────┘
-   │
-   ▼
-复制新目录到 datastore
-   │
-   ▼
-┌─────────────────────────────────────────────────────────┐
-│ 对象重新水化 (Rehydration)                               │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│ 对于 Tag:                                                │
-│   Tag.model(                                            │
-│       datastore_path=...,                               │
-│       __datastore=...,                                  │
-│       default=tag_data                                  │
-│   )                                                     │
-│   + 强制设置 processor='restock_diff'                   │
-│                                                         │
-│ 对于 Watch:                                              │
-│   datastore.rehydrate_entity(uuid, watch_data)          │
-│   → 根据 processor 字段选择对应的 Watch 子类             │
-│     (text_json_diff, restock_diff, etc.)                │
-└─────────────────────────────────────────────────────────┘
-   │
-   ▼
-存入内存字典（current_tags / current_watches）
-   │
-   ▼
-obj.commit() → 持久化到 {uuid}/(watch|tag).json
-   │
-   ▼
-最后: datastore.commit() → 持久化 changedetection.json
-```
-
-### 5.2 commit() 调用层级
-
-```python
-# 恢复过程中有 N+1 次 commit 调用：
-#
-# 1. 每个 Tag 恢复 → tag_obj.commit() → tag.json
-# 2. 每个 Watch 恢复 → watch_obj.commit() → watch.json
-# 3. 最后 datastore.commit() → changedetection.json
-#
-#        ┌─────────────────────────────────────────────────┐
-#        │              commit() 调用层级                  │
-#        └─────────────────────────────────────────────────┘
-#
-# Watch.model.commit()
-#     │
-#     └── watch_base.commit()
-#           ├── 校验 data_dir, uuid
-#           ├── _get_commit_data() → 获取全部 dict 数据
-#           └── EntityPersistenceMixin._save_to_disk()
-#                 ├── _determine_entity_type() → 'watch'
-#                 ├── filename = 'watch.json'
-#                 ├── max_size_mb = 10
-#                 └── save_entity_atomic()
-#                       └── save_json_atomic()
-#                             ├── tempfile.mkstemp()
-#                             ├── 写入 JSON
-#                             ├── os.replace() 原子重命名
-#                             └── 可选 fsync
-#
-# Tag.model.commit() 完全相同，区别仅在于：
-#   _determine_entity_type() → 'tag'
-#   filename = 'tag.json'
-#   max_size_mb = 1
-```
-
----
-
 ## 6. 测试验证方式分析
 
 ### 6.1 现有测试用例覆盖情况
@@ -454,102 +530,66 @@ obj.commit() → 持久化到 {uuid}/(watch|tag).json
 
 ```python
 # 测试关键点分析 (test_backup.py 第 122-202 行)
-#
-# ┌─────────────────────────────────────────────────────────────┐
-# │ 阶段 1: 准备数据 (第 130-136 行)                            │
-# └─────────────────────────────────────────────────────────────┘
-uuid = datastore.add_watch(url=watch_url)              # 创建 Watch
-tag_uuid = datastore.add_tag(title="Tasty backup tag")  # 创建 Tag 1
-tag_uuid2 = datastore.add_tag(title="Tasty backup tag number two")  # 创建 Tag 2
-client.get(url_for("ui.form_watch_checknow"))  # 触发检查，生成历史
-wait_for_all_checks(client)
 
-# ┌─────────────────────────────────────────────────────────────┐
-# │ 阶段 2: 创建并下载备份 (第 138-152 行)                      │
-# └─────────────────────────────────────────────────────────────┘
-client.get(url_for("backups.request_backup"))  # 触发后台备份
-time.sleep(4)  # 等待备份线程完成
+# 阶段 1: 准备数据
+uuid = datastore.add_watch(url=watch_url)
+tag_uuid = datastore.add_tag(title="Tasty backup tag")
+tag_uuid2 = datastore.add_tag(title="Tasty backup tag number two")
+
+# 阶段 2: 创建并下载备份
+client.get(url_for("backups.request_backup"))
+time.sleep(4)
 res = client.get(url_for("backups.download_backup", filename="latest"))
 zip_data = res.data
 
-# 验证 ZIP 内容（不是直接恢复验证，而是验证备份正确包含文件）
+# 验证 ZIP 内容
 backup = ZipFile(io.BytesIO(zip_data))
 names = backup.namelist()
-assert f"{uuid}/watch.json" in names          # Watch 配置文件存在
-assert f"{tag_uuid}/tag.json" in names        # Tag 1 配置文件存在
-assert f"{tag_uuid2}/tag.json" in names       # Tag 2 配置文件存在
+assert f"{uuid}/watch.json" in names
+assert f"{tag_uuid}/tag.json" in names
+assert f"{tag_uuid2}/tag.json" in names
 
-# ┌─────────────────────────────────────────────────────────────┐
-# │ 阶段 3: 清空现有数据 (第 154-160 行)                        │
-# └─────────────────────────────────────────────────────────────┘
-datastore.delete('all')                              # 删除所有 Watches
-client.get(url_for("tags.delete_all"))               # 删除所有 Tags
-# 验证：确认数据已被清除
-assert uuid not in datastore.data['watching']
-assert tag_uuid not in datastore.data['settings']['application']['tags']
+# 阶段 3: 清空现有数据
+datastore.delete('all')
+client.get(url_for("tags.delete_all"))
 
-# ┌─────────────────────────────────────────────────────────────┐
-# │ 阶段 4: 执行恢复 (第 162-178 行)                            │
-# └─────────────────────────────────────────────────────────────┘
+# 阶段 4: 执行恢复（使用全 True 组合：G=True, Rg=True, W=True, Rw=True）
 res = client.post(
     url_for("backups.restore.backups_restore_start"),
     data={
         'zip_file': (io.BytesIO(zip_data), 'backup.zip'),
-        'include_groups': 'y',                          # 恢复 Tags
-        'include_groups_replace_existing': 'y',         # 覆盖已存在的（虽然此时为空）
-        'include_watches': 'y',                         # 恢复 Watches
-        'include_watches_replace_existing': 'y',        # 覆盖已存在的
+        'include_groups': 'y',
+        'include_groups_replace_existing': 'y',
+        'include_watches': 'y',
+        'include_watches_replace_existing': 'y',
     },
     content_type='multipart/form-data'
 )
-time.sleep(2)  # 等待恢复线程完成
+time.sleep(2)
 
-# ┌─────────────────────────────────────────────────────────────┐
-# │ 阶段 5: 验证恢复结果 (第 180-202 行)                        │
-# └─────────────────────────────────────────────────────────────┘
-# Watch 验证
+# 阶段 5: 验证恢复结果（只验证 happy path）
 restored_watch = datastore.data['watching'].get(uuid)
-assert restored_watch is not None                  # 对象存在
-assert restored_watch['url'] == watch_url          # 关键数据正确
-assert isinstance(restored_watch, Watch.model)      # 类型正确（重新水化成功）
-assert restored_watch.history_n >= 1               # 历史记录恢复
+assert restored_watch is not None
+assert restored_watch['url'] == watch_url
+assert isinstance(restored_watch, Watch.model)
+assert restored_watch.history_n >= 1
 
-# Tag 验证
 restored_tags = datastore.data['settings']['application']['tags']
-restored_tag = restored_tags.get(tag_uuid)
-assert restored_tag is not None                    # 对象存在
-assert restored_tag['title'] == "Tasty backup tag"  # 关键数据正确
-assert isinstance(restored_tag, Tag.model)          # 类型正确（重新水化成功）
+assert restored_tags.get(tag_uuid)['title'] == "Tasty backup tag"
 ```
 
-### 6.3 安全测试的特殊验证方式
+### 6.3 现有测试覆盖缺口（对照第 2 节矩阵）
 
-**Zip Slip 测试：直接调用底层函数**
-```python
-# 不通过 Web 接口，直接调用 import_from_zip()
-# 原因：可以精确控制 zip 内容（否则通过 Flask 文件上传可能会被 sanitize）
-with pytest.raises(ValueError, match="Zip Slip"):
-    import_from_zip(
-        zip_stream=malicious_zip,
-        datastore=datastore,
-        include_groups=True,
-        include_groups_replace=True,
-        include_watches=True,
-        include_watches_replace=True,
-    )
-```
+**已覆盖：**
+- ✅ M-007：全 True + 清空 = 全恢复
 
-**Zip Bomb 测试：动态 monkey-patch**
-```python
-# 动态修改限制值（不影响其他测试）
-original_limit = restore_mod._MAX_DECOMPRESSED_BYTES
-try:
-    restore_mod._MAX_DECOMPRESSED_BYTES = 50 * 1024  # 临时改为 50KB
-    with pytest.raises(ValueError, match="decompressed size"):
-        import_from_zip(...)
-finally:
-    restore_mod._MAX_DECOMPRESSED_BYTES = original_limit  # 恢复原值
-```
+**完全未覆盖：**
+- ❌ T-001 ~ T-008：Tag 分支的 8 种组合
+- ❌ W-001 ~ W-008：Watch 分支的 8 种组合
+- ❌ M-001 ~ M-006：混合场景的 6 种组合
+- ❌ C-001 ~ C-008：同一 UUID 双文件场景 8 种组合
+
+**总计：30 种分支组合，仅覆盖 1 种 → 覆盖率 3.3%**
 
 ---
 
@@ -564,47 +604,25 @@ finally:
 | ✅ Tag.json 存在 + include_groups=True | 覆盖 | `test_backup_restore` |
 | ✅ Watch.json 存在 + include_watches=True | 覆盖 | `test_backup_restore` |
 | ✅ 目标目录不存在（新增） | 覆盖 | `test_backup_restore`（清空后恢复） |
-| ✅ tag_obj.commit() 持久化 | 间接覆盖 | `test_backup_restore`（验证对象存在） |
-| ✅ watch_obj.commit() 持久化 | 间接覆盖 | `test_backup_restore`（验证对象存在） |
+| ✅ tag_obj.commit() 持久化 | 间接覆盖 | `test_backup_restore` |
+| ✅ watch_obj.commit() 持久化 | 间接覆盖 | `test_backup_restore` |
 | ✅ datastore.commit() 持久化 | 间接覆盖 | `test_backup_restore` |
 
-### 7.2 未覆盖分支（关键发现！）
+### 7.2 未覆盖分支清单
 
-| 分支 | 覆盖情况 | 说明 |
-|------|---------|------|
-| ❌ 无效 UUID 目录跳过 | 未覆盖 | 目录名不是 UUID 格式时的 warning + continue |
-| ❌ tag.json JSON 解析失败 | 未覆盖 | tag.json 损坏或无效时的 error + continue |
-| ❌ watch.json JSON 解析失败 | 未覆盖 | watch.json 损坏或无效时的 error + continue |
-| ❌ **Tag 已存在且不替换 (include_groups_replace=False)** | **未覆盖** | **最重要的缺失分支！** |
-| ❌ **Watch 已存在且不替换 (include_watches_replace=False)** | **未覆盖** | **最重要的缺失分支！** |
-| ❌ Tag 已存在且替换 (include_groups_replace=True) | 未覆盖 | 删除旧目录后复制新目录的逻辑 |
-| ❌ Watch 已存在且替换 (include_watches_replace=True) | 未覆盖 | 删除旧目录后复制新目录的逻辑 |
-| ❌ include_groups=False 时跳过所有 Tags | 未覆盖 | 不恢复 Tags 的情况 |
-| ❌ include_watches=False 时跳过所有 Watches | 未覆盖 | 不恢复 Watches 的情况 |
-| ❌ 目录既无 tag.json 也无 watch.json | 未覆盖 | 静默跳过的情况 |
-| ❌ commit() 时无 data_dir 的错误处理 | 未覆盖 | 异常路径 |
-| ❌ commit() 时无 uuid 的错误处理 | 未覆盖 | 异常路径 |
-| ❌ 压缩后大小超过限制 (save_json_atomic) | 未覆盖 | 异常路径 |
-
-### 7.3 最高优先级的缺失测试场景
-
-**场景 A：恢复时目标实体已存在，且不允许替换**
-```
-预期行为:
-1. 现有 Watch W1 (uuid=xxx) + Tag T1 (uuid=yyy) 存在于 datastore
-2. 备份 zip 中包含相同 UUID 的 W1' 和 T1'
-3. 恢复时使用 include_groups_replace=False, include_watches_replace=False
-4. 结果: W1 和 T1 保持不变，计数 skipped_watches +=1, skipped_tags +=1
-```
-
-**场景 B：恢复时目标实体已存在，且允许替换**
-```
-预期行为:
-1. 现有 Watch W1 (uuid=xxx) 内容为 "A"
-2. 备份 zip 中 W1' 内容为 "B"
-3. 恢复时 include_watches_replace=True
-4. 结果: W1 被替换为 "B"，旧目录被删除，新目录被复制
-```
+| 分支 | 覆盖情况 | 对应测试矩阵 ID |
+|------|---------|----------------|
+| ❌ Tag 已存在 + include_groups_replace=False → 跳过 | 未覆盖 | T-003, T-007 |
+| ❌ Tag 已存在 + include_groups_replace=True → 替换 | 未覆盖 | T-004, T-008 |
+| ❌ Watch 已存在 + include_watches_replace=False → 跳过 | 未覆盖 | W-003, W-007 |
+| ❌ Watch 已存在 + include_watches_replace=True → 替换 | 未覆盖 | W-004, W-008 |
+| ❌ include_groups=False 时跳过所有 Tags | 未覆盖 | T-001, T-002 |
+| ❌ include_watches=False 时跳过所有 Watches | 未覆盖 | W-001, W-002 |
+| ❌ 同一 UUID 双文件时 Watch 被丢弃 | 未覆盖 | C-001 ~ C-004 |
+| ❌ 无效 UUID 目录跳过 | 未覆盖 | - |
+| ❌ tag.json JSON 解析失败 | 未覆盖 | - |
+| ❌ watch.json JSON 解析失败 | 未覆盖 | - |
+| ❌ 目录既无 tag.json 也无 watch.json | 未覆盖 | - |
 
 ---
 
@@ -612,94 +630,98 @@ finally:
 
 ### 8.1 关键发现
 
-**发现 1：Tag 恢复优先级高于 Watch（if-elif 结构）**
-- 一个 UUID 目录同时有 tag.json 和 watch.json 时，只会恢复 Tag
-- Watch 恢复逻辑永远不会执行
-- 这种设计可能隐含假设：Tag 和 Watch 的 UUID 空间完全隔离
-- 风险：如果 UUID 生成逻辑有重叠，Watch 会被静默丢弃
+**发现 1：命名一致性良好，但术语体系需澄清**
+- ✅ 恢复计数统一使用 `_groups` 后缀（`restored_groups`, `skipped_groups`）
+- ✅ 变量命名在 `import_from_zip` 函数内完全一致
+- ⚠️ 但 UI/展示层可能用 "Tags"，需注意术语映射
 
-**发现 2：恢复分支覆盖率严重不足**
-- 8 个主要恢复分支中仅覆盖了 3 个（清空后恢复的 happy path）
-- 最重要的"已存在且不替换"逻辑完全没有测试覆盖
-- 安全分支测试覆盖较好，但业务逻辑分支测试缺失
+**发现 2：同一 UUID 双文件场景存在静默数据丢失风险**
+- `if-elif` 结构导致 Tag 分支 `continue` 后，Watch 分支完全不执行
+- 没有日志、没有警告、没有计数反馈
+- 即使 Watch 分支也应该跳过并递增 `skipped_watches`，实际上也不会执行
 
-**发现 3：恢复结果只有日志记录，缺乏结构化反馈**
-- import_from_zip 返回计数字典 `{restored_groups, skipped_groups, ...}`
-- 但后台线程执行时，这个返回值被丢弃了（线程无返回值）
-- 用户无法知道到底恢复了什么、跳过了什么
+**发现 3：恢复分支覆盖率极低（约 3.3%）**
+- 30 种分支组合仅覆盖 1 种（全清空后全恢复的 happy path）
+- 最核心的合并逻辑（已存在 + 跳过/替换）完全没有测试
+- 双文件冲突场景完全没有测试覆盖
 
-**发现 4：同一个 UUID 下同时存在 Tag 和 Watch 时的静默行为**
-- 当备份 zip 中一个 UUID 目录同时有 tag.json 和 watch.json
-- 用户选择同时恢复 Tags 和 Watches 时
-- 实际只会恢复 Tag，Watch 被静默跳过
-- 没有日志、没有警告、没有用户反馈
+**发现 4：恢复结果无法通过测试断言验证**
+- 当前测试通过 Flask 后台线程执行恢复，`import_from_zip` 的返回值（计数字典）被丢弃
+- 测试无法直接获取 `restored_groups` 等值进行断言
+- 只能间接验证最终对象状态，无法验证"跳过"逻辑（因为状态不变，无法区分"未恢复" vs "不存在"）
 
 ### 8.2 改进建议
 
-**建议 1：补充核心分支测试**
+**建议 1：立即补充最高优先级测试（按第 2 节矩阵）**
 
-优先级从高到低：
-1. **已存在 + 不替换** → 验证跳过逻辑和计数正确
-2. **已存在 + 替换** → 验证目录删除、复制、更新正确
-3. **include_groups=False / include_watches=False** → 验证不恢复
-4. **损坏 JSON** → 验证异常跳过、日志记录
-5. **无效 UUID 目录** → 验证 warning 日志
+优先级 1（P0）：核心合并逻辑
+- T-003：Tag 已存在 + 不替换 → 验证跳过逻辑
+- T-004：Tag 已存在 + 替换 → 验证替换逻辑
+- W-003：Watch 已存在 + 不替换 → 验证跳过逻辑
+- W-004：Watch 已存在 + 替换 → 验证替换逻辑
 
-**建议 2：改进 Tag/Watch 冲突处理**
+优先级 2（P1）：开关隔离测试
+- T-001：include_groups=False → Tags 不恢复
+- W-001：include_watches=False → Watches 不恢复
 
-选项 A：**在备份创建时确保 UUID 不冲突**
-- 备份时检查 watches 和 tags 的 UUID 是否有重叠
-- 如有冲突，记录 warning
+优先级 3（P2）：风险场景测试
+- C-001：双文件 + 双开启 → 验证 Watch 静默丢失（当前行为）或添加警告日志（改进后）
 
-选项 B：**在恢复时检测并报告冲突**
+**建议 2：增加双文件检测与日志告警**
+
 ```python
-# 恢复时添加检测
-if os.path.exists(tag_json_path) and os.path.exists(watch_json_path):
-    logger.warning(f"UUID {uuid} contains both tag.json and watch.json, only Tag will be restored")
-```
-
-选项 C：**改为两个独立 if，先处理 Tag 再处理 Watch**
-```python
-# 当前：if-elif → 只能处理一个
-# 建议：if + if → 两者都尝试（但仍需检测 UUID 冲突）
-if include_groups and os.path.exists(tag_json_path):
-    process_tag()
-if include_watches and os.path.exists(watch_json_path):
-    process_watch()  # 现在可以执行了！
-```
-
-**建议 3：保存恢复结果供用户查看**
-```python
-# 恢复线程完成后，将结果保存到 datastore 或临时文件
-restore_result = import_from_zip(...)
-# 保存：{timestamp: restore_result}
-# 用户可以通过 UI 查看：恢复了 X 个，跳过了 Y 个
-```
-
-### 8.3 代码优化点
-
-**优化 1：消除魔法字符串 'y'**
-```python
-# 当前代码（restore.py 第 187-246 行）
-include_groups = request.form.get('include_groups') == 'y'
-# 建议：使用常量或更明确的布尔值转换
-```
-
-**优化 2：增加冲突检测日志**
-```python
-# 在 if include_groups ... 前添加
+# 在 restore.py 第 89 行前添加检测
 has_tag = os.path.exists(tag_json_path)
 has_watch = os.path.exists(watch_json_path)
+
 if has_tag and has_watch:
-    logger.warning(f"UUID {uuid} contains both entity types, priority: Tag > Watch")
+    logger.warning(
+        f"UUID {uuid} directory contains BOTH tag.json and watch.json. "
+        f"Will process only Tag (priority), Watch will be SILENTLY SKIPPED. "
+        f"This is likely a backup file corruption issue!"
+    )
 ```
 
-**优化 3：恢复完成后发送通知信号**
+**建议 3：让测试可直接获取恢复结果**
+
 ```python
-# 使用 blinker signal 通知恢复完成
-from blinker import signal
-restore_completed = signal('restore_completed')
-restore_completed.send(result=restore_result)
+# 方法 A：提供同步调用入口（供测试使用）
+# 在 backups/__init__.py 添加测试专用函数
+def restore_backup_sync(zip_file, datastore, **options):
+    """同步恢复备份（测试专用），返回计数字典"""
+    return import_from_zip(zip_file, datastore, **options)
+
+# 方法 B：将恢复结果写入 datastore，持久化可查
+# 恢复完成后写入 datastore：
+datastore.data['last_restore_result'] = {
+    'timestamp': time.time(),
+    'restored_groups': restored_groups,
+    'skipped_groups': skipped_groups,
+    'restored_watches': restored_watches,
+    'skipped_watches': skipped_watches,
+}
+datastore.commit()
+```
+
+**建议 4：考虑重构分支结构**
+
+将 `if-elif` 改为两个独立的 `if`，但增加 UUID 空间检查：
+```python
+# 当前：if-elif → 潜在数据丢失
+if include_groups and os.path.exists(tag_json_path):
+    process_tag()
+elif include_watches and os.path.exists(watch_json_path):
+    process_watch()
+
+# 建议：两个独立 if + 跨类型 UUID 冲突检测
+if include_groups and os.path.exists(tag_json_path):
+    process_tag()
+    
+if include_watches and os.path.exists(watch_json_path):
+    if uuid in current_tags:
+        logger.error(f"UUID {uuid} conflict: already exists as Tag, skipping Watch restore")
+    else:
+        process_watch()
 ```
 
 ---
@@ -709,11 +731,12 @@ restore_completed.send(result=restore_result)
 | 功能 | 文件 | 行号范围 |
 |------|------|---------|
 | import_from_zip 主逻辑 | `backups/restore.py` | 40-169 |
-| Tag 恢复分支 | `backups/restore.py` | 89-124 |
-| Watch 恢复分支 | `backups/restore.py` | 127-155 |
-| 覆盖/跳过判断 | `backups/restore.py` | 90-94, 128-131 |
-| 实体持久化 Mixin | `model/persistence.py` | 37-84 |
-| watch_base 基类 | `model/__init__.py` | 15-690 |
+| Tag 恢复分支（if 分支） | `backups/restore.py` | 89-124 |
+| Watch 恢复分支（elif 分支） | `backups/restore.py` | 127-155 |
+| Tag 跳过计数赋值 | `backups/restore.py` | 90-94 |
+| Watch 跳过计数赋值 | `backups/restore.py` | 128-131 |
+| restored_groups 递增 | `backups/restore.py` | 122 |
+| restored_watches 递增 | `backups/restore.py` | 154 |
 | commit() 方法 | `model/__init__.py` | 649-690 |
-| 原子写入 | `store/file_saving_datastore.py` | 36-176 |
-| 备份恢复测试 | `tests/test_backup.py` | 122-261 |
+| 实体持久化 Mixin | `model/persistence.py` | 37-84 |
+| 现有备份恢复测试 | `tests/test_backup.py` | 122-261 |
