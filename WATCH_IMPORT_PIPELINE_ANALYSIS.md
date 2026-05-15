@@ -2,133 +2,97 @@
 
 ## 概述
 
-changedetection.io 的监控列表导入流程包含四个核心阶段：**解析** → **归并** → **入库** → **调度**。本文档详细分析每个阶段的容错策略、字段对齐方式、批量处理行为及合并语义。
+changedetection.io 的监控列表导入流程包含四个核心阶段：**解析** → **归并** → **入库** → **调度**。本文档详细分析每个阶段的容错策略、字段对齐方式、批量处理行为及合并语义，重点澄清不同入口的差异、合并逻辑及入库与调度的分离。
 
 ---
 
-## 一、解析阶段
+## 一、解析阶段：不同入口的重复监控处理差异
 
-### 1.1 入口渠道
+### 1.1 入口渠道总览
 
-系统支持多种导入入口：
+| 入口类型 | 位置 | 数据源格式 | 重复检测 | 处理方式 |
+|---------|------|-----------|---------|---------|
+| **API批量导入** | `api/Import.py` | 纯文本URL列表 | **有** | 跳过已存在项 |
+| **网页URL列表导入** | `blueprint/imports/importer.py` | URL列表 | 无 | 直接创建（可能重复） |
+| **网页Distill.io导入** | `blueprint/imports/importer.py` | JSON | 无 | 直接创建（可能重复） |
+| **网页Wachete导入** | `blueprint/imports/importer.py` | XLSX | 无 | 直接创建（可能重复） |
+| **网页自定义XLSX导入** | `blueprint/imports/importer.py` | XLSX | 无 | 直接创建（可能重复） |
+| **命令行** | `__init__.py` | `-u`参数 | 无 | 直接创建（可能重复） |
+| **CreateWatch API** | `api/Watch.py` | JSON | 无 | 直接创建（可能重复） |
 
-| 入口类型 | 位置 | 数据源格式 |
-|---------|------|-----------|
-| API导入 | `api/Import.py` | 纯文本URL列表（每行一个） |
-| 网页导入 | `blueprint/imports/importer.py` | URL列表、Distill.io JSON、Wachete XLSX、自定义XLSX |
-| 命令行 | `__init__.py` | `-u` 参数指定URL |
+### 1.2 各入口重复处理详解
 
-### 1.2 容错策略
+#### 1.2.1 API批量导入（唯一有去重的入口）
 
-#### 1.2.1 URL验证
 ```python
-# api/Import.py:188-189
-if not is_safe_valid_url(url):
-    return f"Invalid or unsupported URL - {url}", 400
+# api/Import.py:121-122
+dedupe = strtobool(request.args.get('dedupe', 'true'))
+
+# api/Import.py:179-195
+urls = request.get_data().decode('utf8').splitlines()
+urls_to_import = []
+for url in urls:
+    url = url.strip()
+    if not len(url):
+        continue
+
+    if not is_safe_valid_url(url):
+        return f"Invalid or unsupported URL - {url}", 400
+
+    # 关键：去重检查
+    if dedupe and self.datastore.url_exists(url):
+        continue  # 跳过已存在的URL
+
+    urls_to_import.append(url)
 ```
 
-**验证规则**：
-- 检查协议白名单（http/https）
-- 防止URL注入攻击
-- 拒绝不安全的URL格式
+**去重特性**：
+- **默认开启**：`dedupe=true`，可通过参数关闭
+- **比较方式**：不区分大小写
+- **跳过策略**：已存在的URL直接跳过，不创建也不更新
 
-#### 1.2.2 重复检测（去重）
+#### 1.2.2 网页导入（无去重）
+
 ```python
-# api/Import.py:191-193
-if dedupe and self.datastore.url_exists(url):
-    continue
+# blueprint/imports/importer.py:47-76
+for url in urls:
+    url = url.strip()
+    if not len(url):
+        continue
+
+    tags = ""
+    if ' ' in url:
+        url, tags = url.split(" ", 1)
+
+    # 无去重检查！直接调用add_watch
+    if len(url) and 'http' in url.lower() and good < 5000:
+        extras = None
+        if processor:
+            extras = {'processor': processor}
+        new_uuid = datastore.add_watch(url=url.strip(), tag=tags, 
+                                      save_immediately=False, extras=extras)
 ```
 
-- 默认开启去重（`dedupe=true`）
-- 通过 `datastore.url_exists()` 检查
-- 不区分大小写比较
+#### 1.2.3 命令行导入（无去重）
 
-#### 1.2.3 批量大小限制
 ```python
-# blueprint/imports/importer.py:44-46
-if (len(urls) > 5000):
-    flash(gettext("Importing 5,000 of the first URLs from your list..."))
+# __init__.py:421-426
+for idx, url in enumerate(urls_to_add):
+    extras = url_options.get(idx, {})
+    new_uuid = datastore.add_watch(url=url, extras=extras)
+    if new_uuid:
+        added_watch_uuids.append(new_uuid)
 ```
 
-**限制策略**：
-- 单次导入最多处理 **5000** 条记录
-- 超出部分被跳过，用户可分批导入
+#### 1.2.4 CreateWatch API（无去重）
 
-#### 1.2.4 JSON解析容错
 ```python
-# blueprint/imports/importer.py:95-99
-try:
-    data = json.loads(data.strip())
-except json.decoder.JSONDecodeError:
-    flash(gettext("Unable to read JSON file, was it broken?"), 'error')
-    return
+# api/Watch.py:489
+new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags)
 ```
 
-#### 1.2.5 参数校验
-```python
-# api/Import.py:150-168
-# 验证processor
-if 'processor' in extras:
-    available = [p[0] for p in available_processors()]
-    if extras['processor'] not in available:
-        return f"Invalid processor '{extras['processor']}'", 400
+### 1.3 去重检测底层实现
 
-# 验证fetch_backend
-if 'fetch_backend' in extras:
-    is_valid = (
-        extras['fetch_backend'] == 'system' or
-        extras['fetch_backend'] in available or
-        extras['fetch_backend'].startswith('extra_browser_')
-    )
-```
-
-### 1.3 字段对齐方式
-
-#### 1.3.1 参数类型转换
-```python
-# api/Import.py:26-93
-def convert_query_param_to_type(value, schema_property):
-    """
-    支持类型：
-    - array: 逗号分隔或JSON数组
-    - object: JSON对象
-    - boolean: strtobool转换
-    - integer: 整数
-    - number: 浮点数
-    - string: 保持原样
-    """
-```
-
-#### 1.3.2 外部格式映射
-
-**Distill.io JSON → 内部格式**：
-```python
-# blueprint/imports/importer.py:111-127
-if d_config['selections'][0]['frames'][0]['excludes'][0]['type'] == 'css':
-    extras['subtractive_selectors'] = d_config['selections'][0]['frames'][0]['excludes'][0]['expr']
-
-if d_config['selections'][0]['frames'][0]['includes'][0]['type'] == 'xpath':
-    extras['include_filters'].append('xpath:' + expr)
-else:
-    extras['include_filters'].append(expr)
-```
-
-**Wachete XLSX → 内部格式**：
-| Wachete字段 | 内部字段 | 转换逻辑 |
-|------------|---------|---------|
-| `dynamic wachet` | `fetch_backend` | true→html_webdriver, false→html_requests |
-| `xpath` | `include_filters` | 直接映射为列表 |
-| `name` | `title` | 直接映射 |
-| `interval (min)` | `time_between_check` | 转换为{weeks, days, hours, minutes, seconds} |
-| `folder` | `tag` | 直接映射 |
-
----
-
-## 二、归并阶段
-
-### 2.1 合并语义
-
-#### 2.1.1 去重策略
 ```python
 # store/__init__.py:660-666
 def url_exists(self, url):
@@ -138,43 +102,87 @@ def url_exists(self, url):
     return False
 ```
 
-**语义规则**：
-- **URL唯一性约束**：基于URL（不区分大小写）判断重复
-- **去重时机**：解析阶段立即过滤
-- **保留策略**：已存在的监控项保持不变，新导入的重复项被跳过
+**特点**：
+- 仅比较URL，不比较其他属性
+- O(n)复杂度，遍历所有现有监控项
 
-#### 2.1.2 标签合并
+---
+
+## 二、归并阶段：既有监控项与新增监控项的合并语义
+
+### 2.1 URL合并语义
+
+| 场景 | 行为 | 说明 |
+|-----|------|-----|
+| URL已存在 + API导入(dedupe=true) | **跳过** | 不创建、不更新、不合并 |
+| URL已存在 + 其他入口 | **创建重复项** | 生成新UUID，产生重复监控 |
+| URL不存在 | **创建新项** | 正常流程 |
+
+**核心原则**：系统**不执行URL级别的合并更新**。若需更新现有监控，必须通过编辑入口（PUT /api/v1/watch/{uuid}）。
+
+### 2.2 标签合并语义
+
 ```python
 # store/__init__.py:751-766
 if tag and type(tag) == str:
+    # 标签名称转换为UUID
     for t in tag.split(','):
         for a_t in t.split(','):
-            tag_uuid = self.add_tag(a_t)
+            tag_uuid = self.add_tag(a_t)  # 不存在则创建
             apply_extras['tags'].append(tag_uuid)
 
 if tag_uuids:
+    # 直接使用UUID
     for t in tag_uuids:
         apply_extras['tags'] = list(set(apply_extras['tags'] + [t.strip()]))
 
+# 最终去重
 if apply_extras.get('tags'):
     apply_extras['tags'] = list(set(apply_extras.get('tags')))
 ```
 
-**语义规则**：
-- 支持**标签名称**和**标签UUID**两种格式
-- 自动去重，保证标签列表唯一性
-- 标签不存在时自动创建
+**合并规则**：
+1. **名称→UUID转换**：输入标签名称自动转换为UUID，不存在则创建
+2. **自动去重**：最终标签列表通过 `set()` 去重
+3. **合并模式**：新标签追加到列表，不覆盖现有标签（适用于编辑场景）
 
-#### 2.1.3 共享链接解析
+### 2.3 扩展配置(extras)合并语义
+
+```python
+# store/__init__.py:679-680
+apply_extras = deepcopy(extras)
+
+# store/__init__.py:783
+new_watch.update(apply_extras)
+```
+
+**合并规则**：
+- **新增监控**：extras直接应用到新创建的Watch对象
+- **无冲突处理**：因为URL重复时要么跳过要么创建新项，不存在配置冲突场景
+- **特殊字段过滤**：以下字段会被自动移除（系统管理）：
+  ```python
+  # store/__init__.py:776-778
+  for k in ['uuid', 'history', 'last_checked', 'last_changed', 
+            'newest_history_key', 'previous_md5', 'viewed']:
+      if k in apply_extras:
+          del apply_extras[k]
+  ```
+
+### 2.4 共享链接解析的配置合并
+
 ```python
 # store/__init__.py:684-728
 if (url.startswith("https://changedetection.io/share/")):
-    r = requests.request(method="GET", url=url, 
-                        headers={'App-Guid': self.__data['app_guid']}, timeout=5.0)
+    r = requests.request(method="GET", url=url, timeout=5.0)
     res = r.json()
     
-    # 白名单属性列表
-    for k in ['body', 'browser_steps', 'css_filter', 'extract_text', ...]:
+    # 白名单属性合并
+    for k in ['body', 'browser_steps', 'css_filter', 'extract_text', 
+              'headers', 'ignore_text', 'include_filters', 'method', 
+              'paused', 'previous_md5', 'processor', 'subtractive_selectors',
+              'tag', 'tags', 'text_should_not_be_present', 'title', 
+              'trigger_text', 'url', 'use_page_title_in_list', 
+              'webdriver_js_execute_code']:
         if res.get(k):
             if k != 'css_filter':
                 apply_extras[k] = res[k]
@@ -183,56 +191,71 @@ if (url.startswith("https://changedetection.io/share/")):
 ```
 
 **安全策略**：
-- 仅接受白名单内的属性
-- 字段名映射（如`css_filter`→`include_filters`）
-- 5秒超时防止阻塞
+- **白名单限制**：仅接受预定义的属性列表
+- **字段映射**：`css_filter` → `include_filters`（字段重命名兼容）
+- **超时保护**：5秒超时防止阻塞
 
 ---
 
-## 三、入库阶段
+## 三、入库阶段：持久化机制
 
-### 3.1 核心流程
+### 3.1 入库核心流程
 
 ```python
 # store/__init__.py:674-794
 def add_watch(self, url, tag='', extras=None, tag_uuids=None, save_immediately=True):
-    # 1. 参数准备
+    # 1. 参数准备（深拷贝避免引用问题）
     apply_extras = deepcopy(extras)
     
-    # 2. URL验证
+    # 2. URL安全验证
     if not is_safe_valid_url(url):
         return None
     
-    # 3. 数量限制检查
+    # 3. 数量限制检查（PAGE_WATCH_LIMIT）
     page_watch_limit = os.getenv('PAGE_WATCH_LIMIT')
     if page_watch_limit and current_watch_count >= page_watch_limit:
         return None
     
-    # 4. 标签处理
+    # 4. 标签处理（名称转UUID）
     if tag and type(tag) == str:
-        # 添加标签UUID
+        for t in tag.split(','):
+            tag_uuid = self.add_tag(t)
+            apply_extras['tags'].append(tag_uuid)
     
     # 5. 创建Watch对象
     watch_class = get_custom_watch_obj_for_processor(apply_extras.get('processor'))
-    new_watch = watch_class(datastore_path=self.datastore_path, ...)
+    new_watch = watch_class(datastore_path=self.datastore_path, 
+                           __datastore=self.__data, url=url)
     
-    # 6. 应用额外配置
+    # 6. 应用配置
     new_watch.update(apply_extras)
     new_watch.ensure_data_dir_exists()
     
     # 7. 注册到内存
     self.__data['watching'][new_uuid] = new_watch
     
-    # 8. 持久化
+    # 8. 持久化（可延迟）
     if save_immediately:
         new_watch.commit()
     
     return new_uuid
 ```
 
-### 3.2 持久化机制
+### 3.2 立即保存 vs 延迟保存
 
-#### 3.2.1 原子写入
+| 模式 | `save_immediately` | 适用场景 | 调用方 |
+|-----|-------------------|---------|-------|
+| 立即保存 | `True`（默认） | 单条添加 | CreateWatch API、命令行 |
+| 延迟保存 | `False` | 批量导入 | 网页导入 |
+
+```python
+# blueprint/imports/importer.py:65
+new_uuid = datastore.add_watch(url=url.strip(), tag=tags, 
+                                save_immediately=False, extras=extras)
+```
+
+### 3.3 原子写入机制
+
 ```python
 # store/file_saving_datastore.py:36-175
 def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
@@ -252,85 +275,145 @@ def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
     os.replace(temp_path, file_path)
 ```
 
-#### 3.2.2 存储结构
+### 3.4 存储结构
+
 ```
 datastore/
 ├── changedetection.json      # 全局配置
 ├── {watch-uuid}/
-│   ├── watch.json            # 监控项配置
+│   ├── watch.json            # 监控项配置（原子写入）
 │   ├── history.txt           # 历史索引
-│   ├── {timestamp}.txt(.br)  # 快照内容
+│   ├── {timestamp}.txt(.br)  # 快照内容（Brotli压缩）
 │   ├── last-screenshot.png   # 截图
 │   └── last-error.txt        # 错误信息
 └── {tag-uuid}/
     └── tag.json              # 标签配置
 ```
 
-### 3.3 立即保存 vs 延迟保存
-
-| 模式 | `save_immediately` | 适用场景 | 行为 |
-|-----|-------------------|---------|-----|
-| 立即保存 | `True`（默认） | 单条添加 | 立即写入磁盘 |
-| 延迟保存 | `False` | 批量导入 | 先写入内存，后续统一commit |
-
-```python
-# blueprint/imports/importer.py:65
-new_uuid = datastore.add_watch(url=url.strip(), tag=tags, 
-                                save_immediately=False, extras=extras)
-```
-
 ---
 
-## 四、调度阶段
+## 四、调度阶段：入库与入队的分离
 
-### 4.1 批量处理行为
+### 4.1 核心原则：入库 ≠ 入队
 
-#### 4.1.1 同步 vs 异步阈值
+**入库**：将监控项持久化到磁盘并注册到内存  
+**入队**：将监控项添加到调度队列等待检查  
+
+这是两个**独立**的操作，入库完成后**不会自动入队**。
+
+### 4.2 入队触发条件
+
+| 触发场景 | 代码位置 | 优先级 | 条件 |
+|---------|---------|-------|-----|
+| **编辑保存** | `blueprint/ui/edit.py:275-277` | 1 | 非暂停状态 + 在时间窗口内 |
+| **手动触发检查** | `api/Watch.py:81` | 1 | `?recheck=true` 参数 |
+| **批量重检查** | `api/Watch.py:536-589` | 1 | `?recheck_all=true` 参数 |
+| **命令行批量模式** | `__init__.py:437-445` | 1 | `-b` + `-u` 参数 |
+| **定时调度** | ticker线程 | timestamp | 达到检查时间 |
+
+### 4.3 各入口的入队行为
+
+#### 4.3.1 API批量导入（不入队）
+
 ```python
-# api/Import.py:10-11
-IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD = 20
-
 # api/Import.py:198-227
 if len(urls_to_import) < IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD:
-    # 同步处理
     added = []
     for url in urls_to_import:
         new_uuid = self.datastore.add_watch(...)
         added.append(new_uuid)
-    return added, 200
+    return added, 200  # 仅返回UUID，不入队
 else:
-    # 异步后台线程处理
-    def import_watches_background():
-        for url in urls_to_import:
-            try:
-                self.datastore.add_watch(...)
-            except Exception as e:
-                logger.error(f"Error importing URL {url}: {e}")
-    
-    thread = threading.Thread(target=import_watches_background, 
-                            daemon=True, name="ImportWatches-Background")
+    # 后台线程导入，同样不入队
+    thread = threading.Thread(target=import_watches_background, ...)
     thread.start()
-    return {'status': 'Importing in background', 'count': len(urls_to_import)}, 202
+    return {'status': 'Importing in background'}, 202
 ```
 
-#### 4.1.2 队列优先级
+#### 4.3.2 网页导入（不入队）
 
 ```python
-# custom_queue.py:271-295
-# 优先级定义
-immediate_items = 0  # priority 1 - 立即检查
-clone_items = 0      # priority 5 - 克隆操作
-scheduled_items = 0  # priority > 100 - 定时任务（timestamp）
-
-# 优先级数值越小越优先
-# priority=1: 最高优先级（立即执行）
-# priority=5: 中等优先级（克隆）
-# priority=timestamp: 定时任务（时间戳作为优先级）
+# blueprint/imports/importer.py:65-70
+new_uuid = datastore.add_watch(url=url.strip(), tag=tags, 
+                                save_immediately=False, extras=extras)
+if new_uuid:
+    self.new_uuids.append(new_uuid)  # 仅记录UUID，不入队
+    good += 1
 ```
 
-### 4.2 队列入口
+#### 4.3.3 命令行（条件入队）
 
-#### 4.2.1 优先级队列实现
+```python
+# __init__.py:430-446
+# Step 2: Queue newly added watches (if -u was provided in batch mode)
+if batch_mode and added_watch_uuids:
+    from changedetectionio.flask_app import update_q
+    from changedetectionio import queuedWatchMetaData, worker_pool
+
+    for watch_uuid in added_watch_uuids:
+        worker_pool.queue_item_async_safe(
+            update_q,
+            queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': watch_uuid})
+        )
+```
+
+**条件**：必须同时满足 `-b`（批量模式）和 `-u`（添加URL）
+
+#### 4.3.4 编辑保存（条件入队）
+
+```python
+# blueprint/ui/edit.py:275-277
+if not datastore.data['watching'][uuid].get('paused') and is_in_schedule:
+    worker_pool.queue_item_async_safe(update_q, 
+        queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+```
+
+**条件**：
+1. 监控未暂停 (`paused=False`)
+2. 当前时间在调度窗口内 (`is_in_schedule=True`)
+
+#### 4.3.5 CreateWatch API（不入队）
+
+```python
+# api/Watch.py:491-496
+new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags)
+# Dont queue because the scheduler will check that it hasnt been checked before anyway
+# worker_pool.queue_item_async_safe(...)
+return {'uuid': new_uuid}, 201
+```
+
+**设计意图**：调度器会自动检查新监控项并安排首次检查
+
+### 4.4 批量导入的入队时机
+
+批量导入（API或网页）完成后，新监控项的首次检查由**调度器（ticker线程）**负责，而非导入流程本身：
+
+```
+导入完成 → 监控项入库 → 调度器轮询 → 发现新项(last_checked=0) → 安排首次检查
+```
+
+调度器逻辑：
+- 定期扫描所有监控项
+- 检查 `last_checked` 是否为0（从未检查过）
+- 若是，则计算下次检查时间并加入队列
+
+### 4.5 队列优先级体系
+
+```python
+# custom_queue.py
+# priority=1:     立即检查（最高优先级）
+# priority=5:     克隆操作
+# priority>100:   定时任务（使用timestamp作为优先级）
+```
+
+| 优先级值 | 含义 | 场景 |
+|---------|-----|-----|
+| 1 | 立即执行 | 编辑保存、手动触发、API调用 |
+| 5 | 中等优先级 | 克隆操作 |
+| timestamp | 定时执行 | 调度器安排的周期性检查 |
+
+### 4.6 优先级队列实现
+
 ```python
 # queue_handlers.py:15-411
 class RecheckPriorityQueue:
@@ -348,16 +431,6 @@ class RecheckPriorityQueue:
             self._notification_queue.put(True, block=True, timeout=5.0)
 ```
 
-#### 4.2.2 调度触发时机
-
-| 触发事件 | 优先级 | 代码位置 |
-|---------|-------|---------|
-| 新添加监控 | 1（立即） | `add_watch()` 后自动入队 |
-| 编辑监控 | 1（立即） | 更新后触发 |
-| 定时检查 | timestamp | ticker线程调度 |
-| 手动触发 | 1（立即） | 用户操作 |
-| 克隆操作 | 5 | `clone()` 方法 |
-
 ---
 
 ## 五、完整链路流程图
@@ -369,7 +442,7 @@ class RecheckPriorityQueue:
 ┌─────────────────────┐
 │   1. 解析阶段        │
 │  - URL验证          │
-│  - 去重检测          │
+│  - [仅API]去重检测   │
 │  - 参数类型转换      │
 │  - 字段映射对齐      │
 └─────────┬───────────┘
@@ -377,9 +450,9 @@ class RecheckPriorityQueue:
           ▼
 ┌─────────────────────┐
 │   2. 归并阶段        │
-│  - URL去重判断      │
+│  - URL存在性判断     │
 │  - 标签合并去重      │
-│  - 共享链接解析      │
+│  - 扩展配置应用      │
 └─────────┬───────────┘
           │
           ▼
@@ -391,13 +464,16 @@ class RecheckPriorityQueue:
 │  - 发送创建信号      │
 └─────────┬───────────┘
           │
-          ▼
+          ▼ (分离点)
 ┌─────────────────────┐
 │   4. 调度阶段        │
-│  - 批量大小判断      │
-│  - 同步/异步处理     │
-│  - 优先级队列入队    │
+│  - [条件触发]入队    │
+│  - 优先级排序        │
 │  - Worker消费执行    │
+│                     │
+│  [调度器独立流程]    │
+│  - 扫描新监控项      │
+│  - 安排首次检查      │
 └─────────────────────┘
 ```
 
@@ -408,9 +484,9 @@ class RecheckPriorityQueue:
 | 阶段 | 容错机制 | 可靠性保障 |
 |-----|---------|-----------|
 | 解析 | URL验证、参数校验、格式容错 | 拒绝非法输入 |
-| 归并 | 去重检测、字段白名单 | 数据一致性 |
-| 入库 | 原子写入、批量限制 | 数据完整性 |
-| 调度 | 异步后台线程、优先级队列 | 系统稳定性 |
+| 归并 | 去重检测（仅API）、字段白名单 | 数据一致性 |
+| 入库 | 原子写入、批量限制、内存注册 | 数据完整性 |
+| 调度 | 异步后台线程、优先级队列、条件入队 | 系统稳定性 |
 
 ---
 
@@ -425,6 +501,30 @@ class RecheckPriorityQueue:
 
 ---
 
-**文档版本**: v1.0  
+## 八、核心差异总结表
+
+### 8.1 各入口重复处理差异
+
+| 入口 | 去重检查 | 重复行为 | 适用场景 |
+|-----|---------|---------|---------|
+| API批量导入 | 有（可关闭） | 跳过已存在项 | 大规模导入 |
+| 网页导入 | 无 | 创建重复项 | 手动操作 |
+| 命令行 | 无 | 创建重复项 | 脚本/自动化 |
+| CreateWatch API | 无 | 创建重复项 | 程序化创建 |
+
+### 8.2 各入口入队行为
+
+| 入口 | 自动入队 | 入队条件 |
+|-----|---------|---------|
+| API批量导入 | 否 | 需手动调用 `?recheck_all=true` |
+| 网页导入 | 否 | 需手动触发检查 |
+| 命令行(-u) | 否 | 需同时指定 `-b` |
+| 命令行(-b -u) | 是 | 自动入队新添加项 |
+| CreateWatch API | 否 | 调度器自动安排 |
+| 编辑保存 | 条件入队 | 非暂停 + 在时间窗口内 |
+
+---
+
+**文档版本**: v2.0  
 **生成时间**: 2026-05-15  
 **代码版本**: changedetection.io v0.55.3
