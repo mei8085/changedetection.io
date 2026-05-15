@@ -161,16 +161,16 @@ out_of_stock_keywords = [
 
 ---
 
-## 6. 价格变更检测
+## 6. 价格变更检测（真实分支校准版）
 
 ### 6.1 检测参数
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `follow_price_changes` | Boolean | 是否启用价格追踪 |
-| `price_change_min` | Float | 触发通知的价格下限 |
-| `price_change_max` | Float | 触发通知的价格上限 |
-| `price_change_threshold_percent` | Float | 价格变化百分比阈值 |
+| `price_change_min` | Float | 价格下限（价格低于此值触发） |
+| `price_change_max` | Float | 价格上限（价格高于此值触发） |
+| `price_change_threshold_percent` | Float | 价格变化百分比阈值（变化幅度超过此值才触发） |
 
 ### 6.2 价格去重逻辑
 
@@ -184,16 +184,44 @@ def _deduplicate_prices(data):
     # 返回去重后的唯一价格集合
 ```
 
-### 6.3 变更触发条件
+### 6.3 真实变更触发分支（按代码顺序）
 
+```python
+# ┌── 步骤 1: 启用价格追踪且有历史数据 ─────────────────────────┐
+# │  IF follow_price_changes AND watch.restock EXISTS          │
+# │     AND current.restock.price EXISTS                       │
+# └────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌── 步骤 2: 价格变化初步检测 ────────────────────────────────┐
+# │  IF original_price EXISTS AND price != original_price      │
+# │      changed_detected = True                               │
+# └────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌── 步骤 3: 价格区间过滤（反向逻辑） ──────────────────────────┐
+# │  IF min_limit OR max_limit IS SET                          │
+# │      AND price IS BETWEEN min_limit AND max_limit          │
+# │          FORCE changed_detected = False                    │
+# │                                                            │
+# │  注意: 设置区间后，只有价格跳出区间才触发，区间内不触发      │
+# └────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌── 步骤 4: 百分比阈值过滤 ───────────────────────────────────┐
+# │  IF original_price EXISTS AND changed_detected IS TRUE      │
+# │     AND threshold_percent IS SET                            │
+# │      change_percent = abs((price - original) / original * 100) │
+# │      IF change_percent <= threshold_percent                 │
+# │          FORCE changed_detected = False                     │
+# └────────────────────────────────────────────────────────────┘
 ```
-触发通知当:
-  (价格 != 原始价格) 
-    AND
-  (价格 < price_change_min OR 价格 > price_change_max)
-    AND
-  (变化百分比 >= threshold_percent)
-```
+
+**关键注意事项**:
+- 价格变化比较始终以 `original_price`（首次检测价格）为基准，而非上一次价格
+- min/max 是**反向过滤器**：价格在区间内时**不触发**，跳出区间才触发
+- 百分比阈值是**最小变化量**：变化幅度必须超过阈值才触发
+- 所有过滤条件均可叠加，任一条件将 `changed_detected` 设为 False 就不会触发通知
 
 ---
 
@@ -240,7 +268,94 @@ supports_request_type = True              # 支持自定义请求方法
 
 ---
 
-## 9. 检测流程时序图
+## 9. 关键状态流转详解
+
+### 9.1 original_price 与 previous_price 的本质区别
+
+| 字段 | 存储位置 | 生命周期 | 用途 |
+|------|----------|----------|------|
+| **original_price** | `watch['restock']` 对象中 | 首次检测设置后永久不变 | 价格变化检测的基准值 |
+| **previous_price** | 仅通知模板动态计算 | 不持久化，每次通知时从历史快照解析 | 通知内容展示，不参与检测逻辑 |
+
+**original_price 设置时机** (processor.py 第 568-570 行):
+```python
+# 首次检测到价格且 original_price 未设置时，将当前价格设为原始价格
+if itemprop_availability and itemprop_availability.get('price') 
+   and not itemprop_availability.get('original_price'):
+    itemprop_availability['original_price'] = itemprop_availability.get('price')
+    update_obj['restock']["original_price"] = itemprop_availability.get('price')
+```
+
+**previous_price 计算方式** (`__init__.py` 第 94-104 行):
+```python
+# 从历史快照中解析
+if self.history_n >= 2:
+    sorted_keys = sorted(list(history), key=lambda x: int(x))
+    sorted_keys.reverse()  # 最新在前
+    # 取倒数第一条（即上一次快照）解析价格
+    price_str = self.get_history_snapshot(timestamp=sorted_keys[-1])
+    values['restock']['previous_price'] = get_price_from_history_str(price_str)
+```
+
+> **重要提示**: `previous_price` 仅用于通知模板展示，**不参与任何检测逻辑**。所有价格变化检测都以 `original_price` 为基准。
+
+### 9.2 in_stock 状态流转模式
+
+#### 模式 1: in_stock_only（默认）
+
+```
+触发条件: 库存状态发生变化 AND 当前状态为 in_stock=True
+
+状态流转矩阵:
+┌─────────────┬──────────────────┬──────────────────┐
+│  前状态 \ 后状态  │    缺货(False)   │   有货(True)     │
+├─────────────┼──────────────────┼──────────────────┤
+│  缺货(False)  │  状态未变，不触发  │  ✅ 触发通知      │
+├─────────────┼──────────────────┼──────────────────┤
+│  有货(True)   │  ❌ 不触发通知    │  状态未变，不触发  │
+└─────────────┴──────────────────┴──────────────────┘
+```
+
+**设计意图**: 补货提醒场景，用户只关心"从无货到有货"这一瞬间。
+
+#### 模式 2: all_changes
+
+```
+触发条件: 只要库存状态发生任何变化就触发
+
+状态流转矩阵:
+┌─────────────┬──────────────────┬──────────────────┐
+│  前状态 \ 后状态  │    缺货(False)   │   有货(True)     │
+├─────────────┼──────────────────┼──────────────────┤
+│  缺货(False)  │  状态未变，不触发  │  ✅ 触发通知      │
+├─────────────┼──────────────────┼──────────────────┤
+│  有货(True)   │  ✅ 触发通知      │  状态未变，不触发  │
+└─────────────┴──────────────────┴──────────────────┘
+```
+
+**设计意图**: 需要完整监控库存状态变化的场景（如竞品监控）。
+
+#### 模式 3: off
+
+```
+完全关闭库存状态检测，仅保留价格变化检测功能
+```
+
+### 9.3 快照 MD5 计算机制
+
+每次检测生成快照内容并计算 MD5：
+```python
+snapshot_content = f"In Stock: {in_stock} - Price: {price}"
+fetched_md5 = hashlib.md5(snapshot_content.encode('utf-8')).hexdigest()
+```
+
+- MD5 变化是最终判定 `changed_detected` 的依据
+- 价格或库存任一变化都会导致 MD5 变化
+- 后续的过滤逻辑在此基础上进行二次确认
+
+---
+
+## 10. 检测流程时序图
 
 ```
 调用 perform_site_check()
@@ -266,23 +381,27 @@ supports_request_type = True              # 支持自定义请求方法
     ├─► 浏览器 JS 库存检测结果覆盖
     │   └─► JS 检测无库存 → 强制覆盖 in_stock=False
     │
-    ├─► 生成快照内容: "In Stock: {x} - Price: {y}"
+    ├─► 首次检测初始化 original_price
+    │   └─► 未设置过原始价格? → 将当前价格保存为 original_price
     │
-    ├─► 计算快照 MD5
+    ├─► 生成快照内容与 MD5
+    │   └─► "In Stock: {x} - Price: {y}" → MD5
     │
     └─► 变更检测判断
         ├─► 库存状态变更检测
-        │   └─► 仅缺货→有货? 还是所有变更?
-        ├─► 价格变更检测
-        │   └─► 应用 min/max/百分比阈值
+        │   └─► in_stock_only / all_changes 模式判定
+        ├─► 价格变更检测（按顺序执行）
+        │   ├─► 与 original_price 比较是否变化
+        │   ├─► 应用 min/max 区间过滤（区间内强制不触发）
+        │   └─► 应用百分比阈值过滤（变化过小强制不触发）
         └─► 返回 (changed_detected, update_obj, snapshot)
 ```
 
 ---
 
-## 10. 关键配置选项
+## 11. 关键配置选项
 
-### 10.1 库存检测模式
+### 11.1 库存检测模式
 
 | 模式 | 行为 |
 |------|------|
@@ -290,17 +409,17 @@ supports_request_type = True              # 支持自定义请求方法
 | `all_changes` | 任何库存状态变更都触发通知 |
 | `off` | 完全关闭库存检测 |
 
-### 10.2 价格检测配置
+### 11.2 价格检测配置
 
 - **follow_price_changes**: 开启/关闭价格追踪
-- **price_change_min/max**: 价格区间过滤（只在区间外触发）
-- **price_change_threshold_percent**: 相对于原始价格的变化百分比阈值
+- **price_change_min/max**: 价格区间过滤（跳出区间才触发）
+- **price_change_threshold_percent**: 相对于原始价格的变化百分比阈值（超过才触发）
 
 ---
 
-## 11. 异常处理
+## 12. 异常处理
 
-### 11.1 异常类型
+### 12.1 异常类型
 
 ```python
 class UnableToExtractRestockData(Exception):
@@ -316,7 +435,7 @@ class ProcessorException(基类):
     # 通用处理器异常
 ```
 
-### 11.2 错误恢复策略
+### 12.2 错误恢复策略
 
 1. **多价格错误**: 先尝试 LLM 插件提取正确价格，仍失败才报错
 2. **提取失败降级**: 结构化数据失败 → 降级到 JS 文本检测
@@ -324,18 +443,18 @@ class ProcessorException(基类):
 
 ---
 
-## 12. 测试覆盖
+## 13. 测试覆盖（路径对齐版）
 
-### 12.1 现有测试文件
+### 13.1 现有测试文件（与仓库目录精确对齐）
 
-| 测试文件 | 覆盖内容 |
+| 相对仓库路径 | 覆盖内容 |
 |----------|----------|
-| `tests/restock/test_restock.py` | 端到端库存检测流程 |
-| `tests/test_restock_itemprop.py` | 结构化数据提取 |
-| `tests/unit/test_restock_logic.py` | 核心逻辑单元测试 |
-| `tests/llm/test_llm_restock_plugin.py` | LLM 插件测试 |
+| `changedetectionio/tests/restock/test_restock.py` | 端到端库存检测流程 |
+| `changedetectionio/tests/test_restock_itemprop.py` | 结构化数据提取 |
+| `changedetectionio/tests/unit/test_restock_logic.py` | 核心逻辑单元测试 |
+| `changedetectionio/tests/llm/test_llm_restock_plugin.py` | LLM 插件测试 |
 
-### 12.2 关键测试场景
+### 13.2 关键测试场景
 
 - 缺货 → 有货 通知触发（默认行为）
 - 有货 → 缺货 不通知（默认）
@@ -346,32 +465,34 @@ class ProcessorException(基类):
 
 ---
 
-## 13. 设计亮点与优化点
+## 14. 设计亮点与优化点
 
-### 13.1 优秀设计
+### 14.1 优秀设计
 
 1. **分层提取策略**: 从快到慢、从可靠到 fallback 的多级提取
 2. **内存隔离**: Linux 下 subprocess 彻底解决 lxml 内存泄漏
 3. **真相源优先级**: 浏览器实际可见内容优先级高于元数据
 4. **降噪处理**: LLM 提取前智能移除导航栏/推荐区块噪声
 5. **配置可覆盖**: 支持 Tag 级别配置覆盖单个 watch
+6. **价格基准设计**: 使用 original_price 作为基准避免价格波动噪声
 
-### 13.2 潜在优化方向
+### 14.2 潜在优化方向
 
 1. **正则预提取**: 在 extruct 之前先用正则提取 JSON-LD 等小块，避免解析整个 5MB HTML
 2. **价格历史**: 当前只比较原始价格，可增加历史波动分析
 3. **变体支持**: 增加对多变体产品（颜色/尺码）的库存检测支持
 4. **缓存优化**: 提取的元数据可缓存，避免重复解析相同内容
+5. **previous_price 参与检测**: 考虑增加相对于上一次价格的变化检测模式
 
 ---
 
-## 14. 通知占位符
+## 15. 通知占位符
 
 ```jinja2
 {{ restock.price }}              # 当前价格
 {{ restock.in_stock }}           # 库存状态布尔值
-{{ restock.original_price }}     # 首次检测的价格
-{{ restock.previous_price }}     # 上一次检测的价格
+{{ restock.original_price }}     # 首次检测的价格（检测基准）
+{{ restock.previous_price }}     # 从历史快照解析的上一次价格（仅展示用）
 ```
 
 ---
@@ -381,8 +502,9 @@ class ProcessorException(基类):
 Restock 处理器是一个高度优化的电商产品监控模块，其核心优势在于：
 
 1. **多层提取架构**确保了对各种网站的广泛兼容性
-2. **内存泄漏防护**使其适合大规模部署
-3. **智能降噪和优先级机制**提高了检测准确率
-4. **灵活的阈值配置**满足不同用户的监控需求
+2. **内存泄漏防护**使其适合大规模部署（Linux subprocess 隔离）
+3. **智能降噪和优先级机制**提高了检测准确率（浏览器检测 > 元数据）
+4. **灵活的阈值配置**满足不同用户的监控需求（区间 + 百分比双重过滤）
+5. **清晰的状态流转设计**：original_price 作为稳定检测基准，previous_price 用于通知展示，各司其职
 
-该处理器特别适合电商价格监控、补货提醒等场景，是 changedetection.io 中最复杂也最强大的处理器之一。
+该处理器特别适合电商价格监控、补货提醒等场景，是 changedetection.io 中设计最复杂也最成熟的处理器之一。
