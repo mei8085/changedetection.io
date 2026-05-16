@@ -123,16 +123,17 @@ class TagsDict(dict):
 
 ### 2.1 核心规则区分
 
-标签配置覆盖分为两种完全不同的机制：
+标签配置覆盖分为**三种完全不同的机制**，各自有不同的触发条件和行为：
 
 | 机制 | 触发条件 | 行为 | 适用属性 |
 |------|----------|------|----------|
-| **直接合并** | 不检查 `overrides_watch`，只要标签有该属性就生效 | 所有匹配标签的属性值合并到一起 | 选择器类属性（列表类型） |
-| **条件覆盖** | 必须满足 `overrides_watch=True` 才生效 | 取第一个匹配标签的属性值，完全替换 Watch 配置 | 处理器配置、LLM 配置 |
+| **列表直接合并** | 不检查 `overrides_watch`，只要标签有该属性就生效 | 所有匹配标签的列表值合并为一个列表 | 选择器类属性（列表类型） |
+| **单值级联匹配** | 不检查 `overrides_watch`，只要标签有该属性就生效 | Watch 有值则用 Watch，否则取第一个有值的标签 | LLM 配置（字符串类型） |
+| **条件覆盖** | 必须满足 `overrides_watch=True` 才生效 | 第一个匹配标签的属性值完全替换 Watch 配置 | restock 处理器配置 |
 
 ---
 
-### 2.2 机制一：get_tag_overrides_for_watch 直接合并（不检查 overrides_watch）
+### 2.2 机制一：get_tag_overrides_for_watch 列表直接合并
 
 **函数实现**：
 ```python
@@ -182,23 +183,84 @@ def _get_merged_rules(self, attr, include_global=False):
 
 ---
 
-### 2.3 机制二：条件覆盖（需要 overrides_watch=True）
+### 2.3 机制二：LLM 单值级联匹配（不检查 overrides_watch）
 
-**覆盖原则**：`Watch.field → Tag.field (if overrides_watch) → Global.field`
+**优先级链路**：`Watch.field → 第一个有值的 Tag.field → 空值`
+
+**关键特征**：
+1. ❌ **不检查** `overrides_watch` 属性
+2. 🎯 **第一个匹配优先**：遍历标签列表，第一个有非空值的标签获胜
+3. 🔄 **回退机制**：Watch 有值则直接返回，否则才回退到标签查找
+4. 📋 适用于**单值字符串**配置（llm_intent, llm_change_summary）
+
+**LLM 标签覆盖的属性列表**：
+
+| 属性名 | 解析函数 | 覆盖策略 |
+|--------|----------|----------|
+| `llm_intent` | `resolve_intent()` | Watch 有值则用 Watch，否则取第一个有值的标签 |
+| `llm_change_summary` | `resolve_llm_field()` | Watch 有值则用 Watch，否则取第一个有值的标签 |
+
+**代码依据（resolve_llm_field 通用解析）**：
+```python
+# changedetectionio/llm/evaluator.py:156-173
+def resolve_llm_field(watch, datastore, field: str) -> tuple[str, str]:
+    """
+    Generic cascade resolver for any LLM per-watch field.
+    Returns (value, source) where source is 'watch' or tag title.
+    Returns ('', '') if not set anywhere.
+    """
+    value = (watch.get(field) or '').strip()
+    if value:
+        return value, 'watch'  # Watch 优先级最高
+
+    # 不检查 overrides_watch，直接遍历标签找第一个有值的
+    for tag_uuid in watch.get('tags', []):
+        tag = datastore.data['settings']['application'].get('tags', {}).get(tag_uuid)
+        if tag:
+            tag_value = (tag.get(field) or '').strip()
+            if tag_value:
+                return tag_value, tag.get('title', 'tag')  # 第一个有值的标签获胜
+
+    return '', ''
+```
+
+**代码依据（resolve_intent 专用解析）**：
+```python
+# changedetectionio/llm/evaluator.py:176-192
+def resolve_intent(watch, datastore) -> tuple[str, str]:
+    intent = (watch.get('llm_intent') or '').strip()
+    if intent:
+        return intent, 'watch'  # Watch 优先级最高
+
+    # 不检查 overrides_watch，直接遍历标签找第一个有值的
+    for tag_uuid in watch.get('tags', []):
+        tag = datastore.data['settings']['application'].get('tags', {}).get(tag_uuid)
+        if tag:
+            tag_intent = (tag.get('llm_intent') or '').strip()
+            if tag_intent:
+                return tag_intent, tag.get('title', 'tag')  # 第一个有值的标签获胜
+
+    return '', ''
+```
+
+---
+
+### 2.4 机制三：restock 条件覆盖（需要 overrides_watch=True）
+
+**覆盖原则**：`Watch.field → Tag.field (if overrides_watch) → 默认值`
 
 **关键特征**：
 1. ✅ **必须检查** `overrides_watch == True` 才生效
 2. 🎯 **第一个匹配优先**：遍历标签列表，第一个满足条件的标签获胜
 3. 🔄 **完全替换**：标签值完全替换 Watch 值，不是合并
-4. 📋 适用于**复杂对象**或**单值配置**
+4. 📋 适用于**复杂对象**配置（processor_config_restock_diff）
 
 **需要 overrides_watch 的属性列表**：
 
 | 属性名 | 检查位置 | 覆盖策略 |
 |--------|----------|----------|
-| `processor_config_restock_diff` | `processors/restock_diff/processor.py:464` | 第一个匹配标签的配置完全替换 Watch 配置 |
+| `processor_config_restock_diff` | `processors/restock_diff/processor.py:464` | 第一个 `overrides_watch=True` 标签的配置完全替换 Watch 配置 |
 | `processor_config_restock_diff` | `api/Watch.py:122` | GET /watch 时注入标签覆盖配置 |
-| LLM 配置（`llm_intent`, `llm_change_summary`） | `llm/evaluator.py` | Watch → 第一个有值标签 → 全局 的优先级链 |
 
 **代码依据（restock_diff 条件覆盖）**：
 ```python
@@ -226,17 +288,18 @@ for tag_uuid in (watch_obj.get('tags') or []):
 
 ---
 
-### 2.4 规则对比总结表
+### 2.5 三种覆盖路径完整对照表
 
-| 维度 | get_tag_overrides_for_watch 直接合并 | 条件覆盖（需要 overrides_watch） |
-|------|------------------------------------|----------------------------------|
-| **检查 overrides_watch** | ❌ 不检查 | ✅ 必须检查且为 True |
-| **合并策略** | 所有标签的值合并为一个列表 | 第一个匹配标签的值完全替换 |
-| **适用数据类型** | 列表类型（数组） | 复杂对象、字典、单值 |
-| **Watch 配置优先级** | Watch 列表 + 标签列表，去重合并 | 标签完全覆盖 Watch 配置 |
-| **标签数量限制** | 所有关联标签都生效 | 仅第一个匹配标签生效 |
-| **典型属性** | include_filters, subtractive_selectors | processor_config_restock_diff, LLM 配置 |
-| **实现位置** | store/__init__.py:936 | 各处理器内部自行实现 |
+| 对比维度 | get_tag_overrides_for_watch 列表合并 | LLM 单值级联匹配 | restock 条件覆盖 |
+|---------|-------------------------------------|-----------------|------------------|
+| **检查 overrides_watch** | ❌ 不检查 | ❌ 不检查 | ✅ 必须检查且为 True |
+| **标签匹配策略** | 所有标签都参与合并 | 第一个有非空值的标签获胜 | 第一个 `overrides_watch=True` 的标签获胜 |
+| **数据类型** | 列表类型（数组） | 单值字符串 | 复杂对象、字典 |
+| **Watch 与标签关系** | Watch 列表 + 所有标签列表，去重合并 | Watch 有值则用 Watch，否则回退标签 | 标签完全覆盖 Watch 配置 |
+| **生效标签数量** | 所有关联标签都生效 | 仅第一个有值标签生效 | 仅第一个满足条件标签生效 |
+| **典型属性** | include_filters, subtractive_selectors, ignore_text | llm_intent, llm_change_summary | processor_config_restock_diff |
+| **实现位置** | store/__init__.py:936 | llm/evaluator.py:156-192 | processors/restock_diff/processor.py:461 |
+| **合并/覆盖模式** | 合并（Union） | 级联回退（Fallback） | 覆盖（Override） |
 
 ---
 
