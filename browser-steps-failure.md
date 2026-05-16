@@ -1,257 +1,187 @@
-# Browser Steps 执行链路与失败处理分析报告
+# Browser Steps 单步失败链路分析报告
 
-## 1. 整体架构概述
+## 1. 异常对象定义与字段传递
 
-Browser Steps 是 changedetection.io 中的浏览器自动化功能，允许用户配置一系列操作步骤（如点击、输入文本、等待等），在页面抓取前执行这些步骤。整个流程分为：
+### 1.1 异常类定义
 
-1. **前端编辑**：用户通过可视化界面配置步骤
-2. **数据序列化**：步骤配置保存为 JSON 格式
-3. **抓取执行**：在实际抓取时按顺序执行每个步骤
-4. **失败处理**：单步失败时的异常捕获与处理
-5. **失败通知**：向用户发送失败告警
-
----
-
-## 2. 前端编辑流程与数据结构
-
-### 2.1 前端编辑界面
-
-**文件位置**：`changedetectionio/static/js/browser-steps.js`
-
-前端采用可视化选择器方式配置步骤：
-- 用户点击页面元素，系统自动识别选择器
-- 支持多种操作类型（点击、输入文本、等待等）
-- 每个步骤包含三个核心字段：`operation`、`selector`、`optional_value`
-
-### 2.2 步骤配置数据结构
-
-每个浏览器步骤在前端是一个对象，结构如下：
-
-```javascript
-{
-  "operation": "Click element",      // 操作类型
-  "selector": "#submit-button",      // CSS/XPath 选择器
-  "optional_value": ""               // 可选值（如输入文本、等待时间）
-}
-```
-
-### 2.3 支持的操作类型
-
-在 `browser_steps/browser_steps.py:26-59` 中定义：
-
-| 操作类型 | 说明 | 是否需要 selector | 是否需要 optional_value |
-|---------|------|------------------|------------------------|
-| Click element | 点击元素 | 是 | 否 |
-| Click element if exists | 点击元素（如存在） | 是 | 否 |
-| Enter text in field | 在输入框输入文本 | 是 | 是 |
-| Execute JS | 执行 JavaScript | 否 | 是 |
-| Goto URL | 跳转到 URL | 否 | 是 |
-| Wait for seconds | 等待指定秒数 | 否 | 是 |
-| Wait for text | 等待文本出现 | 否 | 是 |
-| Check checkbox | 勾选复选框 | 是 | 否 |
-| 更多操作... | | | |
-
----
-
-## 3. 步骤配置序列化过程
-
-### 3.1 表单提交
-
-在编辑页面 `blueprint/ui/templates/edit.html` 中，浏览器步骤通过表单字段提交：
-- 表单字段命名：`steps-0-operation`, `steps-1-selector` 等
-- 使用 WTForms 动态表单处理
-
-### 3.2 后端接收与验证
-
-**文件位置**：`changedetectionio/forms.py`
-
-表单验证后，步骤数据被转换为字典列表格式：
-
-```python
-browser_steps = [
-    {
-        'operation': 'Click element',
-        'selector': '#button',
-        'optional_value': ''
-    },
-    # ... 更多步骤
-]
-```
-
-### 3.3 数据持久化
-
-**文件位置**：`changedetectionio/model/Watch.py`
-
-步骤配置作为 Watch 对象的一个字段存储：
-- 保存为 JSON 格式到数据目录的 `watch.json` 文件
-- 通过 `EntityPersistenceMixin` 处理持久化
-
----
-
-## 4. 抓取执行流程
-
-### 4.1 执行入口
-
-**文件位置**：`changedetectionio/content_fetchers/playwright.py:368-375`
-
-在 `run()` 方法中，页面加载完成后调用 `iterate_browser_steps()` 执行所有步骤：
-
-```python
-if self.browser_steps:
-    try:
-        await self.iterate_browser_steps(start_url=url)
-    except BrowserStepsStepException:
-        # 异常向上抛出，由上层处理
-        raise
-```
-
-### 4.2 步骤迭代执行
-
-**文件位置**：`changedetectionio/content_fetchers/base.py:165-199`
-
-`iterate_browser_steps()` 是核心执行函数：
-
-```python
-async def iterate_browser_steps(self, start_url=None):
-    from changedetectionio.browser_steps.browser_steps import steppable_browser_interface, browser_steps_get_valid_steps
-    
-    interface = steppable_browser_interface(start_url=start_url)
-    interface.page = self.page
-    valid_steps = browser_steps_get_valid_steps(self.browser_steps)
-
-    for step in valid_steps:
-        step_n += 1  # 步骤序号（从1开始）
-        
-        # 执行前保存截图和HTML
-        await self.screenshot_step("before-" + str(step_n))
-        await self.save_step_html("before-" + str(step_n))
-
-        try:
-            # 支持 Jinja2 模板变量替换
-            optional_value = step['optional_value']
-            selector = step['selector']
-            if '{%' in optional_value or '{{' in optional_value:
-                optional_value = jinja_render(template_str=optional_value)
-            
-            # 调用具体操作
-            await interface.call_action(
-                action_name=step['operation'],
-                selector=selector,
-                optional_value=optional_value
-            )
-            
-            # 执行后保存截图和HTML
-            await self.screenshot_step(step_n)
-            await self.save_step_html(step_n)
-            
-        except (Error, TimeoutError) as e:
-            # 捕获 Playwright 异常，包装后抛出
-            raise BrowserStepsStepException(step_n=step_n, original_e=e)
-```
-
-### 4.3 步骤执行器
-
-**文件位置**：`changedetectionio/browser_steps/browser_steps.py:75-132`
-
-`call_action()` 方法负责调度具体操作：
-
-```python
-async def call_action(self, action_name, selector=None, optional_value=None):
-    call_action_name = re.sub('[^0-9a-zA-Z]+', '_', action_name.lower())
-    
-    # 支持 Jinja2 模板变量
-    if selector and ('{%' in selector or '{{' in selector):
-        selector = jinja_render(template_str=selector)
-    
-    # 动态调用对应的 action_* 方法
-    action_handler = getattr(self, "action_" + call_action_name)
-    await action_handler(selector, optional_value)
-```
-
----
-
-## 5. 单步失败处理逻辑
-
-### 5.1 异常定义
-
-**文件位置**：`changedetectionio/content_fetchers/exceptions/__init__.py`
+**文件位置**：`changedetectionio/content_fetchers/exceptions/__init__.py:45-50`
 
 ```python
 class BrowserStepsStepException(Exception):
     def __init__(self, step_n, original_e):
-        self.step_n = step_n  # 失败的步骤序号（从0开始）
-        self.original_e = original_e  # 原始异常
-        super().__init__(f"Browser step {step_n + 1} failed: {str(original_e)}")
+        self.step_n = step_n          # 步骤序号（从1开始）
+        self.original_e = original_e  # 原始Playwright异常对象
+        logger.debug(f"Browser Steps exception at step {self.step_n} {str(original_e)}")
+        return
 ```
 
-### 5.2 异常捕获点
+**关键代码证据**：
+- 异常类**未调用父类 `Exception.__init__()`**，直接初始化两个实例属性
+- `step_n`：整数，表示失败的步骤序号
+- `original_e`：Playwright 原始异常对象（`TimeoutError` 或 `Error`）
 
-**文件位置**：`changedetectionio/worker.py:323-354`
+### 1.2 异常抛出点与 step_n 传递
 
-在 worker 的抓取流程中捕获步骤异常：
+**文件位置**：`changedetectionio/content_fetchers/base.py:165-199`
 
 ```python
-try:
-    await site_changed_check(...)
-except content_fetchers_exceptions.BrowserStepsStepException as e:
-    # 步骤执行失败
-    error_step = e.step_n + 1  # 转换为从1开始的显示序号
-    
-    # 更新 Watch 的错误状态
-    datastore.update_watch_error(
-        uuid=uuid,
-        error_text=f"Browser Step #{error_step} failed: {str(e.original_e)}"
-    )
-    
-    # 增加连续失败计数
-    consecutive_browser_step_errors = watch.get('consecutive_browser_step_errors', 0) + 1
-    
-    # 达到阈值时发送通知
-    threshold = int(datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts', 0))
-    if consecutive_browser_step_errors >= threshold:
-        await send_step_failure_notification(
-            watch_uuid=uuid, 
-            step_n=e.step_n, 
-            notification_q=notification_q, 
-            datastore=datastore
-        )
-        consecutive_browser_step_errors = 0  # 重置计数
-    
-    # 保存连续失败计数
-    datastore.update_watch(
-        uuid=uuid, 
-        update_obj={'consecutive_browser_step_errors': consecutive_browser_step_errors}
-    )
+async def iterate_browser_steps(self, start_url=None):
+    step_n = 0  # 初始化为0
+
+    for step in valid_steps:
+        step_n += 1  # 进入循环立即+1，第一个步骤step_n=1
+        logger.debug(f">> Iterating check - browser Step n {step_n} - {step['operation']}...")
+        
+        try:
+            await interface.call_action(...)
+        except (Error, TimeoutError) as e:
+            # 抛出时step_n已是从1开始的序号
+            raise BrowserStepsStepException(step_n=step_n, original_e=e)
 ```
 
-### 5.3 关键设计要点
-
-1. **连续失败计数**：使用 `consecutive_browser_step_errors` 字段记录连续失败次数
-2. **阈值触发**：只有当连续失败达到配置阈值时才发送通知，避免频繁告警
-3. **自动重置**：发送通知后重置计数器，避免重复发送相同告警
-4. **错误信息持久化**：通过 `update_watch_error` 保存错误信息供用户查看
+**步骤序号传递关系**：
+| 代码位置 | 变量 | 值含义 |
+|---------|------|--------|
+| base.py:169 | `step_n = 0` | 初始化 |
+| base.py:177 | `step_n += 1` | 第一个步骤执行前变为 1 |
+| base.py:199 | `step_n=step_n` | 异常对象中存储的是 1-based 序号 |
+| worker.py:327 | `error_step = e.step_n + 1` | **显示时再次+1，存在潜在Bug** |
 
 ---
 
-## 6. 失败通知内容来源
+## 2. 连续失败计数机制
 
-### 6.1 通知服务
+### 2.1 字段名与初始值
+
+**文件位置**：`changedetectionio/worker.py:346-357`
+
+```python
+if watch.get('filter_failure_notification_send', False):
+    # 读取连续失败计数，默认0
+    c = watch.get('consecutive_filter_failures', 0)
+    c += 1  # 计数+1
+    
+    threshold = datastore.data['settings']['application'].get(
+        'filter_failure_notification_threshold_attempts', 0
+    )
+    
+    if threshold > 0 and c >= threshold:
+        if not watch.get('notification_muted'):
+            await send_step_failure_notification(...)
+        c = 0  # 发送通知后重置计数
+    
+    datastore.update_watch(uuid=uuid, update_obj={'consecutive_filter_failures': c})
+```
+
+### 2.2 准确字段名对照表
+
+| 字段名 | 位置 | 类型 | 默认值 | 说明 |
+|--------|------|------|--------|------|
+| **`consecutive_filter_failures`** | Watch对象 | int | 0 | **实际使用的连续失败计数字段** |
+| **`filter_failure_notification_send`** | Watch对象 | bool | False | **通知功能总开关** |
+| **`filter_failure_notification_threshold_attempts`** | 全局设置 | int | 0 | 触发通知的阈值 |
+| **`notification_muted`** | Watch对象 | bool | False | 单个监控的通知静音开关 |
+
+---
+
+## 3. 阈值触发与重置规则
+
+### 3.1 触发通知的完整条件链
+
+**所有条件必须同时满足**：
+
+```
+条件1: watch['filter_failure_notification_send'] == True
+    AND
+条件2: threshold > 0
+    AND
+条件3: consecutive_filter_failures >= threshold
+    AND
+条件4: watch['notification_muted'] == False
+```
+
+**代码证据**（worker.py:346-355）：
+```python
+if watch.get('filter_failure_notification_send', False):  # 条件1
+    c = watch.get('consecutive_filter_failures', 0)
+    c += 1
+    threshold = datastore.data['settings']['application'].get(
+        'filter_failure_notification_threshold_attempts', 0
+    )
+    if threshold > 0 and c >= threshold:  # 条件2 + 条件3
+        if not watch.get('notification_muted'):  # 条件4
+            await send_step_failure_notification(...)
+        c = 0  # 发送后重置计数
+```
+
+### 3.2 计数重置规则
+
+**重置时机**：
+- 仅在 `threshold > 0 and c >= threshold` 条件满足后重置
+- 无论通知是否因 `notification_muted` 被跳过，计数器都会重置为 0
+
+**不重置场景**：
+- `filter_failure_notification_send == False`：计数不更新
+- `threshold == 0`：计数持续累加但不触发通知
+- 未达到阈值：计数保留，下次失败时继续累加
+
+---
+
+## 4. 错误信息处理流程
+
+### 4.1 原始错误信息提取
+
+**文件位置**：`changedetectionio/worker.py:328-338`
+
+```python
+from playwright._impl._errors import TimeoutError, Error
+
+# 默认错误提示
+err_text = f"Browser step at position {error_step} could not run, check the watch, add a delay if necessary, view Browser Steps to see screenshot at that step."
+
+# 根据异常类型追加信息
+if e.original_e.name == "TimeoutError":
+    err_text += " Could not find the target."  # TimeoutError只追加固定提示
+else:
+    # 其他Error类型取异常信息第一行
+    err_text += " " + str(e.original_e).splitlines()[0]
+```
+
+### 4.2 错误信息持久化字段
+
+| 字段 | 值来源 | 示例 |
+|------|--------|------|
+| `last_error` | 构造的 `err_text` | "Browser step at position 2 could not run... Could not find the target." |
+| `browser_steps_last_error_step` | `e.step_n + 1` | 2 |
+
+**代码证据**（worker.py:342-344）：
+```python
+datastore.update_watch(uuid=uuid,
+                     update_obj={'last_error': err_text,
+                               'browser_steps_last_error_step': error_step})
+```
+
+---
+
+## 5. 通知内容来源与构建
+
+### 5.1 通知标题与正文
 
 **文件位置**：`changedetectionio/notification_service.py:480-524`
-
-`send_step_failure_notification()` 方法构建通知内容：
 
 ```python
 def send_step_failure_notification(self, watch_uuid, step_n):
     watch = self.datastore.data['watching'].get(watch_uuid, False)
-    threshold = self.datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts')
+    threshold = self.datastore.data['settings']['application'].get(
+        'filter_failure_notification_threshold_attempts'
+    )
     
-    step = step_n + 1  # 显示序号从1开始
+    step = step_n + 1  # 显示序号再次+1
     
-    # 通知标题
+    # 硬编码标题
     notification_title = f"Changedetection.io - Alert - Browser step at position {step} could not be run"
     
-    # 通知正文（硬编码模板）
+    # 硬编码正文模板
     body = f"""Hello,
 
 Your configured browser step at position {step} for the web page watch {{{{watch_url}}}} did not appear on the page after {threshold} attempts, did the page change layout?
@@ -262,148 +192,110 @@ Edit link: {{{{base_url}}}}/edit/{{{{watch_uuid}}}}
 
 Thanks - Your omniscient changedetection.io installation.
 """
-
-    # 构建通知对象
-    n_object = NotificationContextData({
-        'notification_title': notification_title,
-        'notification_body': body,
-        'notification_format': _check_cascading_vars(self.datastore, 'notification_format', watch),
-    })
-    
-    # 获取通知接收地址（级联优先级）
-    if len(watch['notification_urls']):
-        n_object['notification_urls'] = watch['notification_urls']
-    elif len(self.datastore.data['settings']['application']['notification_urls']):
-        n_object['notification_urls'] = self.datastore.data['settings']['application']['notification_urls']
-    
-    # 添加额外变量
-    n_object.update({
-        'watch_url': watch['url'],
-        'uuid': watch_uuid
-    })
-    
-    # 放入通知队列
-    self.notification_q.put(n_object)
 ```
 
-### 6.2 通知内容构成
+### 5.2 通知内容字段来源表
 
-| 字段 | 来源 | 说明 |
-|------|------|------|
-| **notification_title** | 硬编码 | 包含步骤位置的固定文本 |
-| **notification_body** | 硬编码模板 | 包含步骤位置、阈值、编辑链接等变量 |
-| **notification_format** | 级联配置 | Watch → Tag → Global |
-| **notification_urls** | 级联配置 | Watch 配置优先，否则使用全局配置 |
-| **watch_url** | Watch 对象 | 被监控的页面URL |
-| **watch_uuid** | Watch 对象 | 监控项唯一标识 |
+| 通知字段 | 数据来源 | 说明 |
+|---------|----------|------|
+| **`notification_title`** | 硬编码 f-string | 包含 `{step}` 变量 |
+| **`notification_body`** | 硬编码多行f-string | 包含 `{step}`、`{threshold}` 变量 |
+| **`notification_format`** | `_check_cascading_vars()` | 级联获取：Watch → Tag → Global |
+| **`notification_urls`** | 级联获取 | 优先 `watch['notification_urls']`，否则全局配置 |
+| **`watch_url`** | `watch['url']` | 监控页面URL |
+| **`uuid` / `watch_uuid`** | 传入参数 | 监控项唯一标识 |
 
-### 6.3 级联变量解析机制
-
-**文件位置**：`changedetectionio/notification_service.py:17-54`
-
-`_check_cascading_vars()` 实现配置优先级：
+### 5.3 通知调用链
 
 ```
-Individual Watch Settings → Tag Settings → Global Settings
-```
-
-这意味着：
-1. 首先检查 Watch 自身的配置
-2. 如果 Watch 没有配置，检查其所属的 Tag
-3. 如果 Tag 也没有配置，使用全局设置
-4. 最后还有默认值兜底
-
----
-
-## 7. 关键调用链总结
-
-### 7.1 正常执行流程
-
-```
-前端编辑步骤
-    ↓
-表单提交 → WTForms 验证
-    ↓
-Watch 对象保存 (JSON持久化)
-    ↓
-抓取任务触发
-    ↓
-Playwright Fetcher.run()
-    ↓
-iterate_browser_steps()
-    ↓
-call_action() → 动态调用 action_* 方法
-    ↓
-步骤执行成功 → 继续下一个步骤
-    ↓
-所有步骤完成 → 执行页面内容抓取
-```
-
-### 7.2 失败处理流程
-
-```
-步骤执行异常 (TimeoutError / Error)
-    ↓
-iterate_browser_steps() 捕获
-    ↓
-包装为 BrowserStepsStepException 抛出
-    ↓
-worker.py 捕获异常
-    ↓
-├─ 更新 Watch 错误信息
-├─ 增加连续失败计数
-└─ 达到阈值 → 调用 send_step_failure_notification()
-        ↓
-        notification_service 构建通知内容
-        ↓
-        通知放入队列 → Apprise 异步发送
+worker.py:354 → send_step_failure_notification(watch_uuid, step_n, ...)
+    ↓ (worker.py:782-792)
+notification_service.send_step_failure_notification(watch_uuid, step_n)
+    ↓ (notification_service.py:480-524)
+构建 NotificationContextData → 放入 notification_q 队列
 ```
 
 ---
 
-## 8. 代码优化建议
+## 6. 关键调用链与数据流向
 
-### 8.1 通知模板硬编码问题
+### 6.1 完整失败处理流
 
-**当前问题**：通知标题和正文硬编码在 Python 代码中，不利于维护和国际化。
+```
+Playwright抛出TimeoutError/Error
+    ↓ [base.py:196-199]
+iterate_browser_steps捕获 → 包装BrowserStepsStepException
+    ↓ 抛出时携带: step_n(1-based), original_e
+    ↓ [worker.py:323-359]
+worker捕获异常
+    ├─ 计算 error_step = e.step_n + 1  ← 潜在Bug:序号多加1
+    ├─ 根据 original_e.name 构造 err_text
+    ├─ 更新 last_error 和 browser_steps_last_error_step
+    │
+    └─ filter_failure_notification_send == True?
+        ├─ 是 → consecutive_filter_failures += 1
+        │       └─ threshold > 0 AND 计数 >= threshold?
+        │           ├─ 是 → notification_muted == False?
+        │           │       ├─ 是 → 发送通知
+        │           │       └─ 否 → 跳过通知
+        │           └─ 无论是否发送通知: 重置计数 = 0
+        │
+        └─ 否 → 不更新计数，直接结束
+```
 
-**建议**：
-- 将通知模板移到独立的 Jinja2 模板文件中
-- 支持多语言配置
+### 6.2 screenshot_step 命名规则
 
-### 8.2 步骤执行前后截图命名不一致
+**文件位置**：`changedetectionio/content_fetchers/base.py:179-180,194-195`
 
-**当前问题**：
-- 执行前：`screenshot_step("before-" + str(step_n))`
-- 执行后：`screenshot_step(step_n)`
+| 时机 | 调用代码 | 生成文件名 |
+|------|---------|-----------|
+| 步骤执行前 | `screenshot_step("before-" + str(step_n))` | `step_before-1.jpeg` |
+| 步骤执行后 | `screenshot_step(step_n)` | `step_1.jpeg` |
 
-**建议**：统一命名规范，如 `step-1-before.jpg` 和 `step-1-after.jpg`
+---
 
-### 8.3 异常信息丰富度
+## 7. 代码问题与Bug确认
 
-**当前问题**：通知中只包含步骤位置，没有具体错误原因。
+### 7.1 Bug: 步骤序号显示不一致
 
-**建议**：在通知中包含原始异常信息，帮助用户快速定位问题：
+**问题**：
+- 异常中 `step_n` 已是 1-based（第一个步骤失败时 `step_n=1`）
+- `worker.py:327` 再次 `+1` → `error_step = 2`
+- 导致用户看到的步骤序号比实际配置的序号大1
+
+**证据链**：
+```
+base.py:169: step_n = 0
+base.py:177: step_n += 1 → step_n = 1
+base.py:199: raise BrowserStepsStepException(step_n=1, ...)
+worker.py:327: error_step = e.step_n + 1 → error_step = 2  ← 错误
+```
+
+### 7.2 Bug: Exception父类未初始化
+
+**问题**：
+- `BrowserStepsStepException.__init__` 未调用 `super().__init__()`
+- 导致 `str(exception)` 可能返回空字符串或非预期结果
+
+**证据**（exceptions/__init__.py:46-50）：
 ```python
-body = f"""Hello,
-
-Step {step} failed with error: {str(e.original_e)}
-
-...
-"""
+def __init__(self, step_n, original_e):
+    self.step_n = step_n
+    self.original_e = original_e
+    # 缺少 super().__init__(f"Step {step_n} failed: {original_e}")
+    logger.debug(...)
+    return
 ```
 
 ---
 
-## 9. 附录：关键文件清单
+## 8. 附录：关键文件与行号索引
 
-| 文件路径 | 说明 |
-|---------|------|
-| `changedetectionio/browser_steps/browser_steps.py` | 步骤执行核心逻辑 |
-| `changedetectionio/static/js/browser-steps.js` | 前端编辑交互逻辑 |
-| `changedetectionio/blueprint/browser_steps/__init__.py` | 实时预览后端API |
-| `changedetectionio/content_fetchers/base.py` | 抓取器基类，包含 iterate_browser_steps |
-| `changedetectionio/content_fetchers/playwright.py` | Playwright 抓取实现 |
-| `changedetectionio/notification_service.py` | 通知服务，包含失败通知构建 |
-| `changedetectionio/worker.py` | 任务调度与异常处理 |
-| `changedetectionio/model/Watch.py` | Watch 数据模型 |
+| 文件路径 | 关键代码行号 | 说明 |
+|---------|-------------|------|
+| `changedetectionio/content_fetchers/exceptions/__init__.py` | 45-50 | BrowserStepsStepException定义 |
+| `changedetectionio/content_fetchers/base.py` | 165-199 | iterate_browser_steps异常抛出 |
+| `changedetectionio/worker.py` | 323-359 | Browser Steps异常处理完整逻辑 |
+| `changedetectionio/worker.py` | 346-357 | 连续失败计数与阈值判断 |
+| `changedetectionio/worker.py` | 782-792 | send_step_failure_notification包装函数 |
+| `changedetectionio/notification_service.py` | 480-524 | 通知内容构建 |
