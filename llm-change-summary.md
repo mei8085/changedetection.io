@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-本文档分析 changedetection.io 项目中 LLM 变更摘要功能的上下文体积控制机制，包括 Prompt 组装流程、Token Budget 裁剪顺序、三条路径的预算生效时机、超限后行为以及响应解析失败的处理方式。
+本文档分析 changedetection.io 项目中 LLM 变更摘要功能的上下文体积控制机制，包括 Prompt 组装流程、Token Budget 裁剪顺序、四条路径的预算生效时机、重复累加 Bug、超限后行为以及响应解析失败的处理方式。
 
 ## 2. 上下文体积控制机制
 
@@ -40,10 +40,11 @@ def _check_input_size(text: str, max_chars: int) -> None:
 - `summarise_change()` - 变更摘要生成前检查 (evaluator.py:521)
 - `preview_extract()` - 实时预览提取前检查 (evaluator.py:598)
 - `evaluate_change()` - 变更评估前检查 (evaluator.py:651)
+- ⚠️ `run_setup()` - **不进行**输入大小检查
 
-## 3. 三条 LLM 路径的 Token Budget 生效顺序与超限行为
+## 3. 四条 LLM 路径的 Token Budget 生效顺序与超限行为
 
-### 3.1 关键发现：`_check_token_budget` 的行为
+### 3.1 关键发现 1：`_check_token_budget` 的行为
 
 **重要纠正**：`_check_token_budget()` 函数只返回 `bool`，从不抛出异常。在大多数场景下，其返回值甚至被忽略，仅用于日志记录。
 
@@ -53,9 +54,67 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
     Check token budget limits.  Returns True if within budget, False if exceeded.
     Also accumulates tokens_this_call into watch['llm_tokens_used_cumulative'].
     """
+    if tokens_this_call > 0:
+        current = watch.get('llm_tokens_used_cumulative') or 0
+        watch['llm_tokens_used_cumulative'] = current + tokens_this_call
 ```
 
-### 3.2 路径一：变更摘要 (summarise_change)
+### 3.2 关键发现 2：`summarise_change` 存在双重累加 Bug
+
+**严重问题**：`summarise_change()` 中对 `llm_tokens_used_cumulative` 执行了**两次累加**，导致累计值是实际使用量的 2 倍，会提前触发累计阈值。
+
+```python
+# 第 559 行：第一次累加 — 在 _check_token_budget() 内部执行
+_check_token_budget(watch, cfg, tokens)
+
+# 第 561 行：第二次累加 — 手动重复执行
+watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') or 0) + tokens
+```
+
+**影响**：实际 token 使用量被翻倍计算，导致 Per-Watch 累计预算阈值提前触发。
+
+**对比**：
+- `evaluate_change()`：仅通过 `_check_token_budget()` 累加一次 ✓
+- `run_setup()`：仅通过 `_check_token_budget()` 累加一次 ✓
+- `preview_extract()`：完全不累加 Watch Token ✓
+
+### 3.3 路径一：设置预过滤器 (run_setup)
+
+**生效顺序**：
+
+```
+调用 LLM 前
+    ↓
+1. 检查 LLM 是否配置 → 未配置: return
+    ↓
+2. 检查是否有 intent → 无 intent: return
+    ↓
+3. ⚠️ 完全不检查输入字符大小!
+    ↓
+4. ⚠️ 完全不检查全局月度预算!
+    ↓
+5. ⚠️ 完全不检查 Per-Watch 累计预算!
+    ↓
+6. 执行 LLM 调用
+    ↓
+调用 LLM 后（记账阶段）
+    ↓
+7. 调用 _check_token_budget() → 返回值被 IGNORED!
+   - 仅记录 WARNING 日志
+   - tokens 仍会被累加到 watch['llm_tokens_used_cumulative']
+    ↓
+8. 累加全局 Token 计数
+```
+
+**超限后行为总结**：
+- 完全不进行任何预算预检查（全局、Per-Watch 累计、输入大小都不检查）
+- 仅调用后进行预算检查并记录日志，但不影响返回结果
+- Token 仍会计入全局和 Watch 累计
+- 异常时静默失败，设置 `llm_prefilter = None`
+
+**代码位置**: `evaluator.py:373-410`
+
+### 3.4 路径二：变更摘要 (summarise_change)
 
 **生效顺序**：
 
@@ -73,11 +132,12 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
 调用 LLM 后（记账阶段）
     ↓
 5. 调用 _check_token_budget() → 返回值被 IGNORED!
-   - 仅记录 WARNING 日志
-   - tokens 仍会被累加到 watch['llm_tokens_used_cumulative']
-   - 摘要正常返回，不受影响
+   - 第一次累加 tokens 到 watch['llm_tokens_used_cumulative']
     ↓
-6. 累加全局 Token 计数
+6. ⚠️ 手动第二次累加 tokens（双重累加 Bug!）
+   - watch['llm_tokens_used_cumulative'] += tokens 再次执行
+    ↓
+7. 累加全局 Token 计数
 ```
 
 **超限后行为总结**：
@@ -85,10 +145,11 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
 - 输入字符过大：抛出异常（由上层处理）
 - 单次/累计 Per-Watch 预算超限：仅记录 WARNING 日志，摘要正常返回
   - ⚠️ 此预算检查**不具有阻止调用或拦截返回的实际效果**
+- ⚠️ 双重累加 Bug 导致累计值是实际使用量的 2 倍，提前触发阈值
 
 **代码位置**: `evaluator.py:494-572`
 
-### 3.3 路径二：变更评估 (evaluate_change)
+### 3.5 路径三：变更评估 (evaluate_change)
 
 **生效顺序**：
 
@@ -125,10 +186,11 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
 - Per-Watch 累计预算超限（调用前检查）：开放失败，`important=True`
 - 输入字符过大：抛出异常
 - 单次 Per-Watch 预算超限（调用后）：仅记录日志，结果正常返回
+- 无双重累加 Bug
 
 **代码位置**: `evaluator.py:633-728`
 
-### 3.4 路径三：实时预览 (preview_extract)
+### 3.6 路径四：实时预览 (preview_extract)
 
 **生效顺序**：
 
@@ -141,35 +203,39 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
     ↓
 3. 检查输入字符大小 → 超限: 抛出 LLMInputTooLargeError
     ↓
-4. 执行 LLM 调用
+4. ⚠️ 完全不检查全局月度预算!
+    ↓
+5. 执行 LLM 调用
     ↓
 调用 LLM 后（记账阶段）
     ↓
-5. ⚠️ 完全不检查 Per-Watch Token Budget!
+6. ⚠️ 完全不检查 Per-Watch Token Budget!
    - 无 _check_token_budget() 调用
    - 不累加 watch['llm_tokens_used_cumulative']
     ↓
-6. 仅累加全局 Token 计数
+7. 仅累加全局 Token 计数
 ```
 
 **超限后行为总结**：
-- 完全不进行 Per-Watch Token 预算检查
+- 完全不进行 Per-Watch Token 预算检查和累加
+- 完全不检查全局月度预算
 - 仅检查输入字符大小（抛异常）
 - 仅参与全局 Token 预算累计
 - Per-Watch 预算限制对实时预览路径**完全无效**
 
 **代码位置**: `evaluator.py:579-626`
 
-### 3.5 三条路径对比表
+### 3.7 四条路径统一对照表
 
-| 检查项 | 变更摘要 | 变更评估 | 实时预览 |
-|-------|---------|---------|---------|
-| 全局月度预算（调用前） | ✓ 返回 '' | ✓ important=True | ✗ 不检查 |
-| Per-Watch 累计预算（调用前） | ✗ 不检查 | ✓ important=True | ✗ 不检查 |
-| 输入字符大小限制 | ✓ 抛异常 | ✓ 抛异常 | ✓ 抛异常 |
-| Per-Watch 单次预算（调用后） | ⚠ 返回值忽略，仅日志 | ⚠ 返回值忽略，仅日志 | ✗ 完全不调用 |
-| 全局 Token 累计 | ✓ | ✓ | ✓ |
-| Watch Token 累计 | ✓ | ✓ | ✗ |
+| 检查项 | run_setup | summarise_change | evaluate_change | preview_extract |
+|-------|-----------|-----------------|-----------------|-----------------|
+| 全局月度预算（调用前） | ✗ 不检查 | ✓ 返回 '' | ✓ important=True | ✗ 不检查 |
+| Per-Watch 累计预算（调用前） | ✗ 不检查 | ✗ 不检查 | ✓ important=True | ✗ 不检查 |
+| 输入字符大小限制 | ✗ 不检查 | ✓ 抛异常 | ✓ 抛异常 | ✓ 抛异常 |
+| Per-Watch 单次预算（调用后） | ⚠ 返回值忽略，仅日志 | ⚠ 返回值忽略，仅日志 | ⚠ 返回值忽略，仅日志 | ✗ 完全不调用 |
+| 全局 Token 累计 | ✓ | ✓ | ✓ | ✓ |
+| Watch Token 累计 | ✓ | ⚠️ **双重累加 Bug** | ✓ | ✗ |
+| 异常处理 | 静默失败，prefilter=None | 抛出异常 | 开放失败，important=True | 返回 None |
 
 ## 4. Prompt 组装流程
 
@@ -317,7 +383,7 @@ def _summary_max_tokens(diff: str, max_cap: int = LLM_DEFAULT_MAX_SUMMARY_TOKENS
 2. UI 设置中的 token budget
 3. 0 = 无限制 (默认)
 
-**预算检查路径差异**: 详见第 3 章三条路径对比
+**预算检查路径差异**: 详见第 3 章四条路径统一对照表
 
 ## 6. 响应解析失败处理
 
@@ -442,11 +508,13 @@ MD5( diff_text + '\x00' + prompt )
 ### 8.2 Token Budget 关键发现
 
 1. **`_check_token_budget` 从不抛异常**：仅返回 bool，大多数场景下返回值被忽略
-2. **三条路径行为不一致**：
-   - 变更摘要：调用前只检查全局预算，Per-Watch 仅事后记账
-   - 变更评估：调用前检查全局和累计预算，采用开放失败策略
-   - 实时预览：完全不检查 Per-Watch 预算
+2. **四条路径行为高度不一致**：
+   - run_setup：完全不进行任何预检查
+   - summarise_change：调用前只检查全局预算，存在双重累加 Bug
+   - evaluate_change：调用前检查全局和累计预算，采用开放失败策略
+   - preview_extract：完全不检查 Per-Watch 预算和全局预算
 3. **预算超限的实际效果有限**：多数情况下仅记录日志，不阻止调用或拦截结果
+4. **⚠️ 双重累加 Bug**：`summarise_change` 中 token 被重复累加，导致累计值是实际使用量的 2 倍
 
 ### 8.3 变更摘要不使用快照上下文的核心原因
 
@@ -464,14 +532,15 @@ MD5( diff_text + '\x00' + prompt )
 4. **输入过大**: 明确错误提示，不进行部分处理
 5. **Per-Watch 预算超限**: 多数情况下仅记录日志，不影响功能
 
-### 8.5 关键设计决策
+### 8.5 关键设计决策与 Bug
 
-| 决策 | 原因 | 影响 |
-|-----|------|------|
-| BM25 裁剪而非简单截断 | 保留与 intent 相关的内容 | 上下文质量更高，但需要额外依赖 |
-| 系统/用户 Prompt 分离 | 用户可完全自定义输出格式 | 灵活性高，用户 Prompt 拥有最终控制权 |
-| 移动行预标记 (~前缀) | 避免 LLM 误判重排序为变更 | 减少误报，提高摘要准确性 |
-| 调用失败时开放失败 | 不因为 LLM 故障错过重要变更 | 可能产生额外通知，但保证不遗漏 |
-| 多级 Prompt 级联 | 灵活的配置继承机制 | Watch > Tag > Global > 硬编码默认 |
-| 变更摘要不使用快照上下文 | 防止 LLM 将未变更内容报告为变更 | 提高准确性，减少幻觉 |
-| _check_token_budget 返回值被忽略 | 预算仅作参考/监控，不阻断核心功能 | Token 限制偏软，不具有强制拦截效果 |
+| 决策 / Bug | 原因 / 影响 |
+|-----------|------------|
+| BM25 裁剪而非简单截断 | 保留与 intent 相关的内容，上下文质量更高 |
+| 系统/用户 Prompt 分离 | 用户可完全自定义输出格式，灵活性高 |
+| 移动行预标记 (~前缀) | 避免 LLM 误判重排序为变更，减少误报 |
+| 调用失败时开放失败 | 不因为 LLM 故障错过重要变更，保证不遗漏 |
+| 多级 Prompt 级联 | Watch > Tag > Global > 硬编码默认，配置灵活 |
+| 变更摘要不使用快照上下文 | 防止 LLM 将未变更内容报告为变更，提高准确性 |
+| _check_token_budget 返回值被忽略 | 预算仅作参考/监控，不阻断核心功能 |
+| **summarise_change 双重累加 Bug** | **Token 使用量被翻倍计算，累计阈值提前触发** |
