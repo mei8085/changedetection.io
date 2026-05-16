@@ -119,24 +119,154 @@ class TagsDict(dict):
 
 ---
 
-## 2. 队列处理器调度时的标签感知机制
+## 2. 标签覆盖规则详解
 
-### 2.1 队列调度架构概述
+### 2.1 核心规则区分
 
-**队列核心组件**：`RecheckPriorityQueue` - 基于优先级的线程安全队列
+标签配置覆盖分为两种完全不同的机制：
 
-**关键发现**：队列调度器**本身不直接感知标签**，标签逻辑在更高业务层处理
+| 机制 | 触发条件 | 行为 | 适用属性 |
+|------|----------|------|----------|
+| **直接合并** | 不检查 `overrides_watch`，只要标签有该属性就生效 | 所有匹配标签的属性值合并到一起 | 选择器类属性（列表类型） |
+| **条件覆盖** | 必须满足 `overrides_watch=True` 才生效 | 取第一个匹配标签的属性值，完全替换 Watch 配置 | 处理器配置、LLM 配置 |
 
-### 2.2 标签感知的三个场景
+---
 
-#### 场景1：按标签批量重新检查
+### 2.2 机制一：get_tag_overrides_for_watch 直接合并（不检查 overrides_watch）
 
-**触发入口**：`GET /api/v1/tag/<uuid>?recheck=true`
+**函数实现**：
+```python
+# changedetectionio/store/__init__.py:936-945
+def get_tag_overrides_for_watch(self, uuid, attr):
+    tags = self.get_all_tags_for_watch(uuid=uuid)
+    ret = []
 
-**实现逻辑**：
-1. 遍历所有 Watch，找到包含该标签且未暂停的 Watch
-2. 将匹配的 Watch 加入重新检查队列
-3. 超过20个 Watch 时使用后台线程异步处理
+    if tags:
+        for tag_uuid, tag in tags.items():
+            if attr in tag and tag[attr]:
+                ret = [*ret, *tag[attr]]  # 直接合并所有匹配标签的属性
+
+    return ret
+```
+
+**关键特征**：
+1. ❌ **不检查** `overrides_watch` 属性
+2. ✅ 合并**所有**关联标签的该属性值
+3. ⚠️ 只适用于**列表类型**的属性（使用 `*` 展开合并）
+
+**直接合并的属性列表**：
+
+| 属性名 | 调用位置 | 合并策略 |
+|--------|----------|----------|
+| `include_filters` | `processors/text_json_diff/processor.py:60` | Watch + 所有标签 → 去重合并 |
+| `subtractive_selectors` | `processors/text_json_diff/processor.py:83` | 所有标签 + Watch + 全局 → 顺序合并 |
+| `extract_lines_containing` | `processors/text_json_diff/processor.py:90` | Watch + 所有标签 → 去重合并 |
+| `extract_text` | `processors/text_json_diff/processor.py:94` | Watch + 所有标签 → 去重合并 |
+| `ignore_text` | `processors/text_json_diff/processor.py:98` | Watch + 所有标签 + 全局 → 去重合并 |
+
+**代码依据（合并逻辑）**：
+```python
+# changedetectionio/processors/text_json_diff/processor.py:57-67
+def _get_merged_rules(self, attr, include_global=False):
+    """Merge rules from watch, tags, and optionally global settings."""
+    watch_rules = self.watch.get(attr, [])
+    tag_rules = self.datastore.get_tag_overrides_for_watch(uuid=self.watch_uuid, attr=attr)
+    rules = list(dict.fromkeys(watch_rules + tag_rules))  # Watch + Tags 合并后去重
+
+    if include_global:
+        global_rules = self.datastore.data['settings']['application'].get(f'global_{attr}', [])
+        rules = list(dict.fromkeys(rules + global_rules))
+
+    return rules
+```
+
+---
+
+### 2.3 机制二：条件覆盖（需要 overrides_watch=True）
+
+**覆盖原则**：`Watch.field → Tag.field (if overrides_watch) → Global.field`
+
+**关键特征**：
+1. ✅ **必须检查** `overrides_watch == True` 才生效
+2. 🎯 **第一个匹配优先**：遍历标签列表，第一个满足条件的标签获胜
+3. 🔄 **完全替换**：标签值完全替换 Watch 值，不是合并
+4. 📋 适用于**复杂对象**或**单值配置**
+
+**需要 overrides_watch 的属性列表**：
+
+| 属性名 | 检查位置 | 覆盖策略 |
+|--------|----------|----------|
+| `processor_config_restock_diff` | `processors/restock_diff/processor.py:464` | 第一个匹配标签的配置完全替换 Watch 配置 |
+| `processor_config_restock_diff` | `api/Watch.py:122` | GET /watch 时注入标签覆盖配置 |
+| LLM 配置（`llm_intent`, `llm_change_summary`） | `llm/evaluator.py` | Watch → 第一个有值标签 → 全局 的优先级链 |
+
+**代码依据（restock_diff 条件覆盖）**：
+```python
+# changedetectionio/processors/restock_diff/processor.py:461-467
+# See if any tags have 'activate for individual watches in this tag/group?' enabled and use the first we find
+for tag_uuid in watch.get('tags'):
+    tag = self.datastore.data['settings']['application']['tags'].get(tag_uuid, {})
+    if tag.get('overrides_watch'):  # 必须检查 overrides_watch
+        restock_settings = tag.get('processor_config_restock_diff') or {}
+        logger.info(f"Watch {watch.get('uuid')} - Tag '{tag.get('title')}' selected for restock settings override")
+        break  # 第一个匹配即停止
+```
+
+**代码依据（API 层注入）**：
+```python
+# changedetectionio/api/Watch.py:119-127
+tags = self.datastore.data['settings']['application'].get('tags', {})
+for tag_uuid in (watch_obj.get('tags') or []):
+    tag = tags.get(tag_uuid, {})
+    if tag.get('overrides_watch'):  # 必须检查 overrides_watch
+        restock_config = dict(tag.get('processor_config_restock_diff') or {})
+        restock_source = f'tag:{tag_uuid}'
+        break
+```
+
+---
+
+### 2.4 规则对比总结表
+
+| 维度 | get_tag_overrides_for_watch 直接合并 | 条件覆盖（需要 overrides_watch） |
+|------|------------------------------------|----------------------------------|
+| **检查 overrides_watch** | ❌ 不检查 | ✅ 必须检查且为 True |
+| **合并策略** | 所有标签的值合并为一个列表 | 第一个匹配标签的值完全替换 |
+| **适用数据类型** | 列表类型（数组） | 复杂对象、字典、单值 |
+| **Watch 配置优先级** | Watch 列表 + 标签列表，去重合并 | 标签完全覆盖 Watch 配置 |
+| **标签数量限制** | 所有关联标签都生效 | 仅第一个匹配标签生效 |
+| **典型属性** | include_filters, subtractive_selectors | processor_config_restock_diff, LLM 配置 |
+| **实现位置** | store/__init__.py:936 | 各处理器内部自行实现 |
+
+---
+
+## 3. 队列处理链路标签感知四步分析
+
+### 3.0 队列架构总览
+
+```
+  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+  │   入 队     │────▶│   取 队     │────▶│ Worker 处理 │────▶│  Diff 参数  │
+  │   Enqueue   │     │   Dequeue   │     │  Process    │     │  Resolve   │
+  └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+         │                   │                   │                   │
+         ▼                   ▼                   ▼                   ▼
+   🔍 按标签筛选        📦 队列无标签感知    🎯 动态解析配置        ⚙️  合并选择器
+      仅过滤，不修改         纯优先级队列         overrides_watch        get_tag_overrides
+```
+
+---
+
+### 3.1 第一步：入队（Enqueue）- 标签用于过滤筛选
+
+**触发场景**：
+1. 按标签批量重新检查（`GET /api/v1/tag/<uuid>?recheck=true`）
+2. Watch 列表按标签过滤后批量重检查
+
+**入队时标签的作用**：
+- ✅ **仅用于过滤**：决定哪些 Watch 进入队列
+- ❌ **不修改队列项**：入队的 `PrioritizedItem` 不含标签信息
+- ❌ **不影响优先级**：优先级由其他因素决定，与标签无关
 
 **代码依据**：
 ```python
@@ -147,27 +277,94 @@ if request.args.get('recheck'):
     for k in sorted(self.datastore.data['watching'].items(), key=lambda item: item[1].get('last_checked', 0)):
         watch_uuid = k[0]
         watch = k[1]
+        # 🔍 仅在这里用标签过滤，标签信息不进入队列
         if not watch['paused'] and tag['uuid'] in watch['tags']:
             watches_to_queue.append(watch_uuid)
 
-    # Queue logic follows...
+    # 入队的只有 watch_uuid，没有标签信息
+    for watch_uuid in watches_to_queue:
+        worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': watch_uuid}))
 ```
 
-#### 场景2：标签配置变更强制重处理
+**关键结论**：入队阶段标签**仅作为过滤条件**，不进入队列数据结构。
 
-**触发入口**：标签更新 API 和 UI 编辑页面
+---
 
-**实现逻辑**：
-1. 标签配置更新后，清除所有关联 Watch 的校验和文件
-2. 强制下一次检查时完整重新处理，而非使用校验和快速跳过
+### 3.2 第二步：取队（Dequeue）- 队列完全不感知标签
+
+**队列核心组件**：`RecheckPriorityQueue` - 基于优先级的线程安全队列
+
+**取队行为**：
+- 📦 **纯优先级调度**：完全根据 `item.priority` 决定出队顺序
+- ❌ **不感知标签**：队列内部逻辑与标签系统完全解耦
+- 🔒 **无标签过滤**：取队时不再检查标签，也不会因标签改变优先级
 
 **代码依据**：
 ```python
-# changedetectionio/api/Tags.py:154
-cleared_count = self.datastore.clear_checksums_for_tag(uuid)
-logger.info(f"Tag {uuid} updated via API, cleared {cleared_count} watch checksums")
+# changedetectionio/queue_handlers.py:64-100
+def put(self, item, block: bool = True, timeout: Optional[float] = None):
+    """Thread-safe sync put with priority ordering"""
+    logger.trace(f"RecheckQueue.put() called for item: {self._get_item_uuid(item)}, block={block}, timeout={timeout}")
+    try:
+        # CRITICAL: Add to both priority storage AND notification queue atomically
+        # 仅用 priority 排序，完全忽略标签信息
+        with self._lock:
+            heapq.heappush(self._priority_items, item)  # 🔑 只看 priority
 ```
 
+```python
+# changedetectionio/queue_handlers.py:102-134
+def get(self, block: bool = True, timeout: Optional[float] = None):
+    """Thread-safe sync get with priority ordering"""
+    # 等待通知后直接取最高优先级项，不检查标签
+    with self._lock:
+        if not self._priority_items:
+            raise Exception("Priority queue inconsistency")
+        item = heapq.heappop(self._priority_items)  # 🔑 只看 priority
+```
+
+**关键结论**：队列调度器**完全不感知标签**，标签系统与队列系统在这一层完全解耦。
+
+---
+
+### 3.3 第三步：Worker 处理 - 动态解析标签配置
+
+**执行时机**：Worker 从队列获取 Watch UUID 后，加载 Watch 对象时开始解析标签
+
+**标签感知点**：
+1. 🔄 **配置覆盖解析**：检查 `overrides_watch` 条件覆盖
+2. 🧹 **校验和清理**：标签配置变更后清理校验和强制重处理
+3. 📋 **处理器配置注入**：restock_diff 等处理器获取标签级配置
+
+**代码依据（Worker 主流程）**：
+```python
+# changedetectionio/worker.py:147-180
+if uuid in list(datastore.data['watching'].keys()) and datastore.data['watching'][uuid].get('url'):
+    changed_detected = False
+    contents = b''
+    process_changedetection_results = True
+    update_obj = {}
+
+    watch = datastore.data['watching'].get(uuid)
+
+    # Processor is what we are using for detecting the "Change"
+    processor = watch.get('processor', 'text_json_diff')
+
+    # Init a new 'difference_detection_processor'
+    from changedetectionio.processors import get_processor_module
+    processor_module = get_processor_module(processor)
+
+    if not processor_module:
+        error_msg = f"Processor module '{processor}' not found."
+        logger.error(error_msg)
+        raise ModuleNotFoundError(error_msg)
+
+    update_handler = processor_module.perform_site_check(datastore=datastore,
+                                                         watch_uuid=uuid)
+    # 🎯 处理器初始化后，在其内部动态解析标签配置
+```
+
+**代码依据（标签变更触发重处理）**：
 ```python
 # changedetectionio/store/__init__.py:499-520
 def clear_checksums_for_tag(self, tag_uuid):
@@ -181,39 +378,112 @@ def clear_checksums_for_tag(self, tag_uuid):
         if watch.get('tags') and tag_uuid in watch['tags']:
             if watch.data_dir:
                 checksum_file = os.path.join(watch.data_dir, 'last-checksum.txt')
-                # ... delete logic
+                if os.path.isfile(checksum_file):
+                    try:
+                        os.remove(checksum_file)
+                        deleted_count += 1
+                        logger.debug(f"Cleared checksum for watch {uuid}")
+                    except OSError as e:
+                        logger.warning(f"Failed to delete checksum file for {uuid}: {e}")
 ```
 
-#### 场景3：Worker 运行时的配置覆盖
-
-**执行时机**：Worker 处理 Watch 时，在处理器执行前动态解析
-
-**配置覆盖原则**：`Watch.field → Tag.field (if overrides_watch) → Global.field`
-
-**代码依据**（来自文档注释）：
-```python
-# changedetectionio/model/Tag.py:7-14
-Tags can override Watch settings when overrides_watch=True.
-Current implementation requires manual checking in processors:
-
-    for tag_uuid in watch.get('tags'):
-        tag = datastore['settings']['application']['tags'][tag_uuid]
-        if tag.get('overrides_watch'):
-            restock_settings = tag.get('restock_settings', {})
-            break
-```
-
-**可覆盖的配置类型**：
-- LLM 相关配置（`llm_intent`、`llm_change_summary_prompt`）
-- 处理器特定配置（如 `restock_settings`）
-- 内容过滤配置（`include_filters`、`subtractive_selectors`）
-- 通知静音状态
+**关键结论**：Worker 处理阶段是标签配置**真正生效**的地方，通过处理器内部动态解析实现。
 
 ---
 
-## 3. 差异计算模块与标签的关系
+### 3.4 第四步：Diff 参数 - 标签选择器最终生效
 
-### 3.1 差异计算模块架构
+**执行时机**：差异计算前，构建内容提取规则时
+
+**标签在 Diff 阶段的作用**：
+- ⚙️ **选择器合并**：通过 `get_tag_overrides_for_watch` 合并所有标签的选择器
+- ❌ **不直接调用 diff**：标签不直接参与 diff 算法本身
+- 📥 **间接影响输入**：标签通过改变提取规则间接影响 diff 的输入内容
+
+**代码依据（选择器合并）**：
+```python
+# changedetectionio/processors/text_json_diff/processor.py:79-86
+@property
+def subtractive_selectors(self):
+    if self._subtractive_selectors_cache is None:
+        watch_selectors = self.watch.get("subtractive_selectors", [])
+        # ⚙️  这里调用 get_tag_overrides_for_watch，直接合并所有标签的选择器
+        tag_selectors = self.datastore.get_tag_overrides_for_watch(uuid=self.watch_uuid, attr='subtractive_selectors')
+        global_selectors = self.datastore.data["settings"]["application"].get("global_subtractive_selectors", [])
+        # 标签选择器 → Watch 选择器 → 全局选择器，按顺序合并
+        self._subtractive_selectors_cache = [*tag_selectors, *watch_selectors, *global_selectors]
+    return self._subtractive_selectors_cache
+```
+
+**代码依据（include_filters 合并）**：
+```python
+# changedetectionio/processors/text_json_diff/processor.py:69-77
+@property
+def include_filters(self):
+    if self._include_filters_cache is None:
+        # ⚙️ _get_merged_rules 内部调用 get_tag_overrides_for_watch
+        filters = self._get_merged_rules('include_filters')
+        # Inject LD+JSON price tracker rule if enabled
+        if self.watch.get('track_ldjson_price_data', '') == PRICE_DATA_TRACK_ACCEPT:
+            filters += html_tools.LD_JSON_PRODUCT_OFFER_SELECTORS
+        self._include_filters_cache = filters
+    return self._include_filters_cache
+```
+
+**差异计算纯函数特性验证**：
+```python
+# changedetectionio/diff/__init__.py:424-457
+def render_diff(
+    previous_version_file_contents: str,
+    newest_version_file_contents: str,
+    include_equal: bool = False,
+    include_removed: bool = True,
+    include_added: bool = True,
+    include_replaced: bool = True,
+    include_change_type_prefix: bool = True,
+    patch_format: bool = False,
+    word_diff: bool = True,
+    context_lines: int = 0,
+    case_insensitive: bool = False,
+    ignore_junk: bool = False,
+    tokenizer: str = 'words_and_html'
+) -> str:
+    # 🔑 纯函数：仅接收文本内容和计算参数，完全不感知标签存在
+    # 标签已在上层通过改变选择器影响了输入文本内容
+```
+
+**关键结论**：Diff 模块本身是**纯函数**，标签通过**影响输入内容**（选择器过滤）间接发挥作用。
+
+---
+
+### 3.5 队列链路标签感知总结
+
+| 阶段 | 标签感知程度 | 核心作用 | 关键机制 |
+|------|-------------|----------|----------|
+| **入队** | ⭐ 轻度 | 过滤筛选 | 检查 `tag in watch['tags']`，标签不进入队列 |
+| **取队** | ❌ 无感知 | 纯优先级调度 | 队列与标签解耦，只按 priority 排序 |
+| **Worker 处理** | ⭐⭐⭐ 重度 | 配置覆盖解析 | 检查 `overrides_watch`，处理器级配置覆盖 |
+| **Diff 参数** | ⭐⭐ 中度 | 选择器合并 | `get_tag_overrides_for_watch` 合并过滤规则 |
+
+**标签信息流转路径**：
+```
+Watch['tags'] = [uuid1, uuid2]
+       ↓ (入队过滤)
+  PrioritizedItem = {uuid: watch_uuid}
+       ↓ (取队无标签)
+  Worker 加载 Watch 对象
+       ↓ (处理阶段)
+  ├─→ restock_diff: 检查 overrides_watch，覆盖配置
+  └─→ text_json_diff: get_tag_overrides_for_watch 合并选择器
+       ↓ (选择器过滤文本)
+  纯文本内容 → render_diff() → 差异结果
+```
+
+---
+
+## 4. 差异计算模块与标签的关系
+
+### 4.1 差异计算模块架构
 
 **核心模块**：`changedetectionio/diff/__init__.py`
 
@@ -225,7 +495,7 @@ Current implementation requires manual checking in processors:
 | `render_inline_word_diff()` | 单词级内联差异渲染 |
 | `render_nested_line_diff()` | 嵌套行级差异渲染 |
 
-### 3.2 关键结论：差异计算模块不直接感知标签
+### 4.2 关键结论：差异计算模块不直接感知标签
 
 **纯函数设计原则**：差异计算模块是**无状态的纯函数**，不直接访问或感知标签信息
 
@@ -250,7 +520,7 @@ def render_diff(
     # 仅接收文本内容和计算参数，无任何标签相关输入
 ```
 
-### 3.3 标签对差异计算的间接影响路径
+### 4.3 标签对差异计算的间接影响路径
 
 **影响链**：标签通过配置覆盖机制间接影响差异计算的**输入参数**
 
@@ -262,11 +532,11 @@ def render_diff(
 
 | 配置项 | 影响方式 | 代码位置 |
 |--------|----------|----------|
-| `include_filters` | 控制提取哪些内容进行比较 | `model/Tag.py:30-38` |
-| `subtractive_selectors` | 控制排除哪些内容 | `model/Tag.py:30-38` |
-| `ignore_whitespace` | 是否忽略空白字符变化 | `diff/__init__.py:436` |
-| `filter_text_added/removed/replaced` | 过滤特定类型的变化 | `diff/__init__.py:428-430` |
-| `processor` | 选择不同的差异比较逻辑 | 各 processor 实现 |
+| `include_filters` | 控制提取哪些内容进行比较 | `processors/text_json_diff/processor.py:72` |
+| `subtractive_selectors` | 控制排除哪些内容 | `processors/text_json_diff/processor.py:83` |
+| `ignore_text` | 忽略特定文本变化 | `processors/text_json_diff/processor.py:98` |
+| `extract_lines_containing` | 仅提取包含特定内容的行 | `processors/text_json_diff/processor.py:90` |
+| `extract_text` | 自定义文本提取规则 | `processors/text_json_diff/processor.py:94` |
 
 **代码依据（标签覆盖检查）**：
 ```python
@@ -277,7 +547,7 @@ def _watch_has_tag_options_set(watch):
             return True
 ```
 
-### 3.4 差异计算的纯函数特性验证
+### 4.4 差异计算的纯函数特性验证
 
 **输入仅包含**：
 1. 前一版本文本内容
@@ -291,56 +561,67 @@ def _watch_has_tag_options_set(watch):
 
 ---
 
-## 4. 架构总结与代码索引
+## 5. 架构总结与代码索引
 
-### 4.1 标签功能分层架构
+### 5.1 标签功能分层架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  表现层 (UI/API)                                         │
-│  - 标签过滤列表展示                                       │
-│  - 按标签批量操作                                         │
-│  - watchlist/__init__.py, api/Tags.py                    │
-├─────────────────────────────────────────────────────────┤
-│  业务逻辑层 (处理器/Worker)                               │
-│  - 配置覆盖解析                                           │
-│  - 标签组级操作                                           │
-│  - worker.py, processors/*                               │
-├─────────────────────────────────────────────────────────┤
-│  存储层 (数据模型/持久化)                                  │
-│  - Tag 模型                                              │
-│  - Watch-Tag 关联                                        │
-│  - model/Tag.py, model/Tags.py, store/__init__.py        │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  表现层 (UI/API)                                                  │
+│  - 标签过滤列表展示                                                │
+│  - 按标签批量操作                                                  │
+│  - watchlist/__init__.py, api/Tags.py                             │
+├─────────────────────────────────────────────────────────────────┤
+│  业务逻辑层 (处理器/Worker)                                        │
+│  - 配置覆盖解析：overrides_watch 检查                             │
+│  - 选择器合并：get_tag_overrides_for_watch                        │
+│  - worker.py, processors/*                                        │
+├─────────────────────────────────────────────────────────────────┤
+│  存储层 (数据模型/持久化)                                           │
+│  - Tag 模型 / TagsDict 集合管理                                    │
+│  - Watch-Tag 关联 (watch['tags'] = [UUIDs])                       │
+│  - model/Tag.py, model/Tags.py, store/__init__.py                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 关键代码位置索引
+### 5.2 关键代码位置索引
 
 | 功能点 | 文件路径 | 行号 |
 |--------|----------|------|
+| **标签核心模型** | | |
 | 标签模型定义 | `changedetectionio/model/Tag.py` | 1-71 |
 | 标签集合管理 | `changedetectionio/model/Tags.py` | 1-39 |
 | 统一持久化 Mixin | `changedetectionio/model/persistence.py` | 1-84 |
 | 获取 Watch 的所有标签 | `changedetectionio/store/__init__.py` | 980-996 |
-| 清除标签关联 Watch 的校验和 | `changedetectionio/store/__init__.py` | 499-520 |
+| **标签覆盖规则** | | |
+| 标签属性直接合并函数 | `changedetectionio/store/__init__.py` | 936-945 |
+| 选择器合并逻辑 | `changedetectionio/processors/text_json_diff/processor.py` | 57-98 |
+| restock 条件覆盖 | `changedetectionio/processors/restock_diff/processor.py` | 461-467 |
+| API 注入标签覆盖配置 | `changedetectionio/api/Watch.py` | 119-127 |
+| **队列处理链路** | | |
 | 按标签批量重新检查 | `changedetectionio/api/Tags.py` | 19-65 |
-| Watch 列表按标签过滤 | `changedetectionio/api/Watch.py` | 517-522 |
-| 差异计算核心函数 | `changedetectionio/diff/__init__.py` | 424-507 |
+| 队列入队实现 | `changedetectionio/queue_handlers.py` | 64-100 |
+| 队列取队实现 | `changedetectionio/queue_handlers.py` | 102-134 |
+| 清除标签关联 Watch 校验和 | `changedetectionio/store/__init__.py` | 499-520 |
 | Worker 主处理流程 | `changedetectionio/worker.py` | 46-743 |
+| **差异计算** | | |
+| 差异计算核心函数 | `changedetectionio/diff/__init__.py` | 424-507 |
 | 标签覆盖配置检查 | `changedetectionio/blueprint/ui/edit.py` | 39-43 |
 | 标签 URL 匹配方法 | `changedetectionio/model/Tag.py` | 55-67 |
 
-### 4.3 设计特点总结
+### 5.3 设计特点总结
 
 | 特点 | 说明 |
 |------|------|
 | **关注点分离** | 差异计算是纯函数，标签逻辑在上层处理，便于测试和维护 |
-| **灵活的配置继承** | 标签可以覆盖 Watch 配置，实现组级别的设置管理 |
-| **松耦合架构** | 队列调度器不需要理解标签，标签逻辑集中在业务层 |
+| **双轨覆盖机制** | 列表类属性直接合并，复杂配置需要 overrides_watch 条件覆盖 |
+| **松耦合架构** | 队列调度器不需要理解标签，标签逻辑集中在处理器业务层 |
 | **统一持久化** | Tag 和 Watch 复用相同的持久化机制，减少代码重复 |
 | **纯函数设计** | 差异计算无外部依赖，保证了可测试性和可预测性 |
+| **分层生效** | 标签在队列链路各阶段逐步发挥作用，而非集中处理 |
 
 ---
 
 **报告生成时间**：2026-05-16
 **代码版本**：commit 130-changedetection.io
+**分析深度**：覆盖存储层、队列链路、标签覆盖规则、差异计算模块
