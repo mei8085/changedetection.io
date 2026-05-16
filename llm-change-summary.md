@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-本文档分析 changedetection.io 项目中 LLM 变更摘要功能的上下文体积控制机制，包括 Prompt 组装流程、Token Budget 裁剪顺序以及响应解析失败的处理方式。
+本文档分析 changedetection.io 项目中 LLM 变更摘要功能的上下文体积控制机制，包括 Prompt 组装流程、Token Budget 裁剪顺序、三条路径的预算生效时机、超限后行为以及响应解析失败的处理方式。
 
 ## 2. 上下文体积控制机制
 
@@ -41,9 +41,139 @@ def _check_input_size(text: str, max_chars: int) -> None:
 - `preview_extract()` - 实时预览提取前检查 (evaluator.py:598)
 - `evaluate_change()` - 变更评估前检查 (evaluator.py:651)
 
-## 3. Prompt 组装流程
+## 3. 三条 LLM 路径的 Token Budget 生效顺序与超限行为
 
-### 3.1 变更摘要 Prompt 组装
+### 3.1 关键发现：`_check_token_budget` 的行为
+
+**重要纠正**：`_check_token_budget()` 函数只返回 `bool`，从不抛出异常。在大多数场景下，其返回值甚至被忽略，仅用于日志记录。
+
+```python
+def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
+    """
+    Check token budget limits.  Returns True if within budget, False if exceeded.
+    Also accumulates tokens_this_call into watch['llm_tokens_used_cumulative'].
+    """
+```
+
+### 3.2 路径一：变更摘要 (summarise_change)
+
+**生效顺序**：
+
+```
+调用 LLM 前
+    ↓
+1. 检查 LLM 是否配置 → 未配置: 返回空字符串
+    ↓
+2. 检查全局月度预算是否超限 → 超限: 返回空字符串，记录 WARNING
+    ↓
+3. 检查输入字符大小 → 超限: 抛出 LLMInputTooLargeError
+    ↓
+4. 执行 LLM 调用
+    ↓
+调用 LLM 后（记账阶段）
+    ↓
+5. 调用 _check_token_budget() → 返回值被 IGNORED!
+   - 仅记录 WARNING 日志
+   - tokens 仍会被累加到 watch['llm_tokens_used_cumulative']
+   - 摘要正常返回，不受影响
+    ↓
+6. 累加全局 Token 计数
+```
+
+**超限后行为总结**：
+- 全局月度预算超限：静默返回空字符串，不生成摘要
+- 输入字符过大：抛出异常（由上层处理）
+- 单次/累计 Per-Watch 预算超限：仅记录 WARNING 日志，摘要正常返回
+  - ⚠️ 此预算检查**不具有阻止调用或拦截返回的实际效果**
+
+**代码位置**: `evaluator.py:494-572`
+
+### 3.3 路径二：变更评估 (evaluate_change)
+
+**生效顺序**：
+
+```
+调用 LLM 前
+    ↓
+1. 检查 LLM 是否配置 → 未配置: 返回 None
+    ↓
+2. 检查是否有 intent → 无 intent: 返回 None
+    ↓
+3. 检查输入字符大小 → 超限: 抛出 LLMInputTooLargeError
+    ↓
+4. 缓存命中检查 → 命中: 直接返回缓存结果
+    ↓
+5. 检查全局月度预算是否超限 → 超限: 返回 {'important': True, 'summary': ''}
+    ↓
+6. 检查 Per-Watch 累计预算是否超限 → 超限: 返回 {'important': True, 'summary': ''}
+    ↓
+7. 执行 LLM 调用
+    ↓
+调用 LLM 后（记账阶段）
+    ↓
+8. 调用 _check_token_budget() → 返回值被 IGNORED!
+   - 仅记录 WARNING 日志
+   - tokens 仍会被累加
+    ↓
+9. 累加全局 Token 计数
+    ↓
+10. 缓存结果
+```
+
+**超限后行为总结**：
+- 全局月度预算超限：开放失败 (fail-open)，`important=True`，不抑制通知
+- Per-Watch 累计预算超限（调用前检查）：开放失败，`important=True`
+- 输入字符过大：抛出异常
+- 单次 Per-Watch 预算超限（调用后）：仅记录日志，结果正常返回
+
+**代码位置**: `evaluator.py:633-728`
+
+### 3.4 路径三：实时预览 (preview_extract)
+
+**生效顺序**：
+
+```
+调用 LLM 前
+    ↓
+1. 检查 LLM 是否配置 → 未配置: 返回 None
+    ↓
+2. 检查是否有 intent / 内容是否为空 → 返回 None
+    ↓
+3. 检查输入字符大小 → 超限: 抛出 LLMInputTooLargeError
+    ↓
+4. 执行 LLM 调用
+    ↓
+调用 LLM 后（记账阶段）
+    ↓
+5. ⚠️ 完全不检查 Per-Watch Token Budget!
+   - 无 _check_token_budget() 调用
+   - 不累加 watch['llm_tokens_used_cumulative']
+    ↓
+6. 仅累加全局 Token 计数
+```
+
+**超限后行为总结**：
+- 完全不进行 Per-Watch Token 预算检查
+- 仅检查输入字符大小（抛异常）
+- 仅参与全局 Token 预算累计
+- Per-Watch 预算限制对实时预览路径**完全无效**
+
+**代码位置**: `evaluator.py:579-626`
+
+### 3.5 三条路径对比表
+
+| 检查项 | 变更摘要 | 变更评估 | 实时预览 |
+|-------|---------|---------|---------|
+| 全局月度预算（调用前） | ✓ 返回 '' | ✓ important=True | ✗ 不检查 |
+| Per-Watch 累计预算（调用前） | ✗ 不检查 | ✓ important=True | ✗ 不检查 |
+| 输入字符大小限制 | ✓ 抛异常 | ✓ 抛异常 | ✓ 抛异常 |
+| Per-Watch 单次预算（调用后） | ⚠ 返回值忽略，仅日志 | ⚠ 返回值忽略，仅日志 | ✗ 完全不调用 |
+| 全局 Token 累计 | ✓ | ✓ | ✓ |
+| Watch Token 累计 | ✓ | ✓ | ✗ |
+
+## 4. Prompt 组装流程
+
+### 4.1 变更摘要 Prompt 组装
 
 **文件**: `prompt_builder.py:134-155` - `build_change_summary_prompt()`
 
@@ -61,7 +191,25 @@ Prompt 组装顺序：
 
 **Diff 预处理**: `_annotate_moved_lines()` 函数会将同时出现在 `+` 和 `-` 两侧的行标记为 `~` 前缀，表示移动/重排序/琐碎变更，避免 LLM 误判。
 
-### 3.2 系统 Prompt 分离设计
+### 4.2 变更摘要为何不使用页面快照上下文
+
+**关键设计决策**：`build_change_summary_prompt()` 接受 `current_snapshot` 参数是为了调用者兼容性，但**故意不使用**该参数。
+
+```python
+NOTE: current_snapshot is accepted for caller compatibility but intentionally
+unused. A wholesale page excerpt caused the LLM to report unchanged page
+content (e.g. old release-note bullets) as "what changed" — hallucinations
+drawn from the excerpt rather than the diff. The in-diff context lines give
+the model enough surrounding text to describe each change accurately.
+```
+
+**原因分析**：
+
+1. **幻觉问题**：完整的页面摘录会导致 LLM 将未变更的内容（如旧的发布说明 bullet）错误地报告为"变更了什么"
+2. **上下文已足够**：diff 本身通过 `unified_diff` 的 `n=3` 上下文行（变更前后各 3 行）已经提供了足够的周边文本来准确描述每个变更
+3. **准确性优先**：变更摘要的核心是描述 diff 中的实际变化，而非整个页面的状态。提供过多未变更的上下文反而会干扰 LLM 的判断
+
+### 4.3 系统 Prompt 分离设计
 
 系统 Prompt 和用户 Prompt 分离：
 
@@ -70,7 +218,7 @@ Prompt 组装顺序：
 
 这种设计允许用户完全自定义输出格式，而不会被硬编码的格式规则覆盖。
 
-### 3.3 评估调用 Prompt 组装
+### 4.4 评估调用 Prompt 组装
 
 **文件**: `prompt_builder.py:43-65` - `build_eval_prompt()`
 
@@ -86,7 +234,7 @@ Prompt 组装顺序：
 5. What changed (diff)
 ```
 
-### 3.4 Prompt 级联解析
+### 4.5 Prompt 级联解析
 
 **文件**: `evaluator.py:156-173` - `resolve_llm_field()`
 
@@ -96,9 +244,9 @@ Prompt 组装顺序：
 1. Watch 级别的配置 → 2. Tag 级别的配置 → 3. 全局默认配置 → 4. 硬编码默认值
 ```
 
-## 4. Token Budget 裁剪顺序
+## 5. Token Budget 裁剪顺序
 
-### 4.1 BM25 相关性裁剪
+### 5.1 BM25 相关性裁剪
 
 **文件**: `bm25_trim.py:15-52` - `trim_to_relevant()`
 
@@ -134,7 +282,7 @@ Prompt 组装顺序：
 - `build_eval_prompt()` - 评估调用的页面状态摘录 (prompt_builder.py:59)
 - `build_setup_prompt()` - 设置调用的页面内容摘录 (prompt_builder.py:189)
 
-### 4.2 输出 Token 动态调整
+### 5.2 输出 Token 动态调整
 
 **文件**: `evaluator.py:116-118` - `_summary_max_tokens()`
 
@@ -149,7 +297,7 @@ def _summary_max_tokens(diff: str, max_cap: int = LLM_DEFAULT_MAX_SUMMARY_TOKENS
 - 比例: 每 4 个字符分配约 1 个 token
 - 最大: `LLM_DEFAULT_MAX_SUMMARY_TOKENS` (默认 3000)
 
-### 4.3 本地产 Token 乘数
+### 5.3 本地产 Token 乘数
 
 **文件**: `evaluator.py:121-149` - `apply_local_token_multiplier()`
 
@@ -160,53 +308,20 @@ def _summary_max_tokens(diff: str, max_cap: int = LLM_DEFAULT_MAX_SUMMARY_TOKENS
 - **配置范围**: 1-20x (UI 强制范围，代码中也有防御性限制)
 - **目的**: 为推理模型（如 Qwen3、DeepSeek-R1、Gemma 3）提供足够的思考空间，避免因 `finish_reason='length'` 导致响应被截断
 
-### 4.4 全局月度 Token 预算
+### 5.4 全局月度 Token 预算
 
 **文件**: `evaluator.py:232-335`
-
-**预算检查流程**:
-
-```
-调用 LLM 前
-    ↓
-1. 检查 `is_global_token_budget_exceeded()`
-    ↓ 超出
-2. 记录 WARNING 日志
-    ↓
-3. 变更摘要: 返回空字符串，不生成摘要
-   变更评估: 开放失败 (important=True)，不抑制通知
-    ↓ 未超出
-4. 正常执行 LLM 调用
-    ↓
-5. 调用成功后: `accumulate_global_tokens()` 累加使用量
-    - total_tokens
-    - input_tokens
-    - output_tokens
-    - 估算的 USD 成本 (通过 litellm pricing)
-```
 
 **预算配置优先级**:
 1. 环境变量 `LLM_TOKEN_BUDGET_MONTH` (最高优先级)
 2. UI 设置中的 token budget
 3. 0 = 无限制 (默认)
 
-### 4.5 Per-Watch Token 限制
+**预算检查路径差异**: 详见第 3 章三条路径对比
 
-**文件**: `evaluator.py:342-370` - `_check_token_budget()`
+## 6. 响应解析失败处理
 
-```
-检查维度:
-├─ 每次检查限制 (max_tokens_per_check)
-└─ 累计使用限制 (max_tokens_cumulative)
-
-超限处理:
-├─ 变更摘要: 抛出异常，由上层处理
-└─ 变更评估: 开放失败 (important=True)，不抑制通知
-```
-
-## 5. 响应解析失败处理
-
-### 5.1 JSON 提取与清理
+### 6.1 JSON 提取与清理
 
 **文件**: `response_parser.py:19-27` - `_extract_json()`
 
@@ -222,7 +337,7 @@ def _summary_max_tokens(diff: str, max_cap: int = LLM_DEFAULT_MAX_SUMMARY_TOKENS
 返回提取的 JSON 字符串
 ```
 
-### 5.2 评估响应解析
+### 6.2 评估响应解析
 
 **文件**: `response_parser.py:30-43` - `parse_eval_response()`
 
@@ -238,7 +353,7 @@ JSON 解析
 
 **注意**: 解析失败时默认 `important=False`，意味着不会触发通知。这是一个保守的安全默认值。
 
-### 5.3 预览响应解析
+### 6.3 预览响应解析
 
 **文件**: `response_parser.py:46-59` - `parse_preview_response()`
 
@@ -252,7 +367,7 @@ JSON 解析
 返回默认值: {'found': False, 'answer': ''}
 ```
 
-### 5.4 设置响应解析
+### 6.4 设置响应解析
 
 **文件**: `response_parser.py:62-84` - `parse_setup_response()`
 
@@ -270,7 +385,7 @@ JSON 解析
 返回默认值: {'needs_prefilter': False, 'selector': None, 'reason': ''}
 ```
 
-### 5.5 LLM 调用层面的异常处理
+### 6.5 LLM 调用层面的异常处理
 
 **文件**: `evaluator.py:705-709`
 
@@ -284,9 +399,9 @@ except Exception as e:
 
 **设计意图**: LLM 调用失败时，采用"开放失败"策略，即不抑制通知，确保用户不会因为 LLM 故障而错过重要变更。
 
-## 6. 缓存机制
+## 7. 缓存机制
 
-### 6.1 变更摘要缓存
+### 7.1 变更摘要缓存
 
 **文件**: `evaluator.py:433-491`
 
@@ -306,7 +421,7 @@ MD5( diff_text + '\x00' + prompt )
 - 系统 Prompt 更新时缓存失效
 - Token 限制变化时缓存失效
 
-### 6.2 评估结果缓存
+### 7.2 评估结果缓存
 
 **文件**: `evaluator.py:654-658`
 
@@ -314,24 +429,42 @@ MD5( diff_text + '\x00' + prompt )
 
 每个唯一的 (intent, diff) 组合只评估一次，避免重复消耗 Token。
 
-## 7. 总结
+## 8. 总结
 
-### 7.1 上下文体积控制要点
+### 8.1 上下文体积控制要点
 
 1. **多层级限制**: 从全局 100k 字符到各场景的精细限制
 2. **智能裁剪**: BM25 相关性优先裁剪，保留语义完整性
 3. **动态 Token 分配**: 根据 diff 大小动态调整输出 token 预算
 4. **本地模型适配**: 为自托管模型提供额外的 Token 乘数
-5. **预算保护**: 全局月度预算 + Per-Watch 双重保护
+5. **预算保护**: 全局月度预算 + Per-Watch 双重保护（但实际效果因路径而异）
 
-### 7.2 失败处理原则
+### 8.2 Token Budget 关键发现
 
-1. **JSON 解析失败**: 保守默认值 (不触发通知)
-2. **LLM 调用失败**: 开放失败 (触发通知，不遗漏变更)
-3. **预算超限**: 变更摘要停止，变更评估开放失败
+1. **`_check_token_budget` 从不抛异常**：仅返回 bool，大多数场景下返回值被忽略
+2. **三条路径行为不一致**：
+   - 变更摘要：调用前只检查全局预算，Per-Watch 仅事后记账
+   - 变更评估：调用前检查全局和累计预算，采用开放失败策略
+   - 实时预览：完全不检查 Per-Watch 预算
+3. **预算超限的实际效果有限**：多数情况下仅记录日志，不阻止调用或拦截结果
+
+### 8.3 变更摘要不使用快照上下文的核心原因
+
+| 问题 | 影响 | 解决方案 |
+|-----|------|---------|
+| LLM 幻觉 | 未变更的页面内容被错误报告为变更 | 仅提供 diff，不附加完整页面快照 |
+| 上下文冗余 | diff 本身已包含 n=3 上下文行 | 依赖 diff 内置上下文而非额外快照 |
+| 准确性干扰 | 未变更内容会分散 LLM 注意力 | 聚焦于实际变更行，减少噪声 |
+
+### 8.4 失败处理原则
+
+1. **JSON 解析失败**: 保守默认值（不触发通知）
+2. **LLM 调用失败**: 开放失败（触发通知，不遗漏变更）
+3. **全局预算超限**: 变更摘要停止，变更评估开放失败
 4. **输入过大**: 明确错误提示，不进行部分处理
+5. **Per-Watch 预算超限**: 多数情况下仅记录日志，不影响功能
 
-### 7.3 关键设计决策
+### 8.5 关键设计决策
 
 | 决策 | 原因 | 影响 |
 |-----|------|------|
@@ -340,3 +473,5 @@ MD5( diff_text + '\x00' + prompt )
 | 移动行预标记 (~前缀) | 避免 LLM 误判重排序为变更 | 减少误报，提高摘要准确性 |
 | 调用失败时开放失败 | 不因为 LLM 故障错过重要变更 | 可能产生额外通知，但保证不遗漏 |
 | 多级 Prompt 级联 | 灵活的配置继承机制 | Watch > Tag > Global > 硬编码默认 |
+| 变更摘要不使用快照上下文 | 防止 LLM 将未变更内容报告为变更 | 提高准确性，减少幻觉 |
+| _check_token_budget 返回值被忽略 | 预算仅作参考/监控，不阻断核心功能 | Token 限制偏软，不具有强制拦截效果 |
