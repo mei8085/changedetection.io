@@ -2,7 +2,11 @@
 
 ## 1. 概述
 
-Changedetection.io 的文件型 DataStore 采用原子写入、分层存储和即时提交机制，确保 Watch 配置数据与历史快照数据的一致性。本报告详细说明保存与提交顺序、历史读取路径以及崩溃恢复机制。
+Changedetection.io 的文件型 DataStore 采用原子写入、分层存储和即时提交机制，确保 Watch 配置数据与历史快照数据的一致性。
+
+**重要前提**：本机制仅保证单进程场景下的数据完整性，不支持多进程并发写入。多进程场景下需使用 Redis/SQL 后端。
+
+本报告详细说明保存与提交顺序、历史读取路径以及崩溃恢复机制。
 
 ---
 
@@ -94,8 +98,9 @@ Step 4: 原子写入文件
 
 4. 原子替换 (os.replace)
    os.replace(temp_path, file_path)
-   - POSIX 保证原子性
+   - POSIX 保证原子性：系统调用层面不可中断
    - 原文件要么完整保留，要么被新文件完全替换
+   - 仅保证单文件原子性，不保证多进程并发安全
 
 5. 新文件目录 fsync (确保文件名元数据持久化)
    - 仅针对新创建的文件
@@ -103,7 +108,9 @@ Step 4: 原子写入文件
    - os.fsync(dir_fd)
 ```
 
-**关键保证**：原子写入确保 watch.json 永远不会处于半写损坏状态。
+**关键保证**：原子写入确保单进程下 watch.json 永远不会处于半写损坏状态。
+
+**重要限制**：`os.replace()` 仅保证单个文件替换的系统调用原子性，不能解决多进程场景下的竞态条件（如进程 A 读取、进程 B 同时写入）。
 
 ---
 
@@ -200,152 +207,177 @@ datastore/
 
 ---
 
-## 5. 部分写入或崩溃后的恢复思路
+## 5. 部分写入或崩溃后的恢复机制
 
 ### 5.1 崩溃场景分析
 
-| 崩溃时间点 | 影响 | 恢复策略 |
-|-----------|------|---------|
-| 写临时文件过程中 | 临时文件残留，原文件完整 | 下次启动时清理 .tmp 文件 |
-| os.replace() 执行中 | POSIX 保证原子，无影响 | 无需恢复 |
-| history.txt 追加中 | 可能出现不完整行 | 启动时验证并截断到最后完整行 |
-| 快照文件写入中 | 快照文件损坏 | 重新检查时重新生成 |
-
-### 5.2 现有恢复机制
-
-#### 5.2.1 watch.json 完整性保护
-
-- **原子写入**：崩溃时最多丢失最后一次提交，原文件保持完整
-- **JSON 解析验证**：加载时解析失败会记录错误并跳过该 watch
-  ```python
-  # load_watch_from_file() (file_saving_datastore.py:211-270行)
-  except json.JSONDecodeError as e:
-      logger.critical(f"CORRUPTED WATCH DATA: {uuid}...")
-      return None  # 跳过损坏的 watch
-  ```
-
-#### 5.2.2 history.txt 启动时验证
-
-当前实现中，读取 history.txt 时每行都会：
-1. 验证格式（包含逗号）
-2. 解析出时间戳和文件名
-3. 验证文件实际存在
-4. 跳过无效/损坏的条目
-
-#### 5.2.3 临时文件清理
-
-`save_json_atomic()` 中的异常处理：
-```python
-except Exception as e:
-    # 关闭文件描述符
-    if not fd_closed:
-        try: os.close(fd)
-        except: pass
-    # 删除临时文件
-    if os.path.exists(temp_path):
-        try: os.unlink(temp_path)
-        except: pass
-```
-
-### 5.3 建议增强的恢复策略
-
-#### 策略1：启动时完整数据一致性检查
-
-```python
-# 建议添加到 datastore 初始化流程
-def run_data_consistency_check():
-    for uuid in watch_dirs:
-        # 1. 验证 watch.json
-        try:
-            with open(watch_json) as f:
-                json.load(f)
-        except:
-            # 尝试从备份恢复或标记为损坏
-            handle_corrupted_watch(uuid)
-
-        # 2. 验证 history.txt
-        history_file = os.path.join(uuid_dir, 'history.txt')
-        if os.path.exists(history_file):
-            validate_and_repair_history(history_file)
-
-        # 3. 验证快照文件存在性
-        # 对于 history.txt 中列出的每个快照
-        # 验证文件存在且可读取
-```
-
-#### 策略2：history.txt 双写或 WAL
-
-```python
-# 建议实现预写日志 (Write-Ahead Log)
-# 追加新历史条目前先写 WAL
-def save_history_with_wal():
-    # 1. 先写 WAL
-    wal_path = os.path.join(data_dir, 'history.wal')
-    with open(wal_path, 'w') as f:
-        f.write(f"{timestamp},{snapshot_fname}\n")
-    os.fsync(f)
-
-    # 2. 再追加到主文件
-    with open(history_txt, 'a') as f:
-        f.write(...)
-    os.fsync(f)
-
-    # 3. 删除 WAL
-    os.unlink(wal_path)
-
-# 启动时检查 WAL 存在则重放
-if os.path.exists(wal_path):
-    replay_wal_entry(wal_path)
-```
-
-#### 策略3：自动备份 watch.json
-
-```python
-# 每次 commit 前先备份上一版本
-def commit_with_backup():
-    watch_json = os.path.join(data_dir, 'watch.json')
-    if os.path.exists(watch_json):
-        backup = os.path.join(data_dir, 'watch.json.bak')
-        shutil.copy2(watch_json, backup)
-
-    # 然后执行正常 commit
-```
-
-#### 策略4：部分写入检测
-
-```python
-# 检测 history.txt 中的不完整行
-def repair_history_txt(history_path):
-    lines = []
-    with open(history_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            # 验证行格式: timestamp,filename
-            if ',' in line and len(line.split(',', 1)) == 2:
-                timestamp, filename = line.split(',', 1)
-                if timestamp.isdigit():  # 时间戳应为数字
-                    lines.append(line)
-
-    # 重写完整的 history.txt
-    with open(history_path, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
-```
+| 崩溃时间点 | 影响 |
+|-----------|------|
+| 写临时文件过程中 | 临时文件残留，原文件完整 |
+| os.replace() 执行中 | POSIX 保证原子，单文件无损坏 |
+| history.txt 追加中 | 可能出现不完整行 |
+| 快照文件写入中 | 快照文件损坏 |
 
 ---
 
-## 6. 并发安全机制
+### 5.2 临时文件崩溃处理
+
+#### 5.2.1 现有实现（代码行为）
+
+**位置**：`save_json_atomic()` - file_saving_datastore.py:142-175行
+
+```python
+except Exception as e:
+    # 1. 关闭文件描述符
+    if not fd_closed:
+        try:
+            os.close(fd)
+        except:
+            pass
+    # 2. 删除临时文件
+    if os.path.exists(temp_path):
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+```
+
+**当前行为逐条说明**：
+
+1. ✅ **异常捕获**：所有异常（包括磁盘满、权限错误等）都会进入异常处理分支
+2. ✅ **文件描述符关闭**：尝试关闭可能未关闭的文件描述符，忽略关闭失败
+3. ✅ **临时文件删除**：检查临时文件存在后尝试删除，忽略删除失败
+4. ❌ **启动时残留清理**：崩溃后遗留的 `.tmp` 文件不会在下次启动时自动清理
+
+#### 5.2.2 建议方案
+
+| 改进项 | 建议实现 |
+|--------|---------|
+| 启动时清理残留 .tmp 文件 | datastore 初始化时遍历所有 watch 目录，删除 `*.tmp` 文件 |
+| 临时文件时间戳校验 | 仅删除超过 N 分钟的临时文件，避免清理正在写入的文件 |
+
+---
+
+### 5.3 history.txt 崩溃处理
+
+#### 5.3.1 现有实现（代码行为）
+
+**位置**：`history` 属性 getter - Watch.py:442-491行
+
+```python
+if os.path.isfile(fname):
+    logger.debug(f"Reading watch history index for {self.get('uuid')}")
+    with open(fname, "r", encoding='utf-8') as f:
+        for i in f.readlines():
+            if ',' in i:  # 1. 验证行格式
+                k, v = i.strip().split(',', 2)
+                
+                # 2. 路径安全验证 + 文件存在验证
+                safe_data_dir = os.path.realpath(self.data_dir)
+                snapshot_fname = os.path.basename(v.strip())
+                resolved_path = os.path.realpath(os.path.join(self.data_dir, snapshot_fname))
+                
+                if not resolved_path.startswith(safe_data_dir + os.sep) and resolved_path != safe_data_dir:
+                    continue  # 跳过不安全路径
+                    
+                if not os.path.exists(resolved_path):
+                    continue  # 跳过不存在的文件
+                    
+                tmp_history[k] = resolved_path  # 仅保留有效条目
+```
+
+**当前行为逐条说明**：
+
+1. ✅ **逐行验证格式**：每行必须包含逗号，否则被静默跳过
+2. ✅ **路径安全检查**：通过 `os.path.realpath()` 确保不超出 data_dir
+3. ✅ **文件存在验证**：引用的快照文件必须实际存在才加入内存索引
+4. ❌ **不完整行处理**：崩溃导致的行截断（无换行符）会被 `readlines()` 读入，但因无逗号被跳过
+5. ❌ **磁盘修复**：内存中跳过无效行，但不会重写修复 history.txt 文件
+6. ❌ **启动时完整性检查**：无专门的启动时校验逻辑，仅在访问时验证
+
+#### 5.3.2 建议方案
+
+| 改进项 | 建议实现 |
+|--------|---------|
+| 启动时完整性校验 | datastore 加载完成后扫描所有 watch 的 history.txt |
+| 不完整行检测 | 检查最后一行是否以换行符结尾，无则截断 |
+| 修复后重写 | 检测到无效条目后，清理并重写 history.txt |
+| 行格式校验增强 | 验证时间戳部分为纯数字，文件名部分合法 |
+
+---
+
+### 5.4 watch.json 崩溃处理
+
+#### 5.4.1 现有实现（代码行为）
+
+**位置**：`load_watch_from_file()` - file_saving_datastore.py:211-270行
+
+```python
+try:
+    # 1. 文件大小校验
+    file_size = os.path.getsize(watch_json)
+    if file_size > 10 * 1024 * 1024:  # 10MB 上限
+        logger.critical(f"CORRUPTED WATCH DATA: {uuid} 文件过大")
+        return None
+    
+    # 2. JSON 解析验证
+    if HAS_ORJSON:
+        with open(watch_json, 'rb') as f:
+            watch_data = orjson.loads(f.read())
+    else:
+        with open(watch_json, 'r', encoding='utf-8') as f:
+            watch_data = json.load(f)
+            
+    return watch_data
+    
+except json.JSONDecodeError as e:
+    logger.critical(f"CORRUPTED WATCH DATA: {uuid} JSON 解析失败")
+    return None  # 跳过损坏的 watch
+except ValueError as e:
+    if "invalid json" in str(e).lower() or HAS_ORJSON:
+        logger.critical(f"CORRUPTED WATCH DATA: {uuid} JSON 解析失败")
+        return None
+    raise
+```
+
+**当前行为逐条说明**：
+
+1. ✅ **文件大小检查**：超过 10MB 视为损坏，跳过加载
+2. ✅ **JSON 解析验证**：解析失败记录 critical 日志并返回 None
+3. ✅ **损坏 watch 跳过**：加载失败的 watch 不会加入内存索引
+4. ❌ **无自动恢复**：检测到损坏后不尝试从备份恢复
+5. ❌ **无损坏标记**：损坏的 watch.json 文件保留在磁盘，下次启动继续报错
+
+#### 5.4.2 建议方案
+
+| 改进项 | 建议实现 |
+|--------|---------|
+| 自动备份机制 | 每次成功 commit() 后保留上一版本为 watch.json.bak |
+| 损坏自动恢复 | 加载失败时尝试从 watch.json.bak 恢复 |
+| 用户通知 | WebUI 中显示损坏的 watch 及恢复选项 |
+
+---
+
+## 6. 并发安全机制（单进程内）
 
 ### 6.1 datastore.lock 保护
 
 - 所有 `commit()` 操作在获取数据快照时持有 `datastore.lock`
-- 防止并发修改导致的数据不一致
+- 防止单进程内多线程并发修改导致的数据不一致
 - Python `threading.Lock()` 实现
+- **仅保护线程安全，不保护进程安全**
 
-### 6.2 文件系统级原子性
+### 6.2 os.replace() 的实际边界
 
-- `os.replace()` 是原子系统调用
-- 多进程同时写入同一文件不会导致内容损坏
-- 最后写入者获胜
+**正确理解**：
+- `os.replace()` 是原子系统调用，不会产生半写文件
+- 任何时刻文件要么是旧版本，要么是新版本
+- 单进程内配合 datastore.lock 使用安全
+
+**常见误解澄清**：
+- ❌ **不等于多进程并发安全**：进程 A 读取后进程 B 写入，进程 A 基于旧数据计算后写入会产生丢失更新
+- ❌ **不保证跨文件一致性**：同时写入 watch.json 和 history.txt 可能出现部分成功
+- ❌ **不解决 NFS 分布式锁问题**：网络文件系统上原子性可能削弱
 
 ---
 
@@ -365,27 +397,32 @@ def repair_history_txt(history_path):
 
 ### 8.1 现有保证
 
-1. ✅ **watch.json 永不损坏**：原子写入 + 临时文件替换
+1. ✅ **单进程下 watch.json 永不损坏**：原子写入 + 临时文件替换
 2. ✅ **崩溃后可启动**：损坏的 watch 会被跳过并记录日志
-3. ✅ **部分历史丢失不影响整体**：history.txt 条目逐行验证
+3. ✅ **history.txt 内存级容错**：读取时逐行验证，无效条目被跳过
 4. ✅ **路径穿越防护**：所有文件访问限制在 data_dir 内
+5. ✅ **异常时临时文件清理**：写入过程中异常会删除当前临时文件
 
 ### 8.2 潜在风险点
 
-1. ⚠️ history.txt 追加时崩溃可能产生不完整行
-2. ⚠️ 快照文件写入时崩溃可能产生损坏文件
-3. ⚠️ fsync 默认关闭，系统崩溃可能导致最近几秒数据丢失
+1. ⚠️ **崩溃残留临时文件**：进程崩溃后遗留的 `.tmp` 文件不会自动清理
+2. ⚠️ **history.txt 磁盘级不修复**：内存中跳过但不重写修复文件
+3. ⚠️ **快照文件写入时崩溃**：可能产生损坏的快照文件，下次读取失败
+4. ⚠️ **fsync 默认关闭**：系统崩溃可能导致最近几秒数据丢失
+5. ⚠️ **多进程场景不安全**：当前设计仅支持单进程部署
 
 ### 8.3 建议改进优先级
 
-| 优先级 | 改进 | 收益 |
-|--------|------|------|
-| 高 | history.txt 启动时修复 | 防止崩溃后历史索引损坏 |
-| 中 | watch.json 自动备份 | 极端情况下可恢复 |
-| 低 | WAL 预写日志 | 强一致场景使用 |
-| 低 | 快照文件校验和 | 检测损坏快照 |
+| 优先级 | 改进 | 对应章节 | 收益 |
+|--------|------|---------|------|
+| 高 | 启动时清理残留 .tmp 文件 | 5.2.2 | 防止磁盘空间泄漏 |
+| 高 | history.txt 启动时检测并重写 | 5.3.2 | 防止历史索引累积损坏 |
+| 中 | watch.json 自动备份机制 | 5.4.2 | 极端情况下可恢复配置 |
+| 低 | WAL 预写日志用于 history.txt | 5.3.2 | 强一致场景使用 |
+| 低 | 快照文件校验和验证 | 4.2 | 检测静默损坏的快照 |
 
 ---
 
 **报告生成时间**：2026-05-17
+**修订版本**：v2 - 明确单进程边界，拆分现有实现和建议方案
 **基于代码版本**：file_saving_datastore.py, Watch.py, model/__init__.py
