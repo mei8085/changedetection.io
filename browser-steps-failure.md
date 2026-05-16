@@ -10,17 +10,12 @@
 class BrowserStepsStepException(Exception):
     def __init__(self, step_n, original_e):
         self.step_n = step_n          # 步骤序号（从1开始）
-        self.original_e = original_e  # 原始Playwright异常对象
+        self.original_e = original_e  # Playwright原始异常对象
         logger.debug(f"Browser Steps exception at step {self.step_n} {str(original_e)}")
         return
 ```
 
-**关键代码证据**：
-- 异常类**未调用父类 `Exception.__init__()`**，直接初始化两个实例属性
-- `step_n`：整数，表示失败的步骤序号
-- `original_e`：Playwright 原始异常对象（`TimeoutError` 或 `Error`）
-
-### 1.2 异常抛出点与 step_n 传递
+### 1.2 异常抛出点与step_n传递
 
 **文件位置**：`changedetectionio/content_fetchers/base.py:165-199`
 
@@ -39,13 +34,14 @@ async def iterate_browser_steps(self, start_url=None):
             raise BrowserStepsStepException(step_n=step_n, original_e=e)
 ```
 
-**步骤序号传递关系**：
-| 代码位置 | 变量 | 值含义 |
-|---------|------|--------|
-| base.py:169 | `step_n = 0` | 初始化 |
-| base.py:177 | `step_n += 1` | 第一个步骤执行前变为 1 |
-| base.py:199 | `step_n=step_n` | 异常对象中存储的是 1-based 序号 |
-| worker.py:327 | `error_step = e.step_n + 1` | **显示时再次+1，存在潜在Bug** |
+**步骤序号传递关系表**：
+| 代码位置 | 变量 | 值（步骤1失败时） | 说明 |
+|---------|------|------------------|------|
+| base.py:169 | `step_n = 0` | 0 | 初始化 |
+| base.py:177 | `step_n += 1` | 1 | 第一个步骤执行前变为1 |
+| base.py:199 | `step_n=step_n` | 1 | 异常对象中存储的是1-based序号 |
+| worker.py:327 | `error_step = e.step_n + 1` | 2 | **显示时再次+1** |
+| worker.py:354 | `step_n=e.step_n` | 1 | 传递给通知服务的是原始值 |
 
 ---
 
@@ -68,7 +64,7 @@ if watch.get('filter_failure_notification_send', False):
     if threshold > 0 and c >= threshold:
         if not watch.get('notification_muted'):
             await send_step_failure_notification(...)
-        c = 0  # 发送通知后重置计数
+        c = 0  # 达到阈值后重置计数
     
     datastore.update_watch(uuid=uuid, update_obj={'consecutive_filter_failures': c})
 ```
@@ -84,7 +80,7 @@ if watch.get('filter_failure_notification_send', False):
 
 ---
 
-## 3. 阈值触发与重置规则
+## 3. 阈值触发与两条重置路径
 
 ### 3.1 触发通知的完整条件链
 
@@ -111,25 +107,94 @@ if watch.get('filter_failure_notification_send', False):  # 条件1
     if threshold > 0 and c >= threshold:  # 条件2 + 条件3
         if not watch.get('notification_muted'):  # 条件4
             await send_step_failure_notification(...)
-        c = 0  # 发送后重置计数
+        c = 0  # 达到阈值后重置计数
 ```
 
-### 3.2 计数重置规则
+### 3.2 重置路径1：达到阈值后重置
 
-**重置时机**：
-- 仅在 `threshold > 0 and c >= threshold` 条件满足后重置
-- 无论通知是否因 `notification_muted` 被跳过，计数器都会重置为 0
+**触发场景**：连续失败次数达到配置阈值
 
-**不重置场景**：
-- `filter_failure_notification_send == False`：计数不更新
-- `threshold == 0`：计数持续累加但不触发通知
-- 未达到阈值：计数保留，下次失败时继续累加
+**代码位置**：`worker.py:355`
+```python
+if threshold > 0 and c >= threshold:
+    if not watch.get('notification_muted'):
+        await send_step_failure_notification(...)
+    c = 0  # 无论是否发送通知，只要达到阈值就重置
+```
+
+**特点**：
+- 无论通知是否因`notification_muted`被跳过，计数器都会重置为0
+- 仅在`threshold > 0`且达到阈值时触发
+
+### 3.3 重置路径2：抓取成功后重置
+
+**触发场景**：任何一次完整的成功抓取（包括Browser Steps全部成功）
+
+**代码位置1**：`worker.py:153-154`（抓取开始前）
+```python
+# Clear last errors
+datastore.data['watching'][uuid]['browser_steps_last_error_step'] = None
+```
+
+**代码位置2**：`worker.py:416-417`（抓取成功后，else分支）
+```python
+if not watch.get('ignore_status_codes'):
+    update_obj['consecutive_filter_failures'] = 0
+```
+
+**关键发现**：
+- **抓取开始前**先清除`browser_steps_last_error_step`错误步骤标记
+- **抓取成功后**（无异常抛出时）重置`consecutive_filter_failures = 0`
+- 受`ignore_status_codes`开关影响：如果启用了忽略状态码，则**不重置**计数
 
 ---
 
-## 4. 错误信息处理流程
+## 4. 失败/成功/再次失败对照说明
 
-### 4.1 原始错误信息提取
+### 4.1 场景对照（阈值=3）
+
+| 次数 | 场景 | 计数值 | 操作 | 说明 |
+|-----|------|--------|------|------|
+| 1 | 第一次失败 | 1 | 计数+1，不通知 | 未达阈值 |
+| 2 | 第二次失败 | 2 | 计数+1，不通知 | 未达阈值 |
+| 3 | 第三次失败 | 3 | 达到阈值→发送通知→重置计数=0 | 阈值触发重置 |
+| 4 | （中间某一次）成功 | 0 | 抓取成功路径重置计数=0 | 成功路径重置 |
+| 5 | 再次失败（成功后第一次） | 1 | 计数+1，不通知 | 重新开始累计 |
+
+### 4.2 状态流转图
+
+```
+初始状态 (count=0)
+    ↓ [第一次失败]
+count=1 → 不通知
+    ↓ [第二次失败]
+count=2 → 不通知
+    ↓ [第三次失败]
+count=3 → 达到阈值 → 发送通知 → count=0
+    ↓
+重置状态 (count=0)
+    ↓ [抓取成功]
+count保持0 → 清除browser_steps_last_error_step
+    ↓ [再次失败]
+count=1 → 重新开始累计
+```
+
+### 4.3 对告警节奏的影响
+
+**两条重置路径共同作用的效果**：
+
+| 影响 | 说明 |
+|------|------|
+| **防抖动** | 间歇性故障恢复后，计数器重置，不会产生多余告警 |
+| **告警间隔** | 两次告警之间至少需要`threshold`次连续失败 |
+| **成功恢复** | 只要有一次成功，之前的失败累计就全部清零 |
+| **状态码忽略** | 启用`ignore_status_codes`时，即使HTTP非200，只要页面能解析且步骤成功，计数仍会重置 |
+
+---
+
+## 5. 错误信息处理流程
+
+### 5.1 原始错误信息提取
 
 **文件位置**：`changedetectionio/worker.py:328-338`
 
@@ -147,12 +212,12 @@ else:
     err_text += " " + str(e.original_e).splitlines()[0]
 ```
 
-### 4.2 错误信息持久化字段
+### 5.2 错误信息持久化字段
 
-| 字段 | 值来源 | 示例 |
-|------|--------|------|
-| `last_error` | 构造的 `err_text` | "Browser step at position 2 could not run... Could not find the target." |
-| `browser_steps_last_error_step` | `e.step_n + 1` | 2 |
+| 字段 | 值来源 | 示例值 | 说明 |
+|------|--------|--------|------|
+| `last_error` | 构造的`err_text` | "Browser step at position 2 could not run... Could not find the target." | 用户可见的完整错误提示 |
+| `browser_steps_last_error_step` | `e.step_n + 1` | 2 | 高亮标记的步骤序号（加1后） |
 
 **代码证据**（worker.py:342-344）：
 ```python
@@ -163,9 +228,9 @@ datastore.update_watch(uuid=uuid,
 
 ---
 
-## 5. 通知内容来源与构建
+## 6. 通知内容来源与构建
 
-### 5.1 通知标题与正文
+### 6.1 通知标题与正文
 
 **文件位置**：`changedetectionio/notification_service.py:480-524`
 
@@ -194,108 +259,119 @@ Thanks - Your omniscient changedetection.io installation.
 """
 ```
 
-### 5.2 通知内容字段来源表
+### 6.2 通知内容字段来源表
 
 | 通知字段 | 数据来源 | 说明 |
 |---------|----------|------|
-| **`notification_title`** | 硬编码 f-string | 包含 `{step}` 变量 |
-| **`notification_body`** | 硬编码多行f-string | 包含 `{step}`、`{threshold}` 变量 |
+| **`notification_title`** | 硬编码f-string | 包含`{step}`变量（step_n+1后的值） |
+| **`notification_body`** | 硬编码多行f-string | 包含`{step}`、`{threshold}`变量 |
 | **`notification_format`** | `_check_cascading_vars()` | 级联获取：Watch → Tag → Global |
-| **`notification_urls`** | 级联获取 | 优先 `watch['notification_urls']`，否则全局配置 |
+| **`notification_urls`** | 级联获取 | 优先`watch['notification_urls']`，否则全局配置 |
 | **`watch_url`** | `watch['url']` | 监控页面URL |
-| **`uuid` / `watch_uuid`** | 传入参数 | 监控项唯一标识 |
+| **`uuid`/`watch_uuid`** | 传入参数 | 监控项唯一标识 |
 
-### 5.3 通知调用链
+### 6.3 通知调用链
 
 ```
-worker.py:354 → send_step_failure_notification(watch_uuid, step_n, ...)
+worker.py:354 → send_step_failure_notification(watch_uuid, step_n=e.step_n, ...)
     ↓ (worker.py:782-792)
-notification_service.send_step_failure_notification(watch_uuid, step_n)
-    ↓ (notification_service.py:480-524)
+notification_service.send_step_failure_notification(watch_uuid, step_n)  # step_n=1
+    ↓ (notification_service.py:489)
+step = step_n + 1 → step=2
+    ↓
 构建 NotificationContextData → 放入 notification_q 队列
 ```
 
----
-
-## 6. 关键调用链与数据流向
-
-### 6.1 完整失败处理流
-
-```
-Playwright抛出TimeoutError/Error
-    ↓ [base.py:196-199]
-iterate_browser_steps捕获 → 包装BrowserStepsStepException
-    ↓ 抛出时携带: step_n(1-based), original_e
-    ↓ [worker.py:323-359]
-worker捕获异常
-    ├─ 计算 error_step = e.step_n + 1  ← 潜在Bug:序号多加1
-    ├─ 根据 original_e.name 构造 err_text
-    ├─ 更新 last_error 和 browser_steps_last_error_step
-    │
-    └─ filter_failure_notification_send == True?
-        ├─ 是 → consecutive_filter_failures += 1
-        │       └─ threshold > 0 AND 计数 >= threshold?
-        │           ├─ 是 → notification_muted == False?
-        │           │       ├─ 是 → 发送通知
-        │           │       └─ 否 → 跳过通知
-        │           └─ 无论是否发送通知: 重置计数 = 0
-        │
-        └─ 否 → 不更新计数，直接结束
-```
-
-### 6.2 screenshot_step 命名规则
-
-**文件位置**：`changedetectionio/content_fetchers/base.py:179-180,194-195`
-
-| 时机 | 调用代码 | 生成文件名 |
-|------|---------|-----------|
-| 步骤执行前 | `screenshot_step("before-" + str(step_n))` | `step_before-1.jpeg` |
-| 步骤执行后 | `screenshot_step(step_n)` | `step_1.jpeg` |
+**关键发现**：通知服务中再次对step_n加1，导致通知中显示的是step=2（第一个步骤失败时）。
 
 ---
 
-## 7. 代码问题与Bug确认
+## 7. 步骤序号偏移问题分析
 
-### 7.1 Bug: 步骤序号显示不一致
+### 7.1 加1操作分布
 
-**问题**：
-- 异常中 `step_n` 已是 1-based（第一个步骤失败时 `step_n=1`）
-- `worker.py:327` 再次 `+1` → `error_step = 2`
-- 导致用户看到的步骤序号比实际配置的序号大1
+| 位置 | 代码 | 输入值 | 输出值 | 用途 |
+|------|------|--------|--------|------|
+| worker.py:327 | `error_step = e.step_n + 1` | 1 | 2 | last_error文本提示、保存到browser_steps_last_error_step |
+| worker.py:354 | `step_n=e.step_n` | 1 | 1 | 传递给通知服务 |
+| notification_service.py:489 | `step = step_n + 1` | 1 | 2 | 通知标题和正文中显示 |
 
-**证据链**：
+### 7.2 Bug判断：是否属于真实缺陷？
+
+**结论：是Bug，但影响有限**
+
+**Bug描述**：
+- 异常抛出时step_n已是1-based序号（第一个步骤失败时step_n=1）
+- worker.py中再次+1得到error_step=2，保存到browser_steps_last_error_step
+- 通知服务中再次+1，通知中显示step=2
+- **最终效果**：用户看到的错误步骤序号比实际配置的序号**大1**
+
+**代码证据链**：
 ```
 base.py:169: step_n = 0
 base.py:177: step_n += 1 → step_n = 1
 base.py:199: raise BrowserStepsStepException(step_n=1, ...)
-worker.py:327: error_step = e.step_n + 1 → error_step = 2  ← 错误
+worker.py:327: error_step = e.step_n + 1 → error_step = 2 ← Bug第一次加1
+worker.py:344: browser_steps_last_error_step = 2
+worker.py:354: send_step_failure_notification(step_n=1)
+notification_service.py:489: step = 1 + 1 → step = 2 ← Bug第二次加1
 ```
 
-### 7.2 Bug: Exception父类未初始化
+**影响评估**：
+| 影响点 | 严重程度 | 说明 |
+|--------|---------|------|
+| 前端高亮 | 中 | 用户在"步骤1"失败时看到"步骤2"被高亮，造成困惑 |
+| 通知内容 | 中 | 通知邮件中显示错误步骤号，用户需要手动减1 |
+| 截图命名 | 无 | screenshot_step使用的是base.py中的step_n（不加1），文件名为step_1.jpeg，是正确的 |
 
-**问题**：
-- `BrowserStepsStepException.__init__` 未调用 `super().__init__()`
-- 导致 `str(exception)` 可能返回空字符串或非预期结果
-
-**证据**（exceptions/__init__.py:46-50）：
+**截图命名正确性验证**（base.py:179,194）：
 ```python
-def __init__(self, step_n, original_e):
-    self.step_n = step_n
-    self.original_e = original_e
-    # 缺少 super().__init__(f"Step {step_n} failed: {original_e}")
-    logger.debug(...)
-    return
+await self.screenshot_step("before-" + str(step_n))  # step_before-1.jpeg ✓
+await self.screenshot_step(step_n)                    # step_1.jpeg ✓
 ```
+
+截图文件名使用的是正确的step_n，用户查看截图时不会有偏移问题。
 
 ---
 
-## 8. 附录：关键文件与行号索引
+## 8. 其他设计问题
+
+### 8.1 Exception父类未初始化
+
+**问题**：
+```python
+class BrowserStepsStepException(Exception):
+    def __init__(self, step_n, original_e):
+        self.step_n = step_n
+        self.original_e = original_e
+        # 缺少 super().__init__(f"Step {step_n} failed: {original_e}")
+        logger.debug(...)
+        return
+```
+
+**影响**：`str(exception)`可能返回空字符串或非预期结果，不利于日志调试。
+
+---
+
+## 9. 附录：关键文件与行号索引
 
 | 文件路径 | 关键代码行号 | 说明 |
 |---------|-------------|------|
 | `changedetectionio/content_fetchers/exceptions/__init__.py` | 45-50 | BrowserStepsStepException定义 |
 | `changedetectionio/content_fetchers/base.py` | 165-199 | iterate_browser_steps异常抛出 |
+| `changedetectionio/worker.py` | 153-154 | 抓取开始前清除错误步骤标记 |
 | `changedetectionio/worker.py` | 323-359 | Browser Steps异常处理完整逻辑 |
 | `changedetectionio/worker.py` | 346-357 | 连续失败计数与阈值判断 |
+| `changedetectionio/worker.py` | 416-417 | 成功路径重置计数字段 |
 | `changedetectionio/worker.py` | 782-792 | send_step_failure_notification包装函数 |
 | `changedetectionio/notification_service.py` | 480-524 | 通知内容构建 |
+
+---
+
+## 10. 修复建议
+
+| 问题 | 修复方案 |
+|------|---------|
+| 步骤序号偏移 | 移除worker.py:327和notification_service.py:489中的`+ 1`操作，确保异常中存储的step_n直接使用 |
+| Exception未初始化 | 添加`super().__init__(f"Browser step {step_n} failed: {str(original_e)}")` |
+| 硬编码通知模板 | 将通知标题和正文移至外部Jinja2模板文件，支持国际化 |
