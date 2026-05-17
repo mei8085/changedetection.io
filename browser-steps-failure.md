@@ -300,55 +300,57 @@ step = step_n + 1 → step=2
 构建 NotificationContextData → 放入 notification_q 队列
 ```
 
-**关键发现**：通知服务中再次对step_n加1，导致通知中显示的是step=2（第一个步骤失败时）。
-
 ---
 
 ## 7. 步骤序号偏移问题分析
 
-### 7.1 加1操作分布
+### 7.1 各环节口径对齐表
 
-| 位置 | 代码 | 输入值 | 输出值 | 用途 |
-|------|------|--------|--------|------|
-| worker.py:327 | `error_step = e.step_n + 1` | 1 | 2 | last_error文本提示、保存到browser_steps_last_error_step |
-| worker.py:354 | `step_n=e.step_n` | 1 | 1 | 传递给通知服务 |
-| notification_service.py:489 | `step = step_n + 1` | 1 | 2 | 通知标题和正文中显示 |
+| 环节 | 实际 step_n | 预期口径 | 代码证据 | 说明 |
+|------|------------|---------|---------|------|
+| 异常对象 | 1-based | 1-based | base.py:169-199 | 循环中 step_n +=1，第一个步骤失败时 step_n = 1 |
+| 通知服务内部 | step_n + 1 | 1-based（用户可见） | notification_service.py:489 + 单测68行 | **设计意图**：输入0-based → 输出1-based 展示给用户 |
+| 前端 CSS 高亮 | browser_steps_last_error_step | 1-based | browser-steps.js:455 | CSS nth-child 是 1-based |
+| 前端截图判断 | browser_steps_last_error_step | 1-based（i+1） | browser-steps.js:368 | 数组索引 i 是 0-based |
+| 截图文件名 | step_n | 1-based | base.py:179,194 | step_1.jpeg，正确 |
 
-### 7.2 Bug判断：是否属于真实缺陷？
+### 7.2 加1操作分布与Bug诊断
 
-**结论：是Bug，但影响有限**
+| 位置 | 代码 | 输入值 | 输出值 | 预期行为 | 是否Bug | 说明 |
+|------|------|--------|--------|---------|--------|------|
+| **worker.py:327** | `error_step = e.step_n + 1` | 1 | 2 | 直接使用 1-based | **是Bug** | 异常对象已是1-based，无需再加1 |
+| **worker.py:354** | `step_n=e.step_n` | 1 | 1 | 传递 0-based 给通知服务 | **是Bug** | 通知服务期望0-based输入 |
+| **notification_service.py:489** | `step = step_n + 1` | 1 | 2 | 0-based → 1-based 转换 | **不是Bug** | 这是设计意图，单测验证了此行为 |
 
-**Bug描述**：
-- 异常抛出时step_n已是1-based序号（第一个步骤失败时step_n=1）
-- worker.py中再次+1得到error_step=2，保存到browser_steps_last_error_step
-- 通知服务中再次+1，通知中显示step=2
-- **最终效果**：用户看到的错误步骤序号比实际配置的序号**大1**
+**单测证据**（test_step_failure_notification.py:63-68）：
+```python
+service.send_step_failure_notification(watch_uuid=watch_uuid, step_n=1)
+assert 'position 2' in item['notification_title']  # 输入1 → 显示2
+```
+→ 证明通知服务内部 `+1` 是设计意图，不是Bug。
 
-**代码证据链**：
+### 7.3 完整Bug证据链
+
 ```
 base.py:169: step_n = 0
-base.py:177: step_n += 1 → step_n = 1
+base.py:177: step_n += 1 → step_n = 1  ✓ 正确（1-based）
 base.py:199: raise BrowserStepsStepException(step_n=1, ...)
-worker.py:327: error_step = e.step_n + 1 → error_step = 2 ← Bug第一次加1
-worker.py:344: browser_steps_last_error_step = 2
-worker.py:354: send_step_failure_notification(step_n=1)
-notification_service.py:489: step = 1 + 1 → step = 2 ← Bug第二次加1
+↓
+worker.py:327: error_step = e.step_n + 1 → error_step = 2  ← Bug 1：多余+1
+worker.py:344: browser_steps_last_error_step = 2  ← 保存错误值
+↓
+worker.py:354: send_step_failure_notification(step_n=1)  ← Bug 2：应传0-based
+notification_service.py:489: step = 1 + 1 → step = 2  ← 设计意图，但输入错
 ```
 
-**影响评估**：
+### 7.4 影响评估
+
 | 影响点 | 严重程度 | 说明 |
 |--------|---------|------|
-| 前端高亮 | 中 | 用户在"步骤1"失败时看到"步骤2"被高亮，造成困惑 |
-| 通知内容 | 中 | 通知邮件中显示错误步骤号，用户需要手动减1 |
-| 截图命名 | 无 | screenshot_step使用的是base.py中的step_n（不加1），文件名为step_1.jpeg，是正确的 |
-
-**截图命名正确性验证**（base.py:179,194）：
-```python
-await self.screenshot_step("before-" + str(step_n))  # step_before-1.jpeg ✓
-await self.screenshot_step(step_n)                    # step_1.jpeg ✓
-```
-
-截图文件名使用的是正确的step_n，用户查看截图时不会有偏移问题。
+| 前端高亮错误 | 中 | `browser_steps_last_error_step=2` 导致步骤1失败时高亮步骤2 |
+| 通知序号偏移 | 中 | 通知邮件显示"position 2"，实际是步骤1失败 |
+| 截图判断错误 | 低 | 错误的截图类型判断（before/after），但文件名本身正确 |
+| 截图文件名 | 无 | `step_1.jpeg` 直接用 base.py 中的 step_n，正确 |
 
 ---
 
