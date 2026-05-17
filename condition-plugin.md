@@ -5,6 +5,8 @@
 ### 1.1 插件系统架构
 条件插件系统基于 [Pluggy](https://pluggy.readthedocs.io/) 框架实现，采用**钩子（Hook）驱动**的插件架构。核心文件位于 `changedetectionio/conditions/` 目录。
 
+项目依赖版本：`pluggy ~= 1.6`（`requirements.txt:147`）。
+
 ### 1.2 命名空间与接口定义
 - **命名空间**: `changedetectionio_conditions`（`pluggy_interface.py:8`）
 - **钩子规范类**: `ConditionsSpec`（`pluggy_interface.py:14-40`）
@@ -26,7 +28,7 @@
    ```python
    plugin_manager.register(default_plugin, "default_plugin")
    ```
-   - 显式注册，调用 `register()` 方法
+   - 显式注册，调用 `register()` 方法，插件存入 `_name2plugin` 字典
 
 2. **目录扫描加载** (`pluggy_interface.py:52-71`)：
    - 扫描 `changedetectionio/conditions/plugins/` 目录
@@ -81,7 +83,7 @@ for plugin in plugin_manager.get_plugins():
         field_choices.extend(new_field_choices)
 ```
 
-⚠️ **关键事实**：`plugin_manager.get_plugins()` 返回的是 **`set` 类型**（Pluggy 官方 API 定义），Python 的 `set` **不保证任何遍历顺序**。因此：
+⚠️ **关键事实**：`plugin_manager.get_plugins()` 返回的是 **`set` 类型**（Pluggy 1.6.0 官方 API 定义）。Python 的 `set` **不保证任何遍历顺序**，顺序取决于元素的哈希值和内部存储结构。因此：
 - `operator_choices` 和 `field_choices` 中选项的顺序是**不确定**的
 - 每次程序启动时，UI 下拉框中的选项顺序都可能不同
 - 这与注册顺序无关，完全取决于 set 的内部哈希遍历顺序
@@ -149,19 +151,22 @@ for plugin in plugin_manager.get_plugins():
 
 ### 3.5 插件遍历语义与确定性分析
 
-#### 3.5.1 Pluggy get_plugins() 的底层实现
-根据 Pluggy 官方 API 文档和源码：
+#### 3.5.1 Pluggy 1.6.0 get_plugins() 的底层实现
+根据 Pluggy 1.6.0 官方源码（`src/pluggy/_manager.py:268-270`）：
 ```python
-def get_plugins(self):
+def get_plugins(self) -> set[Any]:
     """Return a set of all registered plugin objects."""
-    return set(self._plugin2hookcallers)
+    return {x for x in self._name2plugin.values() if x is not None}
 ```
 
 **关键事实**：
-- 返回类型：**`set`**，不是 `list`
-- Python `set` 的特性：不保证元素顺序，遍历顺序取决于元素的哈希值和内部存储结构
-- `_plugin2hookcallers` 是 `dict` 类型，虽然 Python 3.7+ 的 dict 保持插入顺序，但转换为 set 后顺序丢失
+- 返回类型：**`set[Any]`**，不是 `list`
+- 实现方式：集合推导式，从 `_name2plugin.values()` 中过滤 `None` 值
+- `_name2plugin` 是 `dict[str, _Plugin]` 类型（Python 3.7+ 的 dict 保持插入顺序）
+- **但转换为 set 后，插入顺序完全丢失**，因为 Python set 是无序的
 - **"按注册顺序执行" 是错误表述**，实际遍历顺序是不确定的
+
+> **版本差异说明**：旧版本 pluggy 使用 `set(self._plugin2hookcallers)`，1.6.0 版本已重构为从 `_name2plugin` 推导，但返回 set 的语义保持不变。
 
 #### 3.5.2 数据合并机制（调用方负责）
 每个插件的 `add_data()` 返回的字典由调用方通过 `EXECUTE_DATA.update(new_data)` 合并：
@@ -292,7 +297,7 @@ except Exception as e:
 - **插件隔离**: 插件间通过明确的参数接口通信，避免隐式耦合
 
 ### 6.2 可改进点
-- **遍历顺序确定性**: 调用 `get_plugins()` 后应转换为排序列表，如 `sorted(plugin_manager.get_plugins(), key=lambda p: p.__name__)`，确保跨环境一致性
+- **遍历顺序确定性**: 调用 `get_plugins()` 后应转换为排序列表，如 `sorted(plugin_manager.get_plugins(), key=lambda p: getattr(p, '__name__', str(p)))`，确保跨环境一致性
 - **插件失败反馈**: 插件失败时应在 UI 上给出提示，而不是静默失败
 - **数据契约**: 应该定义插件返回数据的 schema，确保字段存在性和类型
 - **字段冲突检测**: 检测插件返回的同名字段冲突，给出警告或采用显式的命名空间机制
