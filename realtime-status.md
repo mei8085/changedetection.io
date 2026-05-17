@@ -282,6 +282,144 @@ def handle_connect():
     }, room=request.sid)  # 只发送给这个客户端
 ```
 
+### 5.4 操作闭环链路（Pause/Mute/Recheck/批量操作）
+
+从任一标签发起操作到所有标签同步更新的完整链路：
+
+#### 5.4.1 单个 Watch 操作（Pause/Mute/Recheck）
+
+**链路追踪**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  标签页A（操作发起端）                                          │
+│  1. 用户点击 pause/mute/recheck 按钮 (.ajax-op)                  │
+│  2. realtime.js:12-27 → socket.emit('watch_operation', data)    │
+│  3. 本地无立即更新，等待服务端回推                                │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼  WebSocket
+┌─────────────────────────────────────────────────────────────────┐
+│  Socket.IO 服务端 (realtime/events.py:9-60)                     │
+│  4. handle_watch_operation() 接收事件                            │
+│  5. 根据 op 执行不同操作：                                       │
+│     - pause/mute: watch.toggle_pause()/toggle_mute() → commit() │
+│     - recheck: worker_pool.queue_item_async_safe() 入队          │
+│  6. watch_check_update.send(watch_uuid=uuid) 发送信号             │
+│  7. emit('operation_result') 回执给发起端                         │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼  Blinker 信号
+┌─────────────────────────────────────────────────────────────────┐
+│  SignalHandler (socket_server.py:62-79)                         │
+│  8. handle_signal() 接收 watch_check_update 信号                 │
+│  9. 组装 watch_data（包含 paused/notification_muted/queued 等）  │
+│ 10. 计算 general_stats（count_errors, unread_changes_count）     │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼  Socket.IO 广播
+┌─────────────────────────────────────────────────────────────────┐
+│  所有连接的浏览器标签页（A/B/C...）                              │
+│ 11. realtime.js:216-243 → socket.on('watch_update')              │
+│ 12. 更新对应 tr 的 CSS 类（paused/notification_muted/queued）    │
+│ 13. realtime.js:208-214 → socket.on('general_stats_update')      │
+│ 14. 更新未读计数和错误计数                                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码路径**：
+
+| 步骤 | 文件 | 位置 | 说明 |
+|------|------|------|------|
+| 2 | `realtime.js` | L12-27 | 发送 `watch_operation` 事件 |
+| 4-6 | `events.py` | L9-60 | 处理操作、修改状态、发送信号 |
+| 5-pause | `Watch.py` | L1052-1053 | `toggle_pause()` 切换暂停状态 |
+| 5-mute | `Watch.py` | L1061-1062 | `toggle_mute()` 切换静音状态 |
+| 5-recheck | `queue_handlers.py` | L65-95 | `RecheckPriorityQueue.put()` 入队并发送 `queue_length` 信号 |
+| 8-10 | `socket_server.py` | L62-79, L139-196 | 接收信号、组装数据、广播给所有客户端 |
+
+#### 5.4.2 批量 Checkbox 操作
+
+**链路追踪**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  标签页A（操作发起端）                                          │
+│  1. 勾选多个 Watch，点击批量操作按钮                             │
+│  2. realtime.js:30-72 → socket.emit('checkbox-operation', data)  │
+│  3. 数据包含 op, uuids[], extra_data                             │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼  WebSocket
+┌─────────────────────────────────────────────────────────────────┐
+│  Socket.IO 服务端 (socket_server.py:274-305)                    │
+│  4. event_checkbox_operations() 接收事件                        │
+│  5. 启动后台线程执行：                                          │
+│     thread = threading.Thread(target=run_operation)              │
+│  6. 后台线程调用 _handle_operations()                            │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼  后台线程
+┌─────────────────────────────────────────────────────────────────┐
+│  _handle_operations() (blueprint/ui/__init__.py:13-117)         │
+│  7. 根据 op 批量执行操作：                                       │
+│     - pause/unpause: 设置 watch['paused'] → commit()            │
+│     - mute/unmute: 设置 watch['notification_muted'] → commit()  │
+│     - recheck: 批量入队 update_q                                 │
+│     - mark-viewed: datastore.set_last_viewed()                   │
+│     - clear-errors: 设置 last_error=False → commit()             │
+│     - clear-history: datastore.clear_watch_history()             │
+│     - delete: datastore.delete(uuid)                             │
+│  8. 循环所有 uuids: watch_check_update.send(watch_uuid=uuid)      │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼  Blinker 信号（多次，每个UUID一次）
+┌─────────────────────────────────────────────────────────────────┐
+│  SignalHandler → 广播 watch_update + general_stats_update       │
+│  所有标签页同步更新所有涉及的 Watch 状态                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**设计特点**：
+- **异步执行**：批量操作在后台线程中执行，不阻塞 Socket.IO 事件循环
+- **逐个信号**：每个 UUID 单独发送 `watch_check_update` 信号，确保每个标签页逐个更新
+- **操作原子性**：每个 Watch 的修改和 commit 是原子的，中间状态不会被广播
+
+#### 5.4.3 与未读计数、队列状态、历史记录页的联动
+
+**1. 未读计数联动 (`unread_changes_count`)**
+
+触发操作：`mark-viewed`（单个/批量/全部）
+- 操作执行：`datastore.set_last_viewed(uuid, timestamp)`
+- 状态变更：`watch['last_viewed']` 更新为当前时间戳
+- 信号触发：`watch_check_update` 信号发送
+- 服务端计算：`handle_watch_update()` 中重新计算 `datastore.unread_changes_count`
+- 前端更新：`general_stats_update` 事件 → `$('#unread-tab-counter').text(...)`
+
+**2. 队列状态联动 (`queue_size`)**
+
+触发操作：`recheck`（单个/批量）
+- 操作执行：`worker_pool.queue_item_async_safe(update_q, PrioritizedItem(...))`
+- 队列变更：`RecheckPriorityQueue.put()` → `_emit_put_signals()`
+- 信号触发：`queue_length` 信号发送
+- 服务端广播：`SignalHandler.handle_queue_length()` → `socketio.emit("queue_size", ...)`
+- 前端更新：`realtime.js:127-167` → 更新队列数字、切换 `has-queue` CSS 类
+
+**3. 历史记录页标记联动**
+
+触发操作：`clear-history`、访问 Diff 页面
+- `clear-history` 操作：`datastore.clear_watch_history(uuid)`
+  - 清空历史快照 → `history_n` 重置为 0
+  - `viewed` 状态变为 `True`（因为 `history_n < 2`）
+  - `has_unviewed` 变为 `False`
+  - 触发信号 → 所有标签页移除 `unviewed` 类
+
+- 访问 Diff 页面：
+  - 前端点击：`watch-overview.js:20-22` → 临时移除 `unviewed` 类（即时反馈）
+  - 后端处理：`diff.py:285,320` → `datastore.set_last_viewed(uuid, timestamp)`
+  - 持久化变更：`watch.commit()` 写入磁盘
+  - 信号触发：`watch_check_update` → 所有标签页同步状态
+
 ---
 
 ## 6. 与后台队列、历史记录页的关系
