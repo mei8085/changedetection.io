@@ -102,21 +102,40 @@ for plugin in plugin_manager.get_plugins():
 ### 3.2 执行流程详解
 
 ```
-1. 初始化 EXECUTE_DATA 字典
+1. 初始化 EXECUTE_DATA 字典（调用方局部变量）
 2. 获取 watch 对象和 conditions 配置
 3. 确定逻辑运算符（ALL → and, ANY → or）
 4. 过滤掉不完整的规则行
 5. 插件数据注入阶段（按注册顺序）：
    ├─ 为每个插件创建线程池执行器
-   ├─ 调用 plugin.add_data()，超时 10 秒
-   ├─ 合并返回的数据到 EXECUTE_DATA
+   ├─ 调用 plugin.add_data(current_watch_uuid, application_datastruct, ephemeral_data)，超时 10 秒
+   ├─ 若返回字典，调用方通过 EXECUTE_DATA.update() 合并数据
    └─ 插件异常被捕获并记录，但不中断流程
 6. 将规则转换为 JSON Logic 格式
-7. 使用 jsonLogic 评估规则
+7. 使用 jsonLogic 评估规则（传入 EXECUTE_DATA 作为数据上下文）
 8. 返回评估结果和执行时数据
 ```
 
-### 3.3 规则转换逻辑
+### 3.3 add_data 接口的输入输出契约
+根据 `__init__.py:108-113` 的调用代码，`add_data` 的输入参数严格限定为：
+
+| 参数名 | 类型 | 说明 | 是否必须 |
+|-------|------|------|---------|
+| `current_watch_uuid` | `str` | 当前监控的 UUID | 是 |
+| `application_datastruct` | `dict` | 完整的应用数据结构，包含所有 watch 配置和历史数据 | 是 |
+| `ephemeral_data` | `dict` | 临时数据，通常包含 `text` 字段（过滤后的页面文本） | 是 |
+
+**插件能看到的上下文仅限上述三个参数**。特别注意：
+- ❌ 插件**不能**访问 `EXECUTE_DATA`（这是调用方的局部变量）
+- ❌ 插件**不能**直接访问其他插件返回的数据
+- ❌ 插件之间是完全隔离的，无法感知彼此的存在
+
+插件的返回值：
+- 应返回一个 `dict`，键为字段名，值为字段值
+- 返回 `None` 或非字典类型会被忽略
+- 所有返回数据由调用方统一合并到 `EXECUTE_DATA`
+
+### 3.4 规则转换逻辑
 `convert_to_jsonlogic()` (`__init__.py:41-79`) 将结构化规则转换为 JSON Logic 格式：
 
 - **标准二元运算符** (`>`, `<`, `==` 等): `{operator: [{"var": field}, value]}`
@@ -124,9 +143,9 @@ for plugin in plugin_manager.get_plugins():
 - **一元运算符** (`!`, `!!`, `-`): `{operator: [{"var": field}]}`
 - **多参数运算符** (`min`, `max`, `cat`): `{operator: value}`
 
-### 3.4 插件执行顺序与确定性分析
+### 3.5 插件执行顺序与确定性分析
 
-#### 3.4.1 实际执行顺序
+#### 3.5.1 实际执行顺序
 插件执行顺序由注册顺序决定，而注册顺序受以下因素影响：
 
 | 阶段 | 顺序确定性 | 说明 |
@@ -137,31 +156,33 @@ for plugin in plugin_manager.get_plugins():
 
 > **重要修正**：目录插件**不是按文件名排序**加载的。`os.listdir()` 的返回顺序由底层文件系统的目录项存储顺序决定，跨平台、跨环境、甚至同一环境文件增删后都可能发生变化。
 
-#### 3.4.2 数据合并机制
-每个插件的 `add_data()` 返回的字典通过 `EXECUTE_DATA.update(new_data)` 合并到全局上下文：
-- 如果不同插件返回**同名字段**，后执行的插件会覆盖先执行的
-- 后续插件可以通过 `EXECUTE_DATA` 访问前面插件注入的数据（但当前插件实现中未使用此能力）
+#### 3.5.2 数据合并机制（调用方负责）
+每个插件的 `add_data()` 返回的字典由调用方通过 `EXECUTE_DATA.update(new_data)` 合并：
+- 如果不同插件返回**同名字段**，后执行的插件数据会覆盖先执行的
+- 插件本身无法感知或控制这种覆盖行为
 
-#### 3.4.3 当前插件的数据依赖分析
-检查现有三个插件的 `add_data()` 实现，它们之间**没有数据依赖**：
+#### 3.5.3 当前插件的数据依赖分析
+检查现有三个插件的 `add_data()` 实现，它们之间**没有数据依赖**，输入全部来自函数参数：
 
 | 插件 | 输入来源 | 输出字段 | 是否依赖其他插件 |
 |-----|---------|---------|----------------|
 | `default_plugin` | `ephemeral_data['text']` | `extracted_number`, `page_filtered_text` | 无（仅依赖输入参数） |
-| `levenshtein_plugin` | `ephemeral_data['text']`, watch history | `levenshtein_ratio`, `levenshtein_similarity`, `levenshtein_distance` | 无（仅依赖输入参数） |
+| `levenshtein_plugin` | `ephemeral_data['text']`, `application_datastruct` 中的 watch history | `levenshtein_ratio`, `levenshtein_similarity`, `levenshtein_distance` | 无（仅依赖输入参数） |
 | `wordcount_plugin` | `ephemeral_data['text']` | `word_count` | 无（仅依赖输入参数） |
 
-由于所有插件的输入都来自函数参数（`ephemeral_data`, `application_datastruct`）而非 `EXECUTE_DATA`，且输出字段互不冲突，**当前执行顺序的不确定性不会影响条件判定结果**。
+由于所有插件的输入都来自函数参数（`ephemeral_data`, `application_datastruct`）而非其他插件的输出，且输出字段互不冲突，**当前执行顺序的不确定性不会影响条件判定结果**。
 
-#### 3.4.4 对条件判定稳定性的影响
+#### 3.5.4 对条件判定稳定性的影响
 
-| 影响方面 | 当前状态 | 潜在风险 |
-|---------|---------|---------|
-| 条件判定结果 | ✅ 稳定 | 字段名无冲突，无数据依赖 |
+| 影响方面 | 当前状态 | 说明 |
+|---------|---------|------|
+| 条件判定结果 | ✅ 稳定 | 字段名无冲突，插件无数据依赖 |
 | UI 下拉框选项顺序 | ❌ 可能变化 | `operator_choices` 和 `field_choices` 按注册顺序 `extend`，顺序变化会影响用户体验 |
-| 未来插件兼容性 | ⚠️ 需注意 | 如果新增插件依赖其他插件注入的数据，或出现同名字段覆盖，顺序不确定性将导致不稳定 |
+| 同名字段覆盖 | ⚠️ 理论风险 | 若不同插件返回同名字段，执行顺序决定最终值，但当前无此情况 |
 
-#### 3.4.5 执行顺序的可见影响
+> **架构事实**：由于插件间无法直接通信，"插件依赖其他插件注入的数据"这种模式在当前架构下**不可能实现**。任何数据依赖必须通过 `application_datastruct` 或 `ephemeral_data` 传递。
+
+#### 3.5.5 执行顺序的可见影响
 虽然条件判定结果稳定，但执行顺序在以下场景可见：
 1. **UI 表单选项顺序**：字段和运算符下拉框的选项顺序随插件注册顺序变化
 2. **`EXECUTE_DATA` 调试输出**：`verify-condition-single-rule` 接口返回的数据字段顺序可能变化
@@ -186,6 +207,8 @@ if rule_engine.evaluate_conditions(watch, self.datastore, stripped_text):
     blocked = True
 ```
 
+调用时传入的 `ephemeral_data` 为 `{'text': stripped_text}`，其中 `stripped_text` 是经过所有过滤和转换后的最终文本。
+
 ### 4.2 与其他阻塞规则的关系
 条件评估是三大阻塞规则之一，执行顺序为：
 
@@ -207,7 +230,7 @@ if rule_engine.evaluate_conditions(watch, self.datastore, stripped_text):
 - 接收表单数据和规则 JSON
 - 使用 `prepare_filter_prevew` 应用当前表单的过滤设置
 - 创建临时 watch 对象执行条件评估
-- 返回评估结果和执行时数据供调试
+- 返回评估结果和 `EXECUTE_DATA` 供调试
 
 ## 5. 插件失败对整条流水线的影响
 
@@ -241,9 +264,8 @@ except Exception as e:
 ### 5.4 关键风险点
 1. **静默失败**: 插件异常只记录日志不报错，可能导致规则因缺少数据而意外通过或不通过
 2. **缺少回退机制**: 如果插件提供的关键字段缺失，依赖该字段的规则会使用 `undefined` 进行比较，结果可能不符合预期
-3. **执行顺序不确定性**: 目录插件加载顺序依赖 `os.listdir()`，存在固有的不确定性（详见 3.4 节）
+3. **执行顺序不确定性**: 目录插件加载顺序依赖 `os.listdir()`，存在固有的不确定性（详见 3.5 节）
 4. **同名字段覆盖风险**: 插件返回同名字段时，后执行的会覆盖先执行的，而执行顺序不确定可能导致覆盖结果不可预测
-5. **潜在连锁反应**: 如果未来新增插件依赖前面插件注入的数据，前面插件失败会导致连锁反应
 
 ### 5.5 边界情况处理
 - 无配置条件: `execute_ruleset_against_all_plugins()` 直接返回 `result=True`
@@ -257,12 +279,12 @@ except Exception as e:
 - **容错性好**: 单个插件失败不影响整体流程
 - **实时验证**: 提供预览接口，用户可在配置时验证规则
 - **灵活的规则表达**: 基于 JSON Logic，支持复杂逻辑组合
+- **插件隔离**: 插件间通过明确的参数接口通信，避免隐式耦合
 
 ### 6.2 可改进点
 - **执行顺序确定性**: 目录插件加载应使用 `sorted(os.listdir())` 确保跨环境一致性，或支持插件显式声明优先级
 - **插件失败反馈**: 插件失败时应在 UI 上给出提示，而不是静默失败
 - **数据契约**: 应该定义插件返回数据的 schema，确保字段存在性和类型
-- **依赖管理**: 支持插件间显式声明依赖关系，确保执行顺序满足依赖要求
 - **字段冲突检测**: 检测插件返回的同名字段冲突，给出警告或采用显式的命名空间机制
 - **单元测试**: 为插件执行添加更全面的异常处理和测试
 
