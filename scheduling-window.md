@@ -406,7 +406,321 @@ def run(self):
 | 全局暂停 | 熔断 | 暂停时停止所有调度 |
 | Watch暂停 | 熔断 | 单个watch跳过 |
 
-## 9. 设计权衡与考量
+## 9. 手动重检与批量重检的时间窗约束行为
+
+### 9.1 四种重检路径对比
+
+系统存在四条独立的重检触发路径，它们对时间窗约束的处理方式存在本质差异：
+
+| 路径 | 触发方式 | 时间窗检查 | 优先级 | 代码位置 |
+|------|----------|-----------|--------|----------|
+| 自动调度 | Ticker线程每秒循环 | ✅ 强制执行 | Unix时间戳 | `flask_app.py:1190-1268` |
+| 手动单个重检 | UI点击"Check Now"按钮 | ❌ 跳过 | 1 | `ui/__init__.py:263-277` |
+| 批量重检 | 多选后批量操作 | ❌ 跳过 | 1 | `ui/__init__.py:62-68` |
+| 保存后自动重检 | 编辑watch后保存 | ✅ 强制执行 | 1 | `ui/edit.py:264-277` |
+
+### 9.2 自动调度路径
+
+**严格受时间窗约束**：
+```python
+# flask_app.py:1201-1213
+if time_schedule_limit and time_schedule_limit.get('enabled'):
+    try:
+        result = is_within_schedule(time_schedule_limit=time_schedule_limit,
+                                    default_tz=tz_name)
+        if not result:
+            logger.trace(f"{uuid} Time scheduler - not within schedule skipping.")
+            continue  # 不在窗口内，直接跳过
+    except Exception as e:
+        logger.error(f"{uuid} - Recheck scheduler error - {str(e)}")
+        return False
+```
+
+**行为特征**：
+- 不在时间窗口内的watch会被静默跳过
+- 每秒循环，等待下一轮检查
+- 优先级使用当前Unix时间戳（正常调度优先级）
+
+### 9.3 手动单个重检路径
+
+**完全绕过时间窗约束**：
+```python
+# ui/__init__.py:271-277
+if uuid:
+    if worker_pool.is_watch_running(uuid) or uuid in update_q.get_queued_uuids():
+        flash(gettext("Watch is already queued or being checked."))
+    else:
+        # 直接入队，无时间窗检查
+        worker_pool.queue_item_async_safe(
+            update_q, 
+            queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid})
+        )
+```
+
+**行为特征**：
+- 只检查是否已在运行或队列中，不检查时间窗口
+- 优先级=1（最高优先级，插队执行）
+- Socket.IO实时事件也使用相同逻辑（`realtime/events.py:44`）
+
+### 9.4 批量重检路径
+
+**完全绕过时间窗约束**：
+```python
+# ui/__init__.py:62-68
+elif (op == 'recheck'):
+    for uuid in uuids:
+        if datastore.data['watching'].get(uuid):
+            # 直接入队，无时间窗检查
+            worker_pool.queue_item_async_safe(
+                update_q, 
+                queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid})
+            )
+```
+
+**批量重检的特殊逻辑**：
+- <20个watch：同步入队，立即反馈
+- ≥20个watch：后台线程入队，避免阻塞HTTP响应
+- 所有watch统一使用优先级=1
+- 无时间窗检查，即使watch配置了时间窗也会执行
+
+### 9.5 保存后自动重检路径
+
+**严格受时间窗约束**：
+```python
+# ui/edit.py:264-277
+if time_schedule_limit and time_schedule_limit.get('enabled'):
+    try:
+        is_in_schedule = is_within_schedule(time_schedule_limit=time_schedule_limit,
+                                          default_tz=tz_name)
+    except Exception as e:
+        logger.error(f"{uuid} - Recheck scheduler error - {str(e)}")
+        return False
+
+if not datastore.data['watching'][uuid].get('paused') and is_in_schedule:
+    # 只有在时间窗口内才入队
+    worker_pool.queue_item_async_safe(
+        update_q, 
+        queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid})
+    )
+```
+
+**行为特征**：
+- 保存修改后，如果watch未暂停且在时间窗口内，才会触发重检
+- 优先级=1（立即执行）
+- 这是唯一一条既使用高优先级又遵守时间窗约束的路径
+
+### 9.6 设计意图与风险
+
+**设计意图**：
+- 手动操作反映用户明确意图，应优先执行
+- 自动调度应严格遵守业务时间约束
+- 保存后重检既想立即验证修改，又不想违反时间窗策略
+
+**潜在风险**：
+- 批量重检可能在非工作时间触发大量请求
+- 用户可能误以为时间窗对所有操作生效
+- 优先级=1的任务会插队，可能影响正常调度队列
+
+## 10. 时间窗解析异常的退化路径
+
+### 10.1 异常类型与触发场景
+
+时间窗解析可能在以下环节失败：
+
+| 异常类型 | 触发场景 | 抛出位置 |
+|---------|---------|----------|
+| 无效星期几 | `day_of_week='Funday'` | `time_handler.py:38` |
+| 无效时间格式 | `time_str='25:99'` 或非数字 | `time_handler.py:46` |
+| 无效时区 | `timezone_str='Invalid/Zone'` | `time_handler.py:53` |
+| 配置结构损坏 | 缺少 `enabled`/`start_time`/`duration` | `time_handler.py:94-114` |
+| 字段类型错误 | `duration.hours` 为字符串而非数字 | `time_handler.py:107` |
+
+### 10.2 Ticker线程中的退化路径
+
+**位置**：`flask_app.py:1210-1213`
+
+```python
+try:
+    result = is_within_schedule(time_schedule_limit=time_schedule_limit,
+                                default_tz=tz_name)
+    if not result:
+        logger.trace(f"{uuid} Time scheduler - not within schedule skipping.")
+        continue
+except Exception as e:
+    logger.error(
+        f"{uuid} - Recheck scheduler, error handling timezone, check skipped - TZ name '{tz_name}' - {str(e)}")
+    return False  # ⚠️ 整个线程退出！
+```
+
+**关键发现**：单个watch的时间窗配置错误会导致**整个ticker线程返回退出**，而不是跳过该watch继续处理其他watch。
+
+**影响评估**：
+- ❌ **全局编排停止**：ticker线程退出后，不再有新的watch被自动调度
+- ❌ **无自动恢复**：线程退出后不会自动重启，需等待下一轮健康检查或服务重启
+- ⚠️ **Worker继续运行**：已入队的任务会继续执行，但不会有新任务入队
+- ⚠️ **手动重检仍可用**：API/UI触发的重检不受影响
+
+### 10.3 编辑保存路径中的退化路径
+
+**位置**：`ui/edit.py:269-272`
+
+```python
+try:
+    is_in_schedule = is_within_schedule(time_schedule_limit=time_schedule_limit,
+                                      default_tz=tz_name)
+except Exception as e:
+    logger.error(
+        f"{uuid} - Recheck scheduler, error handling timezone, check skipped - TZ name '{tz_name}' - {str(e)}")
+    return False  # 保存失败
+```
+
+**影响评估**：
+- ✅ **仅影响单个watch**：保存操作失败，用户可看到错误（如果有UI反馈）
+- ✅ **不影响全局**：其他watch的调度不受影响
+- ⚠️ **错误信息**：仅记录日志，前端可能无明确错误提示
+
+### 10.4 退化路径的设计缺陷
+
+**问题1：异常粒度太粗**
+```python
+# 当前：捕获所有异常并退出整个线程
+except Exception as e:
+    return False
+
+# 建议：仅跳过有问题的watch，继续处理其他
+except Exception as e:
+    logger.error(f"{uuid} schedule error: {e}")
+    continue  # 跳过这个watch，继续下一个
+```
+
+**问题2：无降级策略**
+- 配置损坏时，没有"保守跳过"或"使用默认配置"的降级选项
+- 错误配置的watch会导致所有watch都无法被调度
+
+**问题3：无监控告警**
+- 仅依赖日志，没有主动告警机制
+- 服务可能静默停止调度数小时而不被发现
+
+## 11. 夏令时切换边界的证据链
+
+### 11.1 技术依赖链
+
+夏令时处理的正确性依赖以下三层：
+
+```
+应用代码 (changedetection.io)
+    ↓ 调用 arrow.now(timezone_str)
+Arrow 库 (python)
+    ↓ 依赖系统时区数据库
+pytz / zoneinfo 时区信息
+    ↓ 基于
+IANA 时区数据库 (tzdb)
+```
+
+**关键证据**：
+```python
+# time_handler.py:50-53
+try:
+    now_tz = arrow.now(timezone_str.strip())
+except Exception as e:
+    raise ValueError(f"Invalid timezone_str: '{timezone_str}'")
+```
+
+系统使用 `arrow.now(timezone_str)` 获取指定时区的当前时间，Arrow库会：
+1. 查找时区数据库中的规则定义
+2. 应用该时区在当前日期的UTC偏移量
+3. 考虑夏令时（DST）规则
+
+### 11.2 现有测试覆盖分析
+
+**测试文件**：`tests/unit/test_time_handler.py`
+
+**已覆盖的场景**：
+| 测试用例 | 覆盖内容 | 行号 |
+|---------|---------|------|
+| `test_timezone_pacific_within_schedule` | US/Pacific时区 | 55-70 |
+| `test_timezone_tokyo_within_schedule` | Asia/Tokyo时区 | 72-87 |
+| `test_schedule_different_timezones` | Asia/Tokyo时区 | 553-572 |
+| `test_schedule_with_timezone_whitespace` | 时区字符串空白处理 | 594-600 |
+| `test_invalid_timezone` | 无效时区异常 | 144-153 |
+
+**未覆盖的夏令时场景**：
+- ❌ DST开始日（春季向前调1小时）的边界处理
+- ❌ DST结束日（秋季向后调1小时）的边界处理
+- ❌ 不存在的时间（如 2:30 AM 在DST开始日）
+- ❌ 重复的时间（如 1:30 AM 在DST结束日出现两次）
+- ❌ 跨DST切换日的24小时时间窗
+- ❌ 跨DST切换日的午夜跨天窗口
+
+### 11.3 DST切换的潜在问题
+
+**场景1：DST开始日（缺失1小时）**
+
+以美国东部时区为例：
+- 2024年3月10日 2:00 AM → 3:00 AM（跳过1小时）
+- 时间窗配置为 1:30 AM - 3:30 AM（120分钟）
+
+**问题**：
+- 实际可执行时间只有 1:30-2:00（30分钟）和 3:00-3:30（30分钟）
+- 中间 2:00-3:00 的时间不存在
+- `arrow.now()` 在这个时间段会返回 3:00 AM 及之后的时间
+- 时间判断逻辑是否能正确处理？
+
+**场景2：DST结束日（重复1小时）**
+
+- 2024年11月3日 2:00 AM → 1:00 AM（重复1小时）
+- 1:30 AM 会出现两次
+
+**问题**：
+- `arrow.now()` 在第一次 1:30 AM 返回的 UTC 偏移是 EDT（UTC-4）
+- 第二次 1:30 AM 返回的 UTC 偏移是 EST（UTC-5）
+- 时间判断逻辑使用本地时间比较，可能导致误判
+
+### 11.4 代码层面的风险点
+
+**位置**：`time_handler.py:58`
+
+```python
+start_datetime_tz = now_tz.replace(hour=hour, minute=minute, second=0, microsecond=0)
+```
+
+**风险**：`replace()` 方法在DST切换日可能创建不存在的时间点。Arrow库的行为是：
+- 如果替换后的时间在DST切换的"间隙"中（不存在），Arrow会自动调整到有效的时间点
+- 具体行为取决于Arrow版本和底层时区库
+
+**位置**：`time_handler.py:61-78`
+
+```python
+# 跨天判断逻辑
+if target_weekday == (current_weekday - 1) % 7:
+    # 前一天重叠
+elif target_weekday == current_weekday:
+    # 当天
+elif target_weekday == (current_weekday + 1) % 7:
+    # 次日重叠
+```
+
+**风险**：DST切换日的本地时间长度不是24小时：
+- DST开始日：本地时间只有23小时
+- DST结束日：本地时间有25小时
+- 基于 `% 7` 的星期计算可能在边界产生偏移
+
+### 11.5 结论可信度评估
+
+| 维度 | 可信度 | 说明 |
+|-----|--------|------|
+| 常规时区转换 | 高 | IANA数据库 + Arrow库经过广泛验证 |
+| DST开始日边界 | 中 | 无专项测试，依赖Arrow库的隐式处理 |
+| DST结束日边界 | 中 | 无专项测试，依赖Arrow库的隐式处理 |
+| 跨DST切换日窗口 | 低 | 未测试，逻辑可能存在盲区 |
+| 极端边界（午夜+DST） | 低 | 未测试，双重边界叠加风险高 |
+
+**建议**：
+1. 增加DST切换日的专项单元测试
+2. 考虑在DST切换日前后各1小时内增加日志
+3. 对关键业务场景，避免在DST切换日配置时间窗口
+
+## 12. 设计权衡与考量
 
 ### 9.1 优点
 
