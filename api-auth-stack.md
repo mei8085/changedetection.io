@@ -475,26 +475,34 @@ Flask 路由匹配
 
 ### 8.2 请求方法 × 开关状态 × 装饰器进入顺序 × 结果矩阵
 
-以下矩阵以标准接口（Watch/Tags）为例，Import/Spec 接口的差异在备注中说明：
+> **边界说明**：Flask-RESTful 的 Resource 继承自 MethodView，当请求使用资源类未定义的 HTTP 方法时，框架会在 `dispatch_request` 层直接返回 `405 Method Not Allowed`，**不会进入资源方法**，因此也不会触发方法级装饰器（如 `@check_token`、`@validate_openapi_request` 等）。全局装饰器（如 `csrf.exempt`）是否执行取决于 Flask-RESTful 内部实现。
 
-| 接口类 | api_access_token_enabled | 请求方法 | 进入装饰器顺序 | 可能的拦截点 | 可能返回结果 | 备注 |
-|--------|--------------------------|----------|----------------|--------------|--------------|------|
-| **Watch/Tags** | ✅ 开启 | **GET** | 1. csrf.exempt<br>2. check_token<br>3. validate_openapi_request（跳过）<br>4. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• 无其他拦截点 | • 403（密钥错误）<br>• 200（成功）<br>• 404（资源不存在） | GET 请求跳过 OpenAPI 验证 |
-| **Watch/Tags** | ✅ 开启 | **非 GET**（POST/PUT/DELETE） | 1. csrf.exempt<br>2. check_token<br>3. validate_openapi_request<br>4. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• validate_openapi_request：schema 无效 → 400 | • 403（密钥错误）<br>• 400（请求体无效）<br>• 200/201（成功）<br>• 404（资源不存在） | 非 GET 请求执行完整验证 |
-| **Watch/Tags** | ❌ 关闭 | **GET** | 1. csrf.exempt<br>2. check_token（跳过）<br>3. validate_openapi_request（跳过）<br>4. 原函数 | 无拦截点（check_token 和 validate 都跳过） | • 200（成功）<br>• 404（资源不存在） | 完全无保护，匿名可访问 |
-| **Watch/Tags** | ❌ 关闭 | **非 GET**（POST/PUT/DELETE） | 1. csrf.exempt<br>2. check_token（跳过）<br>3. validate_openapi_request<br>4. 原函数 | • validate_openapi_request：schema 无效 → 400 | • 400（请求体无效）<br>• 200/201（成功）<br>• 404（资源不存在） | 无认证，但仍有格式验证 |
-| **Import** | ✅ 开启 | **POST**（仅支持 POST） | 1. csrf.exempt<br>2. check_token<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• validate_openapi_request：schema 无效 → 400 | • 403（密钥错误）<br>• 400（请求体无效）<br>• 200（成功） | default_content_type 必须在 validate 之前 |
-| **Import** | ❌ 关闭 | **POST**（仅支持 POST） | 1. csrf.exempt<br>2. check_token（跳过）<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | • validate_openapi_request：schema 无效 → 400 | • 400（请求体无效）<br>• 200（成功） | 无认证，但仍有格式验证 |
-| **Spec** | ✅ 开启 | **GET**（仅支持 GET） | 1. csrf.exempt<br>2. 原函数（无装饰器） | 无拦截点（Spec 无 check_token） | • 200（成功） | Spec 接口无任何装饰器，始终公开 |
-| **Spec** | ❌ 关闭 | **GET**（仅支持 GET） | 1. csrf.exempt<br>2. 原函数（无装饰器） | 无拦截点 | • 200（成功） | 与开关开启时行为完全相同 |
+以下矩阵覆盖四类接口的支持方法与非支持方法：
+
+| 接口类 | api_access_token_enabled | 请求方法 | 方法支持状态 | 进入装饰器顺序 | 可能的拦截点 | 可能返回结果 | 备注 |
+|--------|--------------------------|----------|--------------|----------------|--------------|--------------|------|
+| **Watch/Tags** | ✅ 开启 | **GET** | ✅ 支持 | 1. csrf.exempt<br>2. check_token<br>3. validate_openapi_request（跳过）<br>4. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• 无其他拦截点 | • 403（密钥错误）<br>• 200（成功）<br>• 404（资源不存在） | GET 请求跳过 OpenAPI 验证 |
+| **Watch/Tags** | ✅ 开启 | **非 GET**（POST/PUT/DELETE） | ✅ 支持 | 1. csrf.exempt<br>2. check_token<br>3. validate_openapi_request<br>4. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• validate_openapi_request：schema 无效 → 400 | • 403（密钥错误）<br>• 400（请求体无效）<br>• 200/201（成功）<br>• 404（资源不存在） | 非 GET 请求执行完整验证 |
+| **Watch/Tags** | ❌ 关闭 | **GET** | ✅ 支持 | 1. csrf.exempt<br>2. check_token（跳过）<br>3. validate_openapi_request（跳过）<br>4. 原函数 | 无拦截点（check_token 和 validate 都跳过） | • 200（成功）<br>• 404（资源不存在） | 完全无保护，匿名可访问 |
+| **Watch/Tags** | ❌ 关闭 | **非 GET**（POST/PUT/DELETE） | ✅ 支持 | 1. csrf.exempt<br>2. check_token（跳过）<br>3. validate_openapi_request<br>4. 原函数 | • validate_openapi_request：schema 无效 → 400 | • 400（请求体无效）<br>• 200/201（成功）<br>• 404（资源不存在） | 无认证，但仍有格式验证 |
+| **Import** | ✅ 开启 | **POST** | ✅ 支持 | 1. csrf.exempt<br>2. check_token<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• validate_openapi_request：schema 无效 → 400 | • 403（密钥错误）<br>• 400（请求体无效）<br>• 200（成功） | default_content_type 必须在 validate 之前 |
+| **Import** | ✅ 开启 | **GET/PUT/DELETE** | ❌ 不支持 | 1. csrf.exempt（可能执行）<br>2. 框架层拦截 | 框架层：方法未定义 → 405 | • 405 Method Not Allowed | 资源类仅定义了 post() 方法，框架层直接拦截 |
+| **Import** | ❌ 关闭 | **POST** | ✅ 支持 | 1. csrf.exempt<br>2. check_token（跳过）<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | • validate_openapi_request：schema 无效 → 400 | • 400（请求体无效）<br>• 200（成功） | 无认证，但仍有格式验证 |
+| **Import** | ❌ 关闭 | **GET/PUT/DELETE** | ❌ 不支持 | 1. csrf.exempt（可能执行）<br>2. 框架层拦截 | 框架层：方法未定义 → 405 | • 405 Method Not Allowed | 与开关状态无关，框架层直接返回 |
+| **Spec** | ✅ 开启 | **GET** | ✅ 支持 | 1. csrf.exempt<br>2. 原函数（无装饰器） | 无拦截点（Spec 无 check_token） | • 200（成功） | Spec 接口无任何装饰器，始终公开 |
+| **Spec** | ✅ 开启 | **POST/PUT/DELETE** | ❌ 不支持 | 1. csrf.exempt（可能执行）<br>2. 框架层拦截 | 框架层：方法未定义 → 405 | • 405 Method Not Allowed | 资源类仅定义了 get() 方法，框架层直接拦截 |
+| **Spec** | ❌ 关闭 | **GET** | ✅ 支持 | 1. csrf.exempt<br>2. 原函数（无装饰器） | 无拦截点 | • 200（成功） | 与开关开启时行为完全相同 |
+| **Spec** | ❌ 关闭 | **POST/PUT/DELETE** | ❌ 不支持 | 1. csrf.exempt（可能执行）<br>2. 框架层拦截 | 框架层：方法未定义 → 405 | • 405 Method Not Allowed | 与开关状态无关，框架层直接返回 |
 
 ### 8.3 关键观察
 
 1. **Spec 接口是例外**：无论开关状态如何，都无认证保护（设计为公开元数据）
-2. **Import 接口仅支持 POST**：无 GET 场景
-3. **开关关闭时 GET 请求完全无保护**：认证和验证都跳过
-4. **开关关闭时非 GET 请求仍有格式验证**：但无认证保护
-5. **default_content_type 始终执行**：不受开关影响（不是条件装饰器）
+2. **非支持方法在框架层拦截**：Import 的 GET/PUT/DELETE、Spec 的 POST/PUT/DELETE 不会进入资源方法，直接返回 405
+3. **非支持方法不受开关影响**：405 响应与 `api_access_token_enabled` 开关状态无关
+4. **非支持方法不触发方法级装饰器**：`check_token`、`validate_openapi_request` 等方法装饰器不会执行
+5. **开关关闭时 GET 请求完全无保护**：认证和验证都跳过
+6. **开关关闭时非 GET 请求仍有格式验证**：但无认证保护
+7. **default_content_type 始终执行**：仅在 Import POST 支持方法场景，不受开关影响
 
 ---
 
@@ -555,11 +563,11 @@ def get(self, uuid):
 | **认证 → 验证**（当前） | 攻击面小，未认证请求无法触发复杂验证 | 认证失败快速返回，节省验证资源 | ✅ 大多数场景 |
 | 验证 → 认证 | 攻击面大，未认证请求可触发验证逻辑 | 验证失败也快速返回，但验证本身消耗资源 | ❌ 不推荐 |
 
-### 9.2 不同接口顺序差异的影响
+### 10.2 不同接口顺序差异的影响
 
 1. **Watch/Tags 标准接口**：
    - 顺序：csrf → auth → validate
-   - 影响：安全合理，认证优先
+   - 影响：安全合理（开关开启时），认证优先
 
 2. **Import 接口**：
    - 顺序：csrf → auth → default_content_type → validate
@@ -571,7 +579,7 @@ def get(self, uuid):
    - 影响：无认证，公开访问
    - 设计必要性：OpenAPI 规范是公开文档，不含敏感信息
 
-### 9.3 与历史漏洞的对比
+### 10.3 与历史漏洞的对比
 
 项目中 `test_auth_decorator_order.py` 提到了 GHSA-jmrh-xmgh-x9j4 漏洞：
 
@@ -583,16 +591,16 @@ def get(self, uuid):
 
 ---
 
-## 10. 与会话/令牌鉴权方式的关系
+## 11. 与会话/令牌鉴权方式的关系
 
-### 10.1 双轨认证体系
+### 11.1 双轨认证体系
 
 | 层面 | 认证方式 | 适用范围 | 装饰器 | 状态 |
 |------|----------|----------|--------|------|
 | API 接口 | 静态令牌（x-api-key） | 自动化集成、脚本 | `check_token` | 无状态 |
 | Web UI | 会话 Cookie（Flask-Login） | 浏览器用户 | `login_optionally_required` | 有状态 |
 
-### 10.2 关键区别
+### 11.2 关键区别
 
 1. **无状态 vs 有状态**：
    - API 认证：无状态，每个请求携带密钥
@@ -612,9 +620,9 @@ def get(self, uuid):
 
 ---
 
-## 11. 缺失的安全层分析
+## 12. 缺失的安全层分析
 
-### 11.1 限流（Rate Limiting）
+### 12.1 限流（Rate Limiting）
 
 **现状**：项目中未发现 API 限流装饰器或中间件。
 
@@ -628,7 +636,7 @@ def get(self, uuid):
 - 对认证失败的请求实施更严格的限流
 - 限流装饰器应该放在 `check_token` 外层（最外层）
 
-### 11.2 权限校验（Authorization）
+### 12.2 权限校验（Authorization）
 
 **现状**：仅实现认证（Authentication），未实现细粒度权限校验。
 
@@ -644,18 +652,18 @@ def get(self, uuid):
 
 ---
 
-## 12. 安全最佳实践遵循情况
+## 13. 安全最佳实践遵循情况
 
-### 12.1 已遵循的最佳实践
+### 13.1 已遵循的最佳实践
 
-1. ✅ **认证优先**：认证装饰器在外层，未认证请求快速拦截
-2. ✅ **认证失败返回通用错误信息**：不区分"密钥不存在"和"密钥错误"
-3. ✅ **API 密钥在请求头中传输**：避免 URL 泄露
+1. ✅ **认证优先（开关开启时）**：认证装饰器在外层，未认证请求快速拦截
+2. ✅ **认证失败返回通用错误信息（开关开启时）**：不区分"密钥不存在"和"密钥错误"
+3. ✅ **API 密钥在请求头中传输（开关开启时）**：避免 URL 泄露
 4. ✅ **CSRF 保护正确豁免**：API 使用密钥认证而非 Cookie
 5. ✅ **装饰器顺序测试**：`test_auth_decorator_order.py` 静态验证 UI 路由装饰器顺序
 6. ✅ **最小权限**：Spec 接口无认证，仅暴露公开元数据
 
-### 12.2 可改进的方面
+### 13.2 可改进的方面
 
 1. ⚠️ **缺少速率限制**：应添加 API 调用频率限制（放在 auth 外层）
 2. ⚠️ **静态密钥无过期**：应支持密钥轮换和过期
@@ -665,29 +673,31 @@ def get(self, uuid):
 
 ---
 
-## 13. 总结
+## 14. 总结
 
-### 13.1 装饰器栈总结（真实执行顺序）
+### 14.1 装饰器栈总结（真实执行顺序）
 
 | 层级 | 装饰器 | 职责 | 执行时机 | 失败返回 |
 |------|--------|------|----------|----------|
 | 1（最外层） | `csrf.exempt` | 全局 CSRF 豁免 | 第1 | - |
-| 2 | `auth.check_token` | API 密钥认证 | 第2 | 403 Forbidden |
+| 2 | `auth.check_token` | API 密钥认证 | 第2 | 403 Forbidden（开关开启时） |
 | 3 | `default_content_type` | 设置默认 Content-Type | 第3（Import 专用） | - |
-| 4（最内层） | `validate_openapi_request` | 请求体 schema 验证 | 第4 | 400 Bad Request |
+| 4（最内层） | `validate_openapi_request` | 请求体 schema 验证 | 第4（非 GET 请求） | 400 Bad Request |
 | 5 | 原函数 | 业务逻辑 | 第5 | - |
 
-### 13.2 核心结论
+### 14.2 核心结论
 
 1. **声明顺序 ≠ 执行顺序**：Python 装饰器靠上的在外面、先进入
-2. **当前顺序合理**：认证优先，最小化攻击面，性能最优
+2. **当前顺序在开关开启时合理**：认证优先，最小化攻击面，性能最优（仅当 `api_access_token_enabled = True` 时成立）
 3. **顺序错误不导致绕过**：API 装饰器顺序错误只会影响性能和攻击面，不会绕过认证（与 UI 路由不同）
-4. **Import 特殊处理**：default_content_type 必须在 validate 之前
-5. **Spec 接口例外**：公开元数据无需认证保护
+4. **Import 特殊处理**：default_content_type 必须在 validate 之前（与开关状态无关）
+5. **Spec 接口例外**：公开元数据无需认证保护（与开关状态无关）
+6. **非支持方法在框架层拦截**：Import 的 GET/PUT/DELETE、Spec 的 POST/PUT/DELETE 直接返回 405，不触发方法级装饰器
+7. **开关关闭时 GET 请求完全无保护**：认证和验证都跳过，匿名可访问
 
-### 13.3 架构评价
+### 14.3 架构评价
 
-**优点**：
+**优点（开关开启时）**：
 - 分层清晰，职责单一
 - 认证与验证分离
 - 有静态测试防止 UI 装饰器顺序错误
@@ -695,15 +705,16 @@ def get(self, uuid):
 - 认证优先的安全设计
 
 **不足**：
-- 缺少限流机制
-- 权限模型过于简单
+- 缺少限流机制（与开关无关）
+- 权限模型过于简单（单用户设计）
 - 无密钥过期和轮换机制
 - 无审计日志
 - 缺少 API 装饰器顺序的静态检查
+- 开关关闭时存在安全隐患
 
 ---
 
-## 14. 参考文件
+## 15. 参考文件
 
 - 认证装饰器：`changedetectionio/api/auth.py`
 - UI 认证装饰器：`changedetectionio/auth_decorator.py`
