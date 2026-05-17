@@ -125,6 +125,18 @@ def get(self, uuid):
     """Get information about a single watch..."""
 ```
 
+**包装关系展开**：
+```python
+# 等价代码
+get = csrf_exempt(
+    auth.check_token(
+        validate_openapi_request('getWatch')(
+            original_get
+        )
+    )
+)
+```
+
 **真实执行顺序（从外到内）**：
 
 | 层级 | 装饰器 | 执行时机 | 职责 |
@@ -148,6 +160,20 @@ def post(self):
     """Import a list of watched URLs..."""
 ```
 
+**包装关系展开**：
+```python
+# 等价代码
+post = csrf_exempt(
+    auth.check_token(
+        default_content_type('text/plain')(
+            validate_openapi_request('importWatches')(
+                original_post
+            )
+        )
+    )
+)
+```
+
 **真实执行顺序**：
 
 | 层级 | 装饰器 | 执行时机 |
@@ -160,7 +186,44 @@ def post(self):
 
 ---
 
-### 3.4 Spec 接口（无装饰器）
+### 3.4 Tags 接口的装饰器栈
+
+以 `Tags.get` 为例，代码声明顺序：
+
+```python
+# Tags.py:199-201
+@auth.check_token           # 第1个声明（上）→ 外层，先进入
+@validate_openapi_request('listTags')  # 第2个声明（下）→ 内层，后进入
+def get(self):
+    """List tags/groups."""
+```
+
+**包装关系展开**：
+```python
+# 等价代码
+get = csrf_exempt(
+    auth.check_token(
+        validate_openapi_request('listTags')(
+            original_get
+        )
+    )
+)
+```
+
+**真实执行顺序**：
+
+| 层级 | 装饰器 | 执行时机 | 职责 |
+|------|--------|----------|------|
+| 1（最外层） | `csrf.exempt` | 第1执行 | 跳过 CSRF 检查 |
+| 2 | `auth.check_token` | 第2执行 | API 密钥认证 |
+| 3（最内层） | `validate_openapi_request` | 第3执行 | 请求体 schema 验证 |
+| 4 | 原函数 `get` | 第4执行 | 列出所有标签 |
+
+**说明**：Tags 接口与 Watch 接口采用完全相同的装饰器配置，属于标准 API 接口。
+
+---
+
+### 3.5 Spec 接口（无装饰器）
 
 `Spec.get` 没有任何装饰器：
 
@@ -171,13 +234,73 @@ class Spec(Resource):
         """Return the merged OpenAPI spec..."""
 ```
 
+**包装关系展开**：
+```python
+# 等价代码
+get = csrf_exempt(
+    original_get
+)
+```
+
 **执行顺序**：只有 `csrf.exempt` 全局装饰器，然后直接执行原函数。
 
 ---
 
-## 4. 各装饰器详细分析
+## 4. 四类接口装饰器三序对照表
 
-### 4.1 `csrf.exempt` - 全局 CSRF 豁免
+### 4.1 声明顺序/包装顺序/运行顺序对照表
+
+| 接口 | 源码声明顺序（从上到下） | 包装顺序（从外到内） | 运行顺序（先入→后入） | 备注 |
+|------|--------------------------|----------------------|----------------------|------|
+| **Watch.get** | `@auth.check_token`<br>`@validate_openapi_request('getWatch')` | `csrf_exempt` → `auth.check_token` → `validate_openapi_request` → 原函数 | 1. csrf_exempt<br>2. auth.check_token<br>3. validate_openapi_request<br>4. 原函数 | 标准配置 |
+| **Tags.get** | `@auth.check_token`<br>`@validate_openapi_request('listTags')` | `csrf_exempt` → `auth.check_token` → `validate_openapi_request` → 原函数 | 1. csrf_exempt<br>2. auth.check_token<br>3. validate_openapi_request<br>4. 原函数 | 与 Watch 相同 |
+| **Import.post** | `@auth.check_token`<br>`@default_content_type('text/plain')`<br>`@validate_openapi_request('importWatches')` | `csrf_exempt` → `auth.check_token` → `default_content_type` → `validate_openapi_request` → 原函数 | 1. csrf_exempt<br>2. auth.check_token<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | 额外 Content-Type 处理 |
+| **Spec.get** | 无装饰器 | `csrf_exempt` → 原函数 | 1. csrf_exempt<br>2. 原函数 | 公开元数据 |
+
+### 4.2 三序关系转换公式
+
+给定声明顺序（从上到下）：`@D1` `@D2` `@D3` `def func():`
+
+则：
+- **包装顺序**（从外到内）：`D1(D2(D3(func)))`
+- **运行顺序**（先入→后入）：`D1 wrapper` → `D2 wrapper` → `D3 wrapper` → `func`
+
+---
+
+## 5. 可复用三步复核清单
+
+看到任意接口的装饰器时，按以下三步快速判断真实执行顺序：
+
+### 第一步：识别全局装饰器
+- 查看 `flask_app.py` 中 `Api(app, decorators=[...])` 的配置
+- 本项目全局装饰器：`[csrf.exempt]`
+- **规则**：全局装饰器永远在最外层，最先执行
+
+### 第二步：识别方法级装饰器
+- 从上到下读取方法上的装饰器列表
+- **规则**：声明时靠上的装饰器 = 运行时外层 = 先进入
+- **快速验证**：用"洋葱模型"想象——外层装饰器是洋葱皮，先被剥开（进入），后被合上（退出）
+
+### 第三步：验证依赖关系
+- 检查装饰器之间是否有隐式依赖
+- 本项目已知依赖：
+  - `default_content_type` 必须在 `validate_openapi_request` 之前（Import 接口）
+  - 认证类装饰器通常在验证类装饰器外层（安全优先原则）
+- **规则**：如果 B 依赖 A 的输出，A 必须在 B 外层（先执行）
+
+**复核示例**（Import.post）：
+```
+第一步：全局装饰器 → csrf.exempt（最外层）
+第二步：方法装饰器从上到下 → auth.check_token → default_content_type → validate_openapi_request
+第三步：验证依赖 → default_content_type 必须在 validate 之前 ✓ 顺序正确
+最终顺序：csrf → auth → default → validate → 原函数 ✓
+```
+
+---
+
+## 6. 各装饰器详细分析
+
+### 6.1 `csrf.exempt` - 全局 CSRF 豁免
 
 **文件位置**：`flask_app.py:170`
 
@@ -190,7 +313,7 @@ class Spec(Resource):
 
 ---
 
-### 4.2 `check_token` - API 令牌认证
+### 6.2 `check_token` - API 令牌认证
 
 **文件位置**：`changedetectionio/api/auth.py:8-25`
 
@@ -224,7 +347,7 @@ def check_token(f):
 
 ---
 
-### 4.3 `default_content_type` - 默认 Content-Type 设置
+### 6.3 `default_content_type` - 默认 Content-Type 设置
 
 **文件位置**：`changedetectionio/api/Import.py:13-23`
 
@@ -236,7 +359,7 @@ def check_token(f):
 
 ---
 
-### 4.4 `validate_openapi_request` - OpenAPI 请求验证
+### 6.4 `validate_openapi_request` - OpenAPI 请求验证
 
 **文件位置**：`changedetectionio/api/__init__.py:173-224`
 
@@ -254,7 +377,7 @@ def check_token(f):
 
 ---
 
-### 4.5 `login_optionally_required` - Web UI 会话认证
+### 6.5 `login_optionally_required` - Web UI 会话认证
 
 **文件位置**：`changedetectionio/auth_decorator.py:16-42`
 
@@ -271,20 +394,9 @@ def check_token(f):
 
 ---
 
-## 5. 四类接口装饰器配置对比
+## 7. 装饰器依赖关系与执行流程
 
-| 接口类 | csrf.exempt | auth.check_token | default_content_type | validate_openapi_request | 备注 |
-|--------|-------------|------------------|----------------------|--------------------------|------|
-| Watch | ✓ | ✓ | ✗ | ✓ | 标准配置 |
-| Tags | ✓ | ✓ | ✗ | ✓ | 标准配置 |
-| Import | ✓ | ✓ | ✓ | ✓ | 额外 Content-Type 处理 |
-| Spec | ✓ | ✗ | ✗ | ✗ | 公开元数据，无需认证 |
-
----
-
-## 6. 装饰器依赖关系与执行流程
-
-### 6.1 标准 API 接口执行流程（以 Watch.get 为例）
+### 7.1 标准 API 接口执行流程（以 Watch.get 为例）
 
 ```
 HTTP 请求到达
@@ -310,7 +422,7 @@ Flask 路由匹配
 返回响应
 ```
 
-### 6.2 Import 接口执行流程
+### 7.2 Import 接口执行流程
 
 ```
 HTTP 请求到达
@@ -331,7 +443,7 @@ Flask 路由匹配
 返回响应
 ```
 
-### 6.3 Spec 接口执行流程
+### 7.3 Spec 接口执行流程
 
 ```
 HTTP 请求到达
@@ -347,9 +459,9 @@ Flask 路由匹配
 
 ---
 
-## 7. 为什么是这个顺序？设计合理性分析
+## 8. 为什么是这个顺序？设计合理性分析
 
-### 7.1 当前顺序的设计意图
+### 8.1 当前顺序的设计意图
 
 **`auth.check_token` 在外层（先执行）**：
 - ✅ **安全优先**：尽早拦截未认证请求，避免消耗后续验证资源
@@ -360,7 +472,7 @@ Flask 路由匹配
 - ✅ **认证后验证**：只对已认证的请求进行格式验证，节省资源
 - ⚠️ **潜在风险**：如果认证被绕过，恶意请求可能触发 schema 验证漏洞
 
-### 7.2 如果顺序颠倒会怎样？
+### 8.2 如果顺序颠倒会怎样？
 
 假设代码写成：
 ```python
@@ -386,16 +498,16 @@ def get(self, uuid):
 
 ---
 
-## 8. 顺序差异的安全与功能影响
+## 9. 顺序差异的安全与功能影响
 
-### 8.1 认证与验证顺序的安全权衡
+### 9.1 认证与验证顺序的安全权衡
 
 | 顺序 | 安全特性 | 性能特性 | 推荐场景 |
 |------|----------|----------|----------|
 | **认证 → 验证**（当前） | 攻击面小，未认证请求无法触发复杂验证 | 认证失败快速返回，节省验证资源 | ✅ 大多数场景 |
 | 验证 → 认证 | 攻击面大，未认证请求可触发验证逻辑 | 验证失败也快速返回，但验证本身消耗资源 | ❌ 不推荐 |
 
-### 8.2 不同接口顺序差异的影响
+### 9.2 不同接口顺序差异的影响
 
 1. **Watch/Tags 标准接口**：
    - 顺序：csrf → auth → validate
@@ -411,7 +523,7 @@ def get(self, uuid):
    - 影响：无认证，公开访问
    - 设计必要性：OpenAPI 规范是公开文档，不含敏感信息
 
-### 8.3 与历史漏洞的对比
+### 9.3 与历史漏洞的对比
 
 项目中 `test_auth_decorator_order.py` 提到了 GHSA-jmrh-xmgh-x9j4 漏洞：
 
@@ -423,16 +535,16 @@ def get(self, uuid):
 
 ---
 
-## 9. 与会话/令牌鉴权方式的关系
+## 10. 与会话/令牌鉴权方式的关系
 
-### 9.1 双轨认证体系
+### 10.1 双轨认证体系
 
 | 层面 | 认证方式 | 适用范围 | 装饰器 | 状态 |
 |------|----------|----------|--------|------|
 | API 接口 | 静态令牌（x-api-key） | 自动化集成、脚本 | `check_token` | 无状态 |
 | Web UI | 会话 Cookie（Flask-Login） | 浏览器用户 | `login_optionally_required` | 有状态 |
 
-### 9.2 关键区别
+### 10.2 关键区别
 
 1. **无状态 vs 有状态**：
    - API 认证：无状态，每个请求携带密钥
@@ -452,9 +564,9 @@ def get(self, uuid):
 
 ---
 
-## 10. 缺失的安全层分析
+## 11. 缺失的安全层分析
 
-### 10.1 限流（Rate Limiting）
+### 11.1 限流（Rate Limiting）
 
 **现状**：项目中未发现 API 限流装饰器或中间件。
 
@@ -468,7 +580,7 @@ def get(self, uuid):
 - 对认证失败的请求实施更严格的限流
 - 限流装饰器应该放在 `check_token` 外层（最外层）
 
-### 10.2 权限校验（Authorization）
+### 11.2 权限校验（Authorization）
 
 **现状**：仅实现认证（Authentication），未实现细粒度权限校验。
 
@@ -484,9 +596,9 @@ def get(self, uuid):
 
 ---
 
-## 11. 安全最佳实践遵循情况
+## 12. 安全最佳实践遵循情况
 
-### 11.1 已遵循的最佳实践
+### 12.1 已遵循的最佳实践
 
 1. ✅ **认证优先**：认证装饰器在外层，未认证请求快速拦截
 2. ✅ **认证失败返回通用错误信息**：不区分"密钥不存在"和"密钥错误"
@@ -495,7 +607,7 @@ def get(self, uuid):
 5. ✅ **装饰器顺序测试**：`test_auth_decorator_order.py` 静态验证 UI 路由装饰器顺序
 6. ✅ **最小权限**：Spec 接口无认证，仅暴露公开元数据
 
-### 11.2 可改进的方面
+### 12.2 可改进的方面
 
 1. ⚠️ **缺少速率限制**：应添加 API 调用频率限制（放在 auth 外层）
 2. ⚠️ **静态密钥无过期**：应支持密钥轮换和过期
@@ -505,9 +617,9 @@ def get(self, uuid):
 
 ---
 
-## 12. 总结
+## 13. 总结
 
-### 12.1 装饰器栈总结（真实执行顺序）
+### 13.1 装饰器栈总结（真实执行顺序）
 
 | 层级 | 装饰器 | 职责 | 执行时机 | 失败返回 |
 |------|--------|------|----------|----------|
@@ -517,7 +629,7 @@ def get(self, uuid):
 | 4（最内层） | `validate_openapi_request` | 请求体 schema 验证 | 第4 | 400 Bad Request |
 | 5 | 原函数 | 业务逻辑 | 第5 | - |
 
-### 12.2 核心结论
+### 13.2 核心结论
 
 1. **声明顺序 ≠ 执行顺序**：Python 装饰器靠上的在外面、先进入
 2. **当前顺序合理**：认证优先，最小化攻击面，性能最优
@@ -525,7 +637,7 @@ def get(self, uuid):
 4. **Import 特殊处理**：default_content_type 必须在 validate 之前
 5. **Spec 接口例外**：公开元数据无需认证保护
 
-### 12.3 架构评价
+### 13.3 架构评价
 
 **优点**：
 - 分层清晰，职责单一
@@ -543,7 +655,7 @@ def get(self, uuid):
 
 ---
 
-## 13. 参考文件
+## 14. 参考文件
 
 - 认证装饰器：`changedetectionio/api/auth.py`
 - UI 认证装饰器：`changedetectionio/auth_decorator.py`
