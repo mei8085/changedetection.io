@@ -15,7 +15,7 @@ changedetection.io 支持两种 JSON 选择器：
 
 ## 一、执行路径与风险拦截位置
 
-### 1.1 主执行流程图（修正版）
+### 1.1 主执行流程图（最终修正版）
 
 **入口函数：** `html_tools.py:523-564` - `extract_json_as_string()`
 
@@ -24,32 +24,37 @@ content (输入)
     │
     ▼
 判断是否以 { 或 [ 开头?
-    ├─ 是 → 尝试直接解析 JSON
-    │       ├─ 解析成功 → 调用 _parse_json()
-    │       │         ├─ 表达式合法 → ✅ 继续向下执行
+    ├─ 是 → 【 纯 JSON 路径 】
+    │       ├─ 尝试直接解析 JSON 并调用 _parse_json()
+    │       │         ├─ 表达式合法且匹配成功 → ✅ 返回匹配结果
+    │       │         ├─ 表达式合法但无匹配 → ✅ 返回空字符串 ''
     │       │         └─ 表达式非法 → ❌ 抛出异常（终止流程）
-    │       └─ 解析失败 → 记录警告，继续向下尝试其他路径
-    └─ 否 → 检查是否为 JSONP 格式
-              ├─ 是 JSONP → 提取内部 JSON
-              │         ├─ 解析成功 → 调用 _parse_json()
-              │         │         ├─ 表达式合法 → ✅ 继续向下执行
-              │         │         └─ 表达式非法 → ❌ 抛出异常（终止流程）
-              │         └─ 解析失败 → 记录警告，继续向下
-              └─ 不是 JSONP → 尝试从 HTML <script>/<body> 提取 JSON blob
+    │       └─ 解析失败 (JSONDecodeError) → ⚠️  记录警告，直接返回空字符串 ''
+    │                                   → ❗ 【 重要：不会继续尝试 JSONP 或 HTML 提取 】
+    └─ 否 → 【 非 JSON 路径 】
+              ├─ 检查是否为 JSONP 格式
+              │   ├─ 是 JSONP → 提取内部 JSON 并调用 _parse_json()
+              │   │         ├─ 表达式合法且匹配成功 → ✅ 返回匹配结果
+              │   │         ├─ 表达式合法但无匹配 → ✅ 继续向下
+              │   │         └─ 表达式非法 → ❌ 抛出异常（终止流程）
+              │   └─ JSONP 解析失败 → ⚠️ 记录警告，继续向下
+              └─ 不是 JSONP 或提取失败 → 尝试从 HTML <script>/<body> 提取 JSON blob
                             → 调用 extract_json_blob_from_html()
                                   ├─ 找到可解析 JSON → 调用 _parse_json()
-                                  │         ├─ 表达式合法 → ✅ 继续向下执行
+                                  │         ├─ 表达式合法 → ✅ 继续向下
                                   │         └─ 表达式非法 → ❌ 抛出异常（终止流程）
                                   └─ 未找到可解析 JSON → ❌ 抛出 JSONNotFound 异常
     │
     ▼
-【 重要：仅当表达式合法且成功执行到此处 】
-判断匹配结果是否为空?
+【 仅非 JSON 路径走到此处，纯 JSON 路径已提前返回 】
+判断 stripped_text_from_html 是否为空?
     ├─ 是 → 返回空字符串 ''
     └─ 否 → 返回匹配结果
 ```
 
-⚠️ **关键修正**：非法表达式不会走到"结果为空判断"分支，而是在 `_parse_json()` 中直接抛出异常并终止流程。
+⚠️ **关键修正 1**：非法表达式不会走到"结果为空判断"分支，而是在 `_parse_json()` 中直接抛出异常并终止流程。
+
+⚠️ **关键修正 2**：纯 JSON 路径解析失败时，记录警告后**直接返回空字符串**，**不会继续**尝试 JSONP 或 HTML 提取路径。这是一个与直觉不符的重要流程差异。
 
 🧪 **已有测试直接验证**：
 - JSONP 格式内容能被正确提取：`test_jsonp_json_filter_extraction`
@@ -205,7 +210,7 @@ except json.JSONDecodeError as e:
 ### 2.3 第三类：文档中无可解析的 JSON
 
 **触发场景：**
-- 输入内容既不是纯 JSON，也不是 JSONP，也无法从 HTML 的 `<script>` 或 `<body>` 中提取到可解析的 JSON
+- 输入内容不以 { 或 [ 开头，且既不是 JSONP，也无法从 HTML 的 `<script>` 或 `<body>` 中提取到可解析的 JSON
 - 例如：输入为完全乱码 `'COMPLETE GIBBERISH, NO JSON!'`
 
 **抛出位置：** `html_tools.py:490-491` - `extract_json_blob_from_html()`
@@ -218,8 +223,8 @@ if not bs_jsons:
 **抛出异常：** `JSONNotFound`（继承自 `ValueError`）
 
 **关键条件：**
-- 仅在通过 `extract_json_blob_from_html()` 路径时才可能抛出
-- 纯 JSON 或 JSONP 解析失败时，仅记录警告不抛出此异常
+- ❗ 仅在"非 JSON 路径"（不以 { 或 [ 开头）中通过 `extract_json_blob_from_html()` 时才可能抛出
+- 纯 JSON 路径（以 { 或 [ 开头）解析失败时，**仅记录警告，返回空字符串**，**永不抛出此异常**
 
 🧪 **已有测试直接验证**：
 - 乱码输入时，`json:`、`jq:`、`jqraw:` 三种选择器都抛出 `JSONNotFound`：`test_unittest_inline_html_extract` 第 113-121 行
@@ -235,7 +240,8 @@ if not bs_jsons:
 |------|---------|---------|---------|---------|
 | **合法无匹配** | 表达式语法正确，但 JSON 中没有匹配内容 | 返回空字符串 `''` | `_get_stripped_text_from_json_match()`:452-454 | 🔍 基于代码推导（Re #265 注释） |
 | **表达式非法** | JSONPath 语法错误、jq 语法错误、jq 危险表达式 | 抛出对应异常（**不被捕获，直接向上传播**） | `_parse_json()` 内部 | ⚠️ 异常传播路径未被测试直接覆盖 |
-| **无可解析 JSON** | 既不是纯 JSON，也不是 JSONP，也无法从 HTML 提取有效 JSON | 抛出 `JSONNotFound` | `extract_json_blob_from_html()`:490-491 | 🧪 已有测试直接验证 |
+| **无可解析 JSON（非 JSON 路径）** | 不以 {/[ 开头，且 JSONP 和 HTML 提取都失败 | 抛出 `JSONNotFound` | `extract_json_blob_from_html()`:490-491 | 🧪 已有测试直接验证 |
+| **纯 JSON 解析失败** | 以 {/[ 开头但 JSON 无效 | 记录警告，返回空字符串 `''`（**永不抛出 JSONNotFound**） | `extract_json_as_string()`:537-538 | ⚠️ 纯 JSON 路径特殊处理未被测试直接覆盖 |
 
 ---
 
@@ -368,12 +374,13 @@ safe = [
 | 安全表达式通过检查 | 8 种安全表达式不抛出异常 | 🧪 已有测试直接验证 | `test_safe_expressions_pass`，`test_jq_security.py` 第 46-65 行 |
 | 绕过开关 | `JQ_ALLOW_RISKY_EXPRESSIONS=true` 完全禁用所有检查 | 🧪 已有测试直接验证 | `test_allow_risky_env_var_bypasses_check`，`test_jq_security.py` 第 67-79 行 |
 | 默认状态 | 未设置环境变量时检查生效 | 🧪 已有测试直接验证 | `test_allow_risky_env_var_off_by_default`，`test_jq_security.py` 第 81-90 行 |
-| 无可解析 JSON | 乱码输入抛出 `JSONNotFound` | 🧪 已有测试直接验证 | `test_unittest_inline_html_extract`，`test_jsonpath_jq_selector.py` 第 113-121 行 |
+| 无可解析 JSON（非 JSON 路径） | 乱码输入抛出 `JSONNotFound` | 🧪 已有测试直接验证 | `test_unittest_inline_html_extract`，`test_jsonpath_jq_selector.py` 第 113-121 行 |
 | JSONP 提取 | 能从 JSONP 格式中提取 JSON 并过滤 | 🧪 已有测试直接验证 | `test_jsonp_json_filter_extraction`，`test_jsonpath_jq_selector.py` 第 42-61 行 |
 | 合法无匹配 | 返回空字符串 `''` | 🔍 基于代码推导 | 只有代码注释 Re #265，无对应测试用例 |
 | 异常传播路径 | 只有 `JSONDecodeError` 被捕获，其他异常直接向上抛出 | ⚠️ 未被现有测试直接覆盖 | 无测试用例验证完整调用链中的异常传播 |
 | jqraw 安全检查 | jqraw 前缀也经过 `validate_jq_expression()` | 🔍 基于代码推导 | 代码路径与 jq: 相同，但无专门测试断言 |
-| 纯 JSON 解析失败 | 仅记录警告，不抛出 `JSONNotFound` | 🔍 基于代码推导 | 只有代码 try-catch 逻辑，无专门测试用例 |
+| **纯 JSON 解析失败路径差异** | 以 {/[ 开头但 JSON 无效时，仅记录警告返回空字符串，**不会继续尝试** JSONP 或 HTML 提取，**永不抛出 JSONNotFound** | ⚠️ 未被现有测试直接覆盖 | 只有代码 if-else 分支逻辑，无测试验证此路径差异 |
+| 纯 JSON 解析失败行为 | 仅记录警告，不抛出 `JSONNotFound` | 🔍 基于代码推导 | 只有代码 try-catch 逻辑，无专门测试用例 |
 | JSONPath 安全性 | 无文件/环境/网络/进程访问能力 | 🔍 基于代码推导 | 基于 jsonpath_ng.ext 库特性，无专门测试 |
 | 拦截日志记录 | 拦截时记录 CRITICAL 级别日志 | 🔍 基于代码推导 | 代码中有 logger.critical 调用，但无测试验证日志输出 |
 
@@ -387,11 +394,13 @@ safe = [
 
 3. **不要启用绕过开关**：除非在完全隔离的环境中且完全理解风险，否则不要设置 `JQ_ALLOW_RISKY_EXPRESSIONS=true`
 
-4. **补充异常传播测试**：建议补充测试用例，验证非法表达式在 `extract_json_as_string()` 完整调用链中的行为
+4. **补充路径差异测试**：建议补充测试用例，验证"纯 JSON 解析失败"与"非 JSON 路径无可解析 JSON"的行为差异
 
-5. **考虑执行超时限制**：为 jq 表达式执行添加超时限制，防止 DoS 攻击
+5. **补充异常传播测试**：建议补充测试用例，验证非法表达式在 `extract_json_as_string()` 完整调用链中的行为
 
-6. **监控 jq 表达式审计**：对多用户环境中的 jq 表达式使用进行审计和告警
+6. **考虑执行超时限制**：为 jq 表达式执行添加超时限制，防止 DoS 攻击
+
+7. **监控 jq 表达式审计**：对多用户环境中的 jq 表达式使用进行审计和告警
 
 ---
 
