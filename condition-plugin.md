@@ -20,23 +20,26 @@
 | `ui_edit_stats_extras()` | 在编辑页面的统计标签页注入 HTML 内容 |
 
 ### 1.3 插件发现与加载流程
-插件加载在 `pluggy_interface.py` 中实现，分为三个阶段：
+插件加载在 `pluggy_interface.py` 中实现，分为三个阶段，按顺序执行：
 
 1. **内置插件注册** (`pluggy_interface.py:49`)：
    ```python
    plugin_manager.register(default_plugin, "default_plugin")
    ```
+   - 显式注册，顺序固定为第一个
 
 2. **目录扫描加载** (`pluggy_interface.py:52-71`)：
    - 扫描 `changedetectionio/conditions/plugins/` 目录
-   - 加载所有 `.py` 文件（排除 `__init__.py`）
-   - 动态导入并注册到插件管理器
+   - 使用 `os.listdir()` 遍历文件，**其返回顺序由文件系统决定，不保证排序**（非字母序、非时间序）
+   - 加载所有 `.py` 文件（排除 `__init__.py`），按遍历顺序动态导入并注册
+   - ⚠️ **关键注意**：`os.listdir()` 顺序在不同操作系统、不同文件系统、甚至同一系统文件增删后都可能变化
 
 3. **外部包发现** (`pluggy_interface.py:74`)：
    ```python
    plugin_manager.load_setuptools_entrypoints(PLUGIN_NAMESPACE)
    ```
    - 支持通过 setuptools entry points 安装的外部插件
+   - 顺序由 setuptools 的发现机制决定
 
 ### 1.4 现有插件列表
 - **default_plugin** (`default_plugin.py`): 提供基础运算符（`starts_with`, `ends_with`, `contains_regex` 等）和字段（`extracted_number`, `page_filtered_text`）
@@ -77,6 +80,8 @@ for plugin in plugin_manager.get_plugins():
     if isinstance(new_field_choices, list):
         field_choices.extend(new_field_choices)
 ```
+
+由于 `operator_choices` 和 `field_choices` 使用 `extend()` 按插件注册顺序追加，**UI 下拉框中的选项顺序会随插件加载顺序变化**。
 
 ### 2.3 表单验证逻辑
 `ConditionFormRow.validate()` (`form.py:25-45`) 实现了智能验证：
@@ -119,13 +124,48 @@ for plugin in plugin_manager.get_plugins():
 - **一元运算符** (`!`, `!!`, `-`): `{operator: [{"var": field}]}`
 - **多参数运算符** (`min`, `max`, `cat`): `{operator: value}`
 
-### 3.4 插件执行顺序
-插件按以下顺序执行（由注册顺序决定）：
-1. `default_plugin`（显式注册）
-2. 目录扫描插件（按文件名排序：levenshtein_plugin, wordcount_plugin）
-3. 外部包插件（按 setuptools 发现顺序）
+### 3.4 插件执行顺序与确定性分析
 
-每个插件的 `add_data()` 返回的字典会合并到 `EXECUTE_DATA` 中，后续插件可以访问前面插件注入的数据。
+#### 3.4.1 实际执行顺序
+插件执行顺序由注册顺序决定，而注册顺序受以下因素影响：
+
+| 阶段 | 顺序确定性 | 说明 |
+|-----|-----------|------|
+| 1. `default_plugin` | ✅ 完全确定 | 显式调用 `register()`，始终为第一个 |
+| 2. 目录扫描插件 | ❌ **不确定** | 由 `os.listdir()` 返回顺序决定，取决于文件系统 |
+| 3. 外部包插件 | ⚠️ 半确定 | 由 setuptools entry points 发现顺序决定 |
+
+> **重要修正**：目录插件**不是按文件名排序**加载的。`os.listdir()` 的返回顺序由底层文件系统的目录项存储顺序决定，跨平台、跨环境、甚至同一环境文件增删后都可能发生变化。
+
+#### 3.4.2 数据合并机制
+每个插件的 `add_data()` 返回的字典通过 `EXECUTE_DATA.update(new_data)` 合并到全局上下文：
+- 如果不同插件返回**同名字段**，后执行的插件会覆盖先执行的
+- 后续插件可以通过 `EXECUTE_DATA` 访问前面插件注入的数据（但当前插件实现中未使用此能力）
+
+#### 3.4.3 当前插件的数据依赖分析
+检查现有三个插件的 `add_data()` 实现，它们之间**没有数据依赖**：
+
+| 插件 | 输入来源 | 输出字段 | 是否依赖其他插件 |
+|-----|---------|---------|----------------|
+| `default_plugin` | `ephemeral_data['text']` | `extracted_number`, `page_filtered_text` | 无（仅依赖输入参数） |
+| `levenshtein_plugin` | `ephemeral_data['text']`, watch history | `levenshtein_ratio`, `levenshtein_similarity`, `levenshtein_distance` | 无（仅依赖输入参数） |
+| `wordcount_plugin` | `ephemeral_data['text']` | `word_count` | 无（仅依赖输入参数） |
+
+由于所有插件的输入都来自函数参数（`ephemeral_data`, `application_datastruct`）而非 `EXECUTE_DATA`，且输出字段互不冲突，**当前执行顺序的不确定性不会影响条件判定结果**。
+
+#### 3.4.4 对条件判定稳定性的影响
+
+| 影响方面 | 当前状态 | 潜在风险 |
+|---------|---------|---------|
+| 条件判定结果 | ✅ 稳定 | 字段名无冲突，无数据依赖 |
+| UI 下拉框选项顺序 | ❌ 可能变化 | `operator_choices` 和 `field_choices` 按注册顺序 `extend`，顺序变化会影响用户体验 |
+| 未来插件兼容性 | ⚠️ 需注意 | 如果新增插件依赖其他插件注入的数据，或出现同名字段覆盖，顺序不确定性将导致不稳定 |
+
+#### 3.4.5 执行顺序的可见影响
+虽然条件判定结果稳定，但执行顺序在以下场景可见：
+1. **UI 表单选项顺序**：字段和运算符下拉框的选项顺序随插件注册顺序变化
+2. **`EXECUTE_DATA` 调试输出**：`verify-condition-single-rule` 接口返回的数据字段顺序可能变化
+3. **日志输出**：插件执行日志的顺序可能变化
 
 ## 4. 与抓取流程及通知渲染的衔接
 
@@ -201,7 +241,9 @@ except Exception as e:
 ### 5.4 关键风险点
 1. **静默失败**: 插件异常只记录日志不报错，可能导致规则因缺少数据而意外通过或不通过
 2. **缺少回退机制**: 如果插件提供的关键字段缺失，依赖该字段的规则会使用 `undefined` 进行比较，结果可能不符合预期
-3. **执行顺序依赖**: 后续插件依赖前面插件注入的数据时，如果前面插件失败，会导致连锁反应
+3. **执行顺序不确定性**: 目录插件加载顺序依赖 `os.listdir()`，存在固有的不确定性（详见 3.4 节）
+4. **同名字段覆盖风险**: 插件返回同名字段时，后执行的会覆盖先执行的，而执行顺序不确定可能导致覆盖结果不可预测
+5. **潜在连锁反应**: 如果未来新增插件依赖前面插件注入的数据，前面插件失败会导致连锁反应
 
 ### 5.5 边界情况处理
 - 无配置条件: `execute_ruleset_against_all_plugins()` 直接返回 `result=True`
@@ -217,9 +259,11 @@ except Exception as e:
 - **灵活的规则表达**: 基于 JSON Logic，支持复杂逻辑组合
 
 ### 6.2 可改进点
+- **执行顺序确定性**: 目录插件加载应使用 `sorted(os.listdir())` 确保跨环境一致性，或支持插件显式声明优先级
 - **插件失败反馈**: 插件失败时应在 UI 上给出提示，而不是静默失败
 - **数据契约**: 应该定义插件返回数据的 schema，确保字段存在性和类型
-- **依赖管理**: 支持插件间显式声明依赖关系
+- **依赖管理**: 支持插件间显式声明依赖关系，确保执行顺序满足依赖要求
+- **字段冲突检测**: 检测插件返回的同名字段冲突，给出警告或采用显式的命名空间机制
 - **单元测试**: 为插件执行添加更全面的异常处理和测试
 
 ### 6.3 核心文件索引
