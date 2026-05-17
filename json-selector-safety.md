@@ -6,7 +6,9 @@ changedetection.io 支持两种 JSON 选择器：
 - **JSONPath** (`json:` 前缀) - 使用 `jsonpath_ng.ext` 库
 - **jq** (`jq:` / `jqraw:` 前缀) - 使用 `jq` Python 绑定
 
-本文档详细分析这两种选择器的执行路径、安全拦截点、三类结果的区别，以及安全边界。所有结论与现有测试用例一一对应。
+本文档精确分析执行路径、安全拦截机制、三类结果处理逻辑。所有结论分为两类标注：
+- 🧪 **已有测试直接验证**：结论有对应的测试用例覆盖
+- 🔍 **基于代码推导**：结论来自代码逻辑分析，暂无直接测试验证
 
 ---
 
@@ -40,6 +42,12 @@ content (输入)
               └─ 否 → 返回匹配结果
 ```
 
+🧪 **已有测试直接验证**：
+- JSONP 格式内容能被正确提取：`test_jsonp_json_filter_extraction`
+- 能从 HTML 内嵌 `<script>` 标签中提取 JSON：`test_unittest_inline_html_extract` 第 89-108 行
+
+---
+
 ### 1.2 _parse_json 执行路径
 
 **位置：** `html_tools.py:410-438` - `_parse_json()`
@@ -55,15 +63,25 @@ json: 前缀?             jq:/jqraw: 前缀?
     ▼                       ▼
 jsonpath_ng.ext.parse()  ┌─────────────────────────┐
     │                    │ 1. 提取表达式            │
-    ▼                    │ 2. validate_jq_expression(expr)  ← 安全拦截点！
-.find(json_data)         │ 3. jq.compile(expr)             ← 实际编译执行
-    │                    │ 4. .input(json_data).all()      ← 执行匹配
-    ▼                    └─────────────────────────────────┘
+    ▼                    │ 2. validate_jq_expression(expr)  ← 安全拦截点
+    │                    │ 3. jq.compile(expr)             ← 实际编译执行
+.find(json_data)         │ 4. .input(json_data).all()      ← 执行匹配
+    │                    └─────────────────────────────────┘
+    ▼
 _get_stripped_text_from_json_match(match)
     │
     ▼
 返回结果
 ```
+
+🧪 **已有测试直接验证**：
+- jq 危险表达式会被拦截：`test_blocked_builtins_raise`
+
+🔍 **基于代码推导**：
+- jqraw 前缀的选择器也经过 `validate_jq_expression()` 安全检查（与 jq: 相同路径）
+- JSONPath 直接编译执行，无安全检查
+
+---
 
 ### 1.3 jq 风险拦截的精确位置
 
@@ -83,19 +101,29 @@ def validate_jq_expression(expression: str) -> None:
 ```
 
 **执行顺序：**
-1. ✅ 检查环境变量 `JQ_ALLOW_RISKY_EXPRESSIONS`
-2. ✅ 遍历 12 个正则表达式黑名单模式
-3. ✅ 如果匹配到危险模式 → 记录日志 + 抛出 `ValueError`
-4. ✅ 检查通过 → 返回，继续执行 `jq.compile()`
+1. 检查环境变量 `JQ_ALLOW_RISKY_EXPRESSIONS`
+2. 遍历 12 个正则表达式黑名单模式
+3. 如果匹配到危险模式 → 记录 CRITICAL 日志 + 抛出 `ValueError`
+4. 检查通过 → 返回，继续执行 `jq.compile()`
+
+🧪 **已有测试直接验证**：
+- 危险表达式抛出 `ValueError`：`test_blocked_builtins_raise`
+- 安全表达式不抛出异常：`test_safe_expressions_pass`
+- `JQ_ALLOW_RISKY_EXPRESSIONS=true` 时绕过检查：`test_allow_risky_env_var_bypasses_check`
+- 默认情况下启用检查：`test_allow_risky_env_var_off_by_default`
+
+---
 
 ### 1.4 绕过开关的影响范围
 
 | 开关状态 | 影响 |
 |---------|------|
-| `JQ_ALLOW_RISKY_EXPRESSIONS=false` (默认) | ✅ 启用所有 12 个安全检查，危险表达式被拦截 |
-| `JQ_ALLOW_RISKY_EXPRESSIONS=true` | ❌ **完全禁用所有安全检查**，任何 jq 表达式都能执行 |
+| `JQ_ALLOW_RISKY_EXPRESSIONS=false` (默认) | 启用所有 12 个安全检查，危险表达式被拦截 |
+| `JQ_ALLOW_RISKY_EXPRESSIONS=true` | **完全禁用所有安全检查**，任何 jq 表达式都能执行 |
 
-**注意：** 绕过开关影响的是 `validate_jq_expression()` 函数本身，不是 `jq.compile()`。开关打开时，函数直接 `return`，不执行任何检查逻辑。
+🧪 **已有测试直接验证**：
+- 绕过开关能完全禁用检查：`test_allow_risky_env_var_bypasses_check`
+- 默认状态下检查生效：`test_allow_risky_env_var_off_by_default`
 
 ---
 
@@ -117,8 +145,9 @@ if not match:
 
 **最终返回值：** 空字符串 `''`
 
-**对应测试用例：**
-- ✅ Re #265 注释说明：允许选择器不匹配任何内容，因为用户可能在等待某个条件出现
+🔍 **基于代码推导**：
+- Re #265 注释说明：允许选择器不匹配任何内容，因为用户可能在等待某个条件出现
+- 集成测试间接验证此行为，但无直接的单元测试断言
 
 ---
 
@@ -141,19 +170,24 @@ try:
     stripped_text_from_html = _parse_json(json.loads(content.lstrip("\ufeff")), json_filter)
 except json.JSONDecodeError as e:
     logger.warning(f"Error processing JSON {content[:20]}...{str(e)})")
-# 注意：其他异常 (JsonPathParserError, ValueError, InvalidExpression) 不会被捕获！
+# 重要：只有 JSONDecodeError 被捕获！
+# JsonPathParserError、ValueError、InvalidExpression 都不会被捕获！
 ```
 
 **关键发现：**
-- ⚠️ 只有 `json.JSONDecodeError` 被捕获并记录警告
-- ⚠️ 其他异常（包括 JSONPath 语法错误、jq 语法错误、jq 安全拦截）**直接向上抛出**，不会被捕获！
-- ⚠️ 只有异常未被捕获且执行到最后，才返回空字符串
+- ✅ `json.JSONDecodeError` 被捕获并记录警告
+- ❌ **JSONPath 语法错误**：异常直接向上抛出，不被捕获
+- ❌ **jq 语法错误**：异常直接向上抛出，不被捕获  
+- ❌ **jq 安全拦截**：`ValueError` 直接向上抛出，不被捕获
 
 **最终行为：** 异常向上抛出，不由本函数处理
 
-**对应测试用例：**
-- ✅ `test_blocked_builtins_raise`：12 种危险 jq 表达式必须抛出 `ValueError`
-- ✅ `test_safe_expressions_pass`：安全表达式不抛出异常
+⚠️ **未被现有测试直接覆盖**：
+- 异常传播路径（只有 JSONDecodeError 被捕获）没有对应的测试用例
+- 现有测试仅直接验证了 `validate_jq_expression()` 会抛出异常，但未验证异常在 `extract_json_as_string()` 中是否被捕获
+
+🧪 **已有测试直接验证**：
+- `validate_jq_expression()` 对危险表达式抛出 `ValueError`：`test_blocked_builtins_raise`
 
 ---
 
@@ -176,18 +210,21 @@ if not bs_jsons:
 - 仅在通过 `extract_json_blob_from_html()` 路径时才可能抛出
 - 纯 JSON 或 JSONP 解析失败时，仅记录警告不抛出此异常
 
-**对应测试用例：**
-- ✅ `test_unittest_inline_html_extract`（第 113-121 行）：对乱码输入，`json:`、`jq:`、`jqraw:` 三种选择器都必须抛出 `JSONNotFound`
+🧪 **已有测试直接验证**：
+- 乱码输入时，`json:`、`jq:`、`jqraw:` 三种选择器都抛出 `JSONNotFound`：`test_unittest_inline_html_extract` 第 113-121 行
+
+🔍 **基于代码推导**：
+- 纯 JSON 解析失败时，仅记录警告，不抛出 `JSONNotFound`
 
 ---
 
 ### 2.4 三类结果总结对照表
 
-| 情况 | 触发条件 | 返回/抛出 | 代码位置 | 对应测试 |
-|------|---------|-----------|---------|----------|
-| **合法无匹配** | 表达式语法正确，但 JSON 中没有匹配内容 | 返回空字符串 `''` | `_get_stripped_text_from_json_match()`:452-454 | Re #265 注释 |
-| **表达式非法** | JSONPath 语法错误、jq 语法错误、jq 危险表达式 | 抛出对应异常（不被捕获） | `_parse_json()` 内部 | `test_blocked_builtins_raise` |
-| **无可解析 JSON** | 既不是纯 JSON，也不是 JSONP，也无法从 HTML 提取有效 JSON | 抛出 `JSONNotFound` | `extract_json_blob_from_html()`:490-491 | `test_unittest_inline_html_extract` 第 113-121 行 |
+| 情况 | 触发条件 | 返回/抛出 | 代码位置 | 证据类型 |
+|------|---------|-----------|---------|---------|
+| **合法无匹配** | 表达式语法正确，但 JSON 中没有匹配内容 | 返回空字符串 `''` | `_get_stripped_text_from_json_match()`:452-454 | 🔍 基于代码推导 |
+| **表达式非法** | JSONPath 语法错误、jq 语法错误、jq 危险表达式 | 抛出对应异常（**不被捕获，直接向上传播**） | `_parse_json()` 内部 | ⚠️ 异常传播路径未被测试直接覆盖 |
+| **无可解析 JSON** | 既不是纯 JSON，也不是 JSONP，也无法从 HTML 提取有效 JSON | 抛出 `JSONNotFound` | `extract_json_blob_from_html()`:490-491 | 🧪 已有测试直接验证 |
 
 ---
 
@@ -197,20 +234,22 @@ if not bs_jsons:
 
 **位置：** `html_tools.py:24-37` - `_JQ_BLOCKED_PATTERNS`
 
-| 序号 | 正则模式 | 匹配内容 | 风险类型 | 对应测试用例 |
-|------|---------|---------|---------|-------------|
-| 1 | `\benv\b` | `env` 函数 | 环境变量泄露 | `test_blocked_builtins_raise` |
-| 2 | `\$ENV\b` | `$ENV` 变量 | 环境变量泄露 | `test_blocked_builtins_raise` |
-| 3 | `\binclude\b` | `include` 指令 | 文件读取 | `test_blocked_builtins_raise` |
-| 4 | `\bimport\b` | `import` 指令 | 文件读取 | `test_blocked_builtins_raise` |
-| 5 | `\binputs?\b` | `input` / `inputs` | 读取 stdin 外部数据 | `test_blocked_builtins_raise` |
-| 6 | `\bdebug\b` | `debug` 函数 | 数据泄露到 stderr | `test_blocked_builtins_raise` |
-| 7 | `\bstderr\b` | `stderr` 函数 | 数据泄露到 stderr | `test_blocked_builtins_raise` |
-| 8 | `\bhalt(?:_error)?\b` | `halt` / `halt_error` | 进程终止（DoS） | `test_blocked_builtins_raise` |
-| 9 | `\$__loc__\b` | `$__loc__` 变量 | 文件路径信息泄露 | `test_blocked_builtins_raise` |
-| 10 | `\bbuiltins\b` | `builtins` 函数 | 枚举可用函数 | `test_blocked_builtins_raise` |
-| 11 | `\bmodulemeta\b` | `modulemeta` 函数 | 模块信息泄露 | `test_blocked_builtins_raise` |
-| 12 | `\$JQ_BUILD_CONFIGURATION\b` | `$JQ_BUILD_CONFIGURATION` | 构建配置信息泄露 | `test_blocked_builtins_raise` |
+| 序号 | 正则模式 | 匹配内容 | 风险类型 | 证据类型 |
+|------|---------|---------|---------|---------|
+| 1 | `\benv\b` | `env` 函数 | 环境变量泄露 | 🧪 已有测试直接验证 |
+| 2 | `\$ENV\b` | `$ENV` 变量 | 环境变量泄露 | 🧪 已有测试直接验证 |
+| 3 | `\binclude\b` | `include` 指令 | 文件读取 | 🧪 已有测试直接验证 |
+| 4 | `\bimport\b` | `import` 指令 | 文件读取 | 🧪 已有测试直接验证 |
+| 5 | `\binputs?\b` | `input` / `inputs` | 读取 stdin 外部数据 | 🧪 已有测试直接验证 |
+| 6 | `\bdebug\b` | `debug` 函数 | 数据泄露到 stderr | 🧪 已有测试直接验证 |
+| 7 | `\bstderr\b` | `stderr` 函数 | 数据泄露到 stderr | 🧪 已有测试直接验证 |
+| 8 | `\bhalt(?:_error)?\b` | `halt` / `halt_error` | 进程终止（DoS） | 🧪 已有测试直接验证 |
+| 9 | `\$__loc__\b` | `$__loc__` 变量 | 文件路径信息泄露 | 🧪 已有测试直接验证 |
+| 10 | `\bbuiltins\b` | `builtins` 函数 | 枚举可用函数 | 🧪 已有测试直接验证 |
+| 11 | `\bmodulemeta\b` | `modulemeta` 函数 | 模块信息泄露 | 🧪 已有测试直接验证 |
+| 12 | `\$JQ_BUILD_CONFIGURATION\b` | `$JQ_BUILD_CONFIGURATION` | 构建配置信息泄露 | 🧪 已有测试直接验证 |
+
+---
 
 ### 3.2 测试验证的危险表达式示例
 
@@ -239,7 +278,7 @@ blocked = [
 ]
 ```
 
-✅ **测试验证：** 以上所有表达式调用 `validate_jq_expression()` 时必须抛出 `ValueError`
+🧪 **已有测试直接验证**：以上所有表达式调用 `validate_jq_expression()` 时必须抛出 `ValueError`
 
 ---
 
@@ -260,16 +299,7 @@ safe = [
 ]
 ```
 
-✅ **测试验证：** 以上所有表达式调用 `validate_jq_expression()` 时不得抛出异常
-
----
-
-### 3.4 绕过开关的测试验证
-
-**对应测试用例：**
-1. ✅ `test_allow_risky_env_var_bypasses_check`：设置 `JQ_ALLOW_RISKY_EXPRESSIONS=true` 时，即使是最危险的表达式 `env` 和 `$ENV` 也能通过检查
-
-2. ✅ `test_allow_risky_env_var_off_by_default`：未设置环境变量时（默认），危险表达式必须被拦截
+🧪 **已有测试直接验证**：以上所有表达式调用 `validate_jq_expression()` 时不得抛出异常
 
 ---
 
@@ -280,15 +310,15 @@ safe = [
 **使用库：** `jsonpath_ng.ext`
 
 **安全特性：**
-- ✅ 无文件系统访问能力
-- ✅ 无环境变量访问能力
-- ✅ 无网络访问能力
-- ✅ 仅在提供的 JSON 数据上操作
-- ✅ 无进程控制能力
+- 🔍 **基于代码推导**：无文件系统访问能力
+- 🔍 **基于代码推导**：无环境变量访问能力
+- 🔍 **基于代码推导**：无网络访问能力
+- 🔍 **基于代码推导**：仅在提供的 JSON 数据上操作
+- 🔍 **基于代码推导**：无进程控制能力
 
 **风险等级：** ✅ **低风险**
 
-**安全机制：** 无额外安全检查（因为库本身就是安全的）
+**安全机制：** 无额外安全检查（基于库特性推导）
 
 ---
 
@@ -297,20 +327,20 @@ safe = [
 **使用库：** `jq` Python 绑定
 
 **安全特性：**
-- ✅ **黑名单式安全检查**：12 个正则模式阻止危险内置函数
-- ✅ **检查在编译前执行**：`validate_jq_expression()` 在 `jq.compile()` 之前调用
-- ✅ **安全日志记录**：拦截时记录 CRITICAL 级别日志
-- ⚠️ **可完全绕过**：通过环境变量 `JQ_ALLOW_RISKY_EXPRESSIONS=true`
-- ⚠️ **基于正则的黑名单局限性**：可能存在绕过方式（如字符串拼接、编码等）
+- 🧪 **已有测试直接验证**：黑名单式安全检查（12 个正则模式阻止危险内置函数）
+- 🔍 **基于代码推导**：检查在编译前执行（`validate_jq_expression()` 在 `jq.compile()` 之前调用）
+- 🔍 **基于代码推导**：拦截时记录 CRITICAL 级别日志
+- 🧪 **已有测试直接验证**：可通过环境变量 `JQ_ALLOW_RISKY_EXPRESSIONS=true` 完全绕过
+- 🔍 **基于代码推导**：基于正则的黑名单存在局限性（可能存在绕过方式）
 
-**已缓解的风险：**
+**已缓解的风险（有测试验证）：**
 - 环境变量泄露
 - 任意文件读取
 - 进程终止（DoS）
 - stderr 数据泄露
 - 内部信息泄露
 
-**潜在未缓解的风险：**
+**潜在未缓解的风险（基于代码推导）：**
 - CPU 资源耗尽（复杂递归表达式导致 DoS）
 - 内存资源耗尽
 - 正则黑名单绕过
@@ -319,19 +349,21 @@ safe = [
 
 ---
 
-## 五、与现有测试用例的完整对应表
+## 五、证据边界总结表
 
-| 测试用例 | 验证内容 | 文档章节 |
-|---------|---------|---------|
-| `test_blocked_builtins_raise` | 12 种危险 jq 表达式必须抛出 `ValueError` | 3.1, 3.2 |
-| `test_safe_expressions_pass` | 8 种安全表达式必须通过检查 | 3.3 |
-| `test_allow_risky_env_var_bypasses_check` | `JQ_ALLOW_RISKY_EXPRESSIONS=true` 绕过所有检查 | 1.4, 3.4 |
-| `test_allow_risky_env_var_off_by_default` | 默认情况下必须启用安全检查 | 1.4, 3.4 |
-| `test_jsonp_json_filter_extraction` | JSONP 格式内容能被正确提取和过滤 | 1.1 |
-| `test_unittest_inline_html_extract` 第 89-108 行 | 能从 HTML 内嵌 `<script>` 标签中提取 JSON 并正确匹配 | 1.1 |
-| `test_unittest_inline_html_extract` 第 113-121 行 | 找不到可解析 JSON 时必须抛出 `JSONNotFound` 异常 | 2.3 |
-| Re #265 注释（第 360 行） | 选择器无匹配时返回空字符串（不报错） | 2.1 |
-| `test_jsonpath_BOM_utf8` | 支持带 BOM 的 UTF-8 JSON 输入 | 输入处理 |
+| 项目 | 结论 | 证据类型 |
+|-----|------|---------|
+| validate_jq_expression 会拦截危险表达式 | 12 种危险 jq 表达式抛出 `ValueError` | 🧪 已有测试直接验证 |
+| 绕过开关 | `JQ_ALLOW_RISKY_EXPRESSIONS=true` 完全禁用所有检查 | 🧪 已有测试直接验证 |
+| 默认状态 | 未设置环境变量时检查生效 | 🧪 已有测试直接验证 |
+| 无可解析 JSON | 乱码输入抛出 `JSONNotFound` | 🧪 已有测试直接验证 |
+| JSONP 提取 | 能从 JSONP 格式中提取 JSON 并过滤 | 🧪 已有测试直接验证 |
+| 合法无匹配 | 返回空字符串 `''` | 🔍 基于代码推导（Re #265 注释） |
+| 异常传播路径 | 只有 `JSONDecodeError` 被捕获，其他异常直接向上抛出 | ⚠️ 未被现有测试直接覆盖 |
+| jqraw 安全检查 | jqraw 前缀也经过 `validate_jq_expression()` | 🔍 基于代码推导（同一路径） |
+| 纯 JSON 解析失败 | 仅记录警告，不抛出 `JSONNotFound` | 🔍 基于代码推导 |
+| JSONPath 安全性 | 无文件/环境/网络/进程访问能力 | 🔍 基于代码推导（库特性） |
+| 拦截日志记录 | 拦截时记录 CRITICAL 级别日志 | 🔍 基于代码推导 |
 
 ---
 
@@ -343,9 +375,11 @@ safe = [
 
 3. **不要启用绕过开关**：除非在完全隔离的环境中且完全理解风险，否则不要设置 `JQ_ALLOW_RISKY_EXPRESSIONS=true`
 
-4. **考虑执行超时限制**：为 jq 表达式执行添加超时限制，防止 DoS 攻击
+4. **补充异常传播测试**：建议补充测试用例，验证非法表达式在完整调用链中的行为
 
-5. **监控 jq 表达式审计**：对多用户环境中的 jq 表达式使用进行审计和告警
+5. **考虑执行超时限制**：为 jq 表达式执行添加超时限制，防止 DoS 攻击
+
+6. **监控 jq 表达式审计**：对多用户环境中的 jq 表达式使用进行审计和告警
 
 ---
 
