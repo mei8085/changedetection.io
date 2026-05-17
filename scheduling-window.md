@@ -549,16 +549,54 @@ try:
 except Exception as e:
     logger.error(
         f"{uuid} - Recheck scheduler, error handling timezone, check skipped - TZ name '{tz_name}' - {str(e)}")
-    return False  # ⚠️ 整个线程退出！
+    return False  # ⚠️ 整个函数返回，线程退出！
 ```
 
-**关键发现**：单个watch的时间窗配置错误会导致**整个ticker线程返回退出**，而不是跳过该watch继续处理其他watch。
+#### 调用链与真实行为
+
+**代码事实**（基于完整调用链分析）：
+
+1. **ticker线程入口**：`flask_app.py:999`
+   ```python
+   ticker_thread = threading.Thread(
+       target=ticker_thread_check_time_launch_checks, 
+       daemon=True, 
+       name="TickerThread-ScheduleChecker"
+   ).start()
+   ```
+   - 只在应用启动时调用**一次**，存储在全局变量 `ticker_thread` 中（但变量值为 `None`，因为 `.start()` 返回None）
+
+2. **健康检查范围**：`worker_pool.py:498-553`
+   ```python
+   def check_worker_health(expected_count, update_q=None, notification_q=None, app=None, datastore=None):
+       # 只检查 worker_threads 列表中的worker线程
+       alive_count = sum(1 for w in worker_threads if w.thread and w.thread.is_alive())
+       # 只能重启worker线程，不能重启ticker线程
+   ```
+   - `check_worker_health()` 只监控 `worker_threads` 列表中的worker线程
+   - **不监控** ticker线程，也没有重启ticker线程的逻辑
+
+3. **异常后的准确边界**：
+
+| 组件 | 异常后状态 | 能否自动恢复 | 代码证据 |
+|------|-----------|-------------|----------|
+| ticker调度线程 | ❌ 永久终止（函数return） | ❌ 不能 | `flask_app.py:1213` + `flask_app.py:999` |
+| Worker健康检查 | ✅ 继续运行（在ticker内每60秒调用） | 不适用 | `flask_app.py:1123-1138` |
+| Worker线程池 | ✅ 独立运行，不受影响 | ✅ 可被健康检查恢复 | `worker_pool.py:498-553` |
+| 已入队任务 | ✅ 继续执行 | 不适用 | 队列和worker独立 |
+| 手动/批量重检 | ✅ 正常工作（绕过ticker） | 不适用 | `ui/__init__.py:263-277,62-68` |
+
+**关键结论**：
+- 时间窗解析异常会导致 `ticker_thread_check_time_launch_checks()` 函数 `return False`，**ticker线程永久终止**
+- 由于ticker线程只在启动时创建一次，且健康检查不监控它，**没有任何自动恢复机制**
+- 唯一恢复方式是**重启整个应用进程**
+- 健康检查本身在ticker线程内调用，所以ticker退出后，**健康检查也不再执行**（这是一个嵌套失效）
 
 **影响评估**：
-- ❌ **全局编排停止**：ticker线程退出后，不再有新的watch被自动调度
-- ❌ **无自动恢复**：线程退出后不会自动重启，需等待下一轮健康检查或服务重启
-- ⚠️ **Worker继续运行**：已入队的任务会继续执行，但不会有新任务入队
-- ⚠️ **手动重检仍可用**：API/UI触发的重检不受影响
+- ❌ **全局自动调度停止**：不再有watch被自动调度入队
+- ❌ **健康检查也停止**：worker崩溃后无法自动恢复
+- ⚠️ **已入队任务继续执行**：队列中的任务会被处理完
+- ⚠️ **手动操作仍可用**：UI/API触发的重检不受影响
 
 ### 10.3 编辑保存路径中的退化路径
 
@@ -744,7 +782,7 @@ elif target_weekday == (current_weekday + 1) % 7:
 3. **排序遍历**：按last_checked排序，优先处理最久未检查的
 4. **无锁设计**：使用copy-on-write避免遍历时的并发修改问题
 
-## 10. 代码索引
+## 13. 代码索引
 
 | 功能 | 文件位置 | 行号 |
 |------|----------|------|
