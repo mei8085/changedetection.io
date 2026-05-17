@@ -584,7 +584,9 @@ processors.save_processor_config(datastore, uuid, processor_config_data)
 ```
 1. 从 watch.json 读取 include_filters
 2. FilterConfig 三级合并（watch → tags → global）
-3. BeautifulSoup 执行 CSS/XPath 过滤
+3. 按过滤器类型分路径执行
+   ├─ XPath 过滤器 → elementpath 库
+   └─ CSS 选择器 → BeautifulSoup4
 4. 提取文本内容
 5. 与历史版本对比
 ```
@@ -684,7 +686,7 @@ def get_filter_config_hash(self):
 
 ### 9.1 性能优化
 
-1. **元素排序**：浏览器端升序、前端降序的两次排序，兼顾精确匹配和视觉层级
+1. **元素排序**：两次排序机制——浏览器端升序、前端降序，配合 `forEach` 覆盖逻辑实现最小元素优先命中
 2. **数据压缩**：使用 zlib 压缩元素数据，节省磁盘空间
 3. **分块截图**：大页面分块抓取后拼接，避免 GPU 内存溢出
 4. **配置哈希**：通过哈希检测配置变化，避免不必要的重新检测
