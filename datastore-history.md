@@ -155,11 +155,17 @@ datastore/
       ├─ 超过阈值且启用 Brotli → {snapshot_id}.txt.br
       └─ 否则 → {snapshot_id}.txt
 
-3. 追加到 history.txt (原子追加)
+3. 追加到 history.txt (非原子追加)
    with open(index_fname, 'a', encoding='utf-8') as f:
        f.write(f"{timestamp},{snapshot_fname}\n")
        f.flush()
        os.fsync(f.fileno())  # 强制刷盘
+
+   【重要边界说明】
+   - 这是 4 步独立操作，不是原子操作：open('a') → write() → flush() → fsync()
+   - write() 崩溃风险：文件可能写入部分字节（半行），或缺少结尾换行符
+   - fsync() 崩溃风险：内核缓冲区数据可能未完全落盘
+   - 后果：下次读取时因无逗号/格式错误，该行被静默跳过（内存级容错）
 
 4. 更新内存状态
    self.__newest_history_key = timestamp
