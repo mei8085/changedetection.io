@@ -535,9 +535,9 @@ if not datastore.data['watching'][uuid].get('paused') and is_in_schedule:
 | 配置结构损坏 | 缺少 `enabled`/`start_time`/`duration` | `time_handler.py:94-114` |
 | 字段类型错误 | `duration.hours` 为字符串而非数字 | `time_handler.py:107` |
 
-### 10.2 Ticker线程中的退化路径
+### 10.2 Ticker线程异常后的恢复链路（唯一自洽结论）
 
-**位置**：`flask_app.py:1210-1213`
+**异常触发点**：`flask_app.py:1210-1213`
 
 ```python
 try:
@@ -549,14 +549,39 @@ try:
 except Exception as e:
     logger.error(
         f"{uuid} - Recheck scheduler, error handling timezone, check skipped - TZ name '{tz_name}' - {str(e)}")
-    return False  # ⚠️ 整个函数返回，线程退出！
+    return False  # 函数返回，线程终止
 ```
 
-#### 调用链与真实行为
+#### 结论1：异常后各组件状态（代码事实）
 
-**代码事实**（基于完整调用链分析）：
+| 组件 | 异常后状态 | 证据来源 |
+|------|-----------|----------|
+| **Ticker调度线程** | ❌ 永久终止 | `flask_app.py:1213` - `return False` 退出整个函数 |
+| **Worker健康检查** | ❌ 停止执行 | `flask_app.py:1123-1138` - 健康检查在ticker的while循环内调用 |
+| **Worker线程池** | ✅ 继续独立运行 | `worker_pool.py:43-67` - Worker线程与ticker线程完全独立 |
+| **已入队任务** | ✅ 继续执行 | 队列和worker独立于ticker调度逻辑 |
+| **手动/批量重检** | ✅ 正常工作 | `ui/__init__.py:62-68,263-277` - 直接入队，绕过ticker调度 |
 
-1. **ticker线程入口**：`flask_app.py:999`
+#### 结论2：失效能力清单（代码事实）
+
+**完全失效的能力**：
+- ❌ 自动调度：不再有watch被自动加入队列（ticker退出）
+- ❌ Worker健康检查：不再检查worker存活状态，worker崩溃后无法自动恢复（健康检查在ticker循环内）
+- ❌ 代理限流：代理重用时间间隔检查在ticker内执行（`flask_app.py:1229-1246`）
+- ❌ 调度抖动（Jitter）：抖动值计算和重置在ticker内执行（`flask_app.py:1218-1222,1267`）
+
+**不受影响的能力**：
+- ✅ 已入队任务的抓取执行
+- ✅ UI/API触发的手动重检
+- ✅ 通知发送（独立线程 `flask_app.py:1002-1009`）
+- ✅ Web界面访问
+
+#### 结论3：恢复方式（代码事实）
+
+**唯一恢复方式**：重启整个应用进程
+
+**支撑证据**：
+1. ticker线程只在应用启动时创建一次：`flask_app.py:999`
    ```python
    ticker_thread = threading.Thread(
        target=ticker_thread_check_time_launch_checks, 
@@ -564,39 +589,18 @@ except Exception as e:
        name="TickerThread-ScheduleChecker"
    ).start()
    ```
-   - 只在应用启动时调用**一次**，存储在全局变量 `ticker_thread` 中（但变量值为 `None`，因为 `.start()` 返回None）
-
-2. **健康检查范围**：`worker_pool.py:498-553`
+   - 全局变量 `ticker_thread` 存储的是 `.start()` 的返回值（即 `None`），无法引用线程对象
+2. `check_worker_health()` 只监控 `worker_threads` 列表，不监控ticker线程：`worker_pool.py:513-514`
    ```python
-   def check_worker_health(expected_count, update_q=None, notification_q=None, app=None, datastore=None):
-       # 只检查 worker_threads 列表中的worker线程
-       alive_count = sum(1 for w in worker_threads if w.thread and w.thread.is_alive())
-       # 只能重启worker线程，不能重启ticker线程
+   alive_count = sum(1 for w in worker_threads if w.thread and w.thread.is_alive())
    ```
-   - `check_worker_health()` 只监控 `worker_threads` 列表中的worker线程
-   - **不监控** ticker线程，也没有重启ticker线程的逻辑
+3. 代码中没有任何重启ticker线程的逻辑
 
-3. **异常后的准确边界**：
+#### 结论4：故障可见性（代码事实）
 
-| 组件 | 异常后状态 | 能否自动恢复 | 代码证据 |
-|------|-----------|-------------|----------|
-| ticker调度线程 | ❌ 永久终止（函数return） | ❌ 不能 | `flask_app.py:1213` + `flask_app.py:999` |
-| Worker健康检查 | ✅ 继续运行（在ticker内每60秒调用） | 不适用 | `flask_app.py:1123-1138` |
-| Worker线程池 | ✅ 独立运行，不受影响 | ✅ 可被健康检查恢复 | `worker_pool.py:498-553` |
-| 已入队任务 | ✅ 继续执行 | 不适用 | 队列和worker独立 |
-| 手动/批量重检 | ✅ 正常工作（绕过ticker） | 不适用 | `ui/__init__.py:263-277,62-68` |
-
-**关键结论**：
-- 时间窗解析异常会导致 `ticker_thread_check_time_launch_checks()` 函数 `return False`，**ticker线程永久终止**
-- 由于ticker线程只在启动时创建一次，且健康检查不监控它，**没有任何自动恢复机制**
-- 唯一恢复方式是**重启整个应用进程**
-- 健康检查本身在ticker线程内调用，所以ticker退出后，**健康检查也不再执行**（这是一个嵌套失效）
-
-**影响评估**：
-- ❌ **全局自动调度停止**：不再有watch被自动调度入队
-- ❌ **健康检查也停止**：worker崩溃后无法自动恢复
-- ⚠️ **已入队任务继续执行**：队列中的任务会被处理完
-- ⚠️ **手动操作仍可用**：UI/API触发的重检不受影响
+- 日志：会记录一条 ERROR 级别日志（`flask_app.py:1211-1212`）
+- 无主动告警：没有内置告警机制
+- 业务表现：watch的 `last_checked` 时间不再更新，内容不再自动刷新
 
 ### 10.3 编辑保存路径中的退化路径
 
@@ -760,7 +764,7 @@ elif target_weekday == (current_weekday + 1) % 7:
 
 ## 12. 设计权衡与考量
 
-### 9.1 优点
+### 12.1 优点
 
 1. **时区正确性**：基于IANA时区数据库，自动处理夏令时
 2. **灵活性**：支持全局和watch级配置，覆盖各种使用场景
