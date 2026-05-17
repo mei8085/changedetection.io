@@ -100,7 +100,105 @@ title, trigger_text, url, use_page_title_in_list, webdriver_js_execute_code
 
 ---
 
-## 三、分组（Tag/Group）数据模型与实现机制
+## 三、分组 API 的鉴权边界
+
+### 3.1 分组 API 接口清单
+
+所有分组相关的 API 接口定义在 `api/Tags.py` 中，共 5 个端点，全部使用 `@auth.check_token` 装饰器保护 [api/Tags.py:13-212](changedetectionio/api/Tags.py:13-212)：
+
+| HTTP 方法 | 路由 | 端点功能 |
+|----------|------|---------|
+| GET | `/api/v1/tags` | 列出所有分组（返回简化信息） |
+| GET | `/api/v1/tag/<uuid>` | 获取单个分组详情，支持 `?recheck`、`?muted=muted`、`?muted=unmuted` 操作 |
+| POST | `/api/v1/tag` | 创建新分组 |
+| PUT | `/api/v1/tag/<uuid>` | 更新分组信息 |
+| DELETE | `/api/v1/tag/<uuid>` | 删除分组并从所有 Watch 中移除 |
+
+**路由注册** [flask_app.py:589-593](changedetectionio/flask_app.py:589-593)：
+```python
+watch_api.add_resource(Tags, '/api/v1/tags', resource_class_kwargs={'datastore': datastore})
+watch_api.add_resource(Tag, '/api/v1/tag', '/api/v1/tag/<uuid_str:uuid>', ...)
+```
+
+### 3.2 API 鉴权核心机制
+
+`check_token` 装饰器是所有 API 端点的唯一鉴权层，定义在 `api/auth.py:8-25` [api/auth.py:8-25](changedetectionio/api/auth.py:8-25)：
+
+```python
+def check_token(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        datastore = args[0].datastore
+        config_api_token_enabled = datastore.data['settings']['application'].get('api_access_token_enabled')
+        config_api_token = datastore.data['settings']['application'].get('api_access_token')
+
+        # 仅当 api_access_token_enabled 为 True 时才校验 x-api-key
+        if config_api_token_enabled:
+            if request.headers.get('x-api-key') != config_api_token:
+                return make_response(jsonify("Invalid access - API key invalid."), 403)
+
+        return f(*args, **kwargs)
+    return decorated
+```
+
+### 3.3 `api_access_token_enabled` 开关的两种状态对比
+
+| 状态 | `api_access_token_enabled = True` | `api_access_token_enabled = False` |
+|------|----------------------------------|-----------------------------------|
+| **鉴权逻辑** | 必须校验 `x-api-key` 请求头 | 跳过所有鉴权检查，直接放行 |
+| **匿名访问** | ❌ 拒绝（返回 403） | ✅ 允许（任何人可调用） |
+| **密钥要求** | `x-api-key` 必须匹配 `api_access_token` | 无需任何密钥 |
+| **适用场景** | 生产环境、公开实例 | 本地开发、内网部署 |
+
+**代码证据** [api/auth.py:17-21](changedetectionio/api/auth.py:17-21)：
+```python
+if config_api_token_enabled:
+    if request.headers.get('x-api-key') != config_api_token:
+        return make_response(jsonify("Invalid access - API key invalid."), 403)
+# 否则直接 return f(*args, **kwargs)
+```
+
+### 3.4 `x-api-key` 校验生效/失效的条件
+
+**校验生效的必要条件（全部满足）**：
+1. ✅ `api_access_token_enabled` 设置为 `True`
+2. ✅ 目标 API 方法使用了 `@auth.check_token` 装饰器
+3. ✅ 请求头中包含 `x-api-key` 字段（或匹配规则）
+
+**校验失效的场景（满足任意一条）**：
+
+| 场景 | 原因 | 风险等级 |
+|------|------|---------|
+| `api_access_token_enabled = False` | 配置关闭，直接跳过检查 | ⚠️ 高 |
+| API 方法未使用 `@auth.check_token` | 鉴权装饰器缺失 | ⚠️ 高 |
+| `api_access_token` 为空字符串 | 空字符串比较可能导致逻辑绕过 | ⚠️ 中 |
+| 请求头大小写不匹配 | Flask 的 `request.headers.get()` 不区分大小写 | ✅ 安全 |
+
+**关键注意事项**：
+- `x-api-key` 校验**不依赖** Web 登录状态，与 `login_optionally_required` 是两套独立的认证体系
+- 即使 `shared_diff_access=True`，API 接口也不会自动豁免，仍受 `api_access_token_enabled` 控制
+- 分组 API 的 5 个端点**全部**使用了 `@auth.check_token` 装饰器，无例外
+
+### 3.5 与匿名访客权限的对齐关系
+
+**分组 API 与匿名 Diff 访问是两套完全独立的权限体系**：
+
+| 权限维度 | 匿名 Diff 访问 (`shared_diff_access`) | 分组 API (`/api/v1/tag/*`) |
+|----------|--------------------------------------|---------------------------|
+| **开关** | `shared_diff_access` | `api_access_token_enabled` |
+| **认证方式** | 无密钥，仅基于端点白名单 | `x-api-key` 请求头 |
+| **允许匿名** | 当开关开启时，仅豁免 3 个只读端点 | 当开关关闭时，所有 5 个端点完全开放 |
+| **操作权限** | 仅只读（查看 Diff、下载 Patch） | 完整 CRUD（创建、读取、更新、删除） |
+| **与登录关系** | 登录用户不受此开关限制 | 登录状态不影响 API 鉴权逻辑 |
+
+**重要安全边界**：
+1.  即使 `shared_diff_access=True`（允许匿名看 Diff），只要 `api_access_token_enabled=True`，匿名用户仍无法调用分组 API
+2.  反之，如果 `api_access_token_enabled=False`，无论 `shared_diff_access` 是什么状态，任何人都可以通过 API 管理分组
+3.  两种机制互不干扰，独立控制
+
+---
+
+## 四、分组（Tag/Group）数据模型与实现机制
 
 ### 3.1 分组的实体形态
 
