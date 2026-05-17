@@ -100,64 +100,158 @@ title, trigger_text, url, use_page_title_in_list, webdriver_js_execute_code
 
 ---
 
-## 三、与标签、分组、通知配置的相互影响
+## 三、分组（Tag/Group）数据模型与实现机制
 
-### 3.1 标签（Tags）
+### 3.1 分组的实体形态
 
-**分享时的标签处理：**
+**核心模型定义**：
 
-1.  **分享导出时**：标签 UUID 会包含在分享数据中（字段名 `tags`）
-2.  **分享导入时**：标签 UUID 会被保留，但需要接收方实例中存在对应 UUID 的标签才能生效
-3.  **标签白名单**：`tags` 字段在导入白名单中 [store/__init__.py:710](changedetectionio/store/__init__.py:710)
+分组（Tag）是一个完整的领域模型，继承自 `watch_base` 基类，可复用 Watch 的所有字段 [model/Tag.py:26-42](changedetectionio/model/Tag.py:26-42)：
 
-**注意事项：**
-- 标签是按 UUID 引用的，跨实例分享时标签关联可能失效
-- 接收方需要手动创建或匹配相同 UUID 的标签
-- 标签的覆盖规则（`overrides_watch`）仅在接收方实例中生效
+```python
+class model(EntityPersistenceMixin, watch_base):
+    """Tag domain model - groups watches and can override their settings."""
+```
 
-### 3.2 通知配置
+**实体字段**：
 
-**严格的隐私保护：**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `uuid` | str | 唯一标识符 |
+| `title` | str | 显示名称 |
+| `overrides_watch` | bool | 是否启用覆盖模式，优先级高于 Watch 设置 |
+| `url_match_pattern` | str | URL 自动匹配模式，支持通配符 |
+| `tag_colour` | str | 标签颜色 |
+| `llm_intent` | str | AI 变更意图提示词 |
+| `llm_change_summary` | str | AI 变更摘要模板 |
+| `notification_*` | 多字段 | 完整的通知配置（与 Watch 相同） |
+| `processor_config_*` | dict | 处理器配置（如补货监控设置） |
+| ... | ... | 所有 `watch_base` 中的字段 |
 
-1.  **分享时完全剥离**：所有 `notification_` 前缀的字段都会被删除 [blueprint/ui/__init__.py:386-388](changedetectionio/blueprint/ui/__init__.py:386-388)
-    ```python
-    for k in list(watch.keys()):
-        if k.startswith('notification_'):
-            del watch[k]
-    ```
+**持久化机制**：
+- 存储在 `datastore.data['settings']['application']['tags']` 字典中
+- 每个 Tag 有独立的目录和 `tag.json` 文件 [model/Tags.py:9-29](changedetectionio/model/Tags.py:9-29)
+- 删除 Tag 时通过 `TagsDict.__delitem__` 自动清理文件系统
 
-2.  **删除的字段包括**：
-    - `notification_urls` - 通知目标 URL（可能包含 Webhook 密钥）
-    - `notification_title` / `notification_body` - 通知模板
-    - `notification_format` - 通知格式
-    - `notification_muted` - 静音状态
-    - `notification_screenshot` - 是否包含截图
-    - `notification_alert_count` - 通知计数
+### 3.2 分组与 Watch 的关联机制
 
-3.  **导入时也不接受**：通知相关字段不在导入白名单中
+**关联方式**：
+- Watch 通过 `tags` 字段（列表）引用 Tag UUID
+- 支持手动分配和自动匹配两种方式
 
-### 3.3 全局配置的影响
+**自动匹配机制**：
+- Tag 可配置 `url_match_pattern`，支持通配符（`*`, `?`, `[ ]`）或子串匹配
+- `get_all_tags_for_watch()` 方法返回 Watch 的所有关联 Tag，包括：
+  1. 手动分配的 Tag
+  2. URL 模式自动匹配的 Tag [store/__init__.py:980-994](changedetectionio/store/__init__.py:980-994)
 
-在分享导出时，会合并以下全局配置到 Watch 数据中：
-- `global_ignore_text` → 追加到 `ignore_text`
-- `global_subtractive_selectors` → 追加到 `subtractive_selectors`
+```python
+# 手动分配的 Tag
+result = dictfilt(self.__data['settings']['application']['tags'], watch.get('tags', []))
+# URL 自动匹配的 Tag
+for tag_uuid, tag in self.__data['settings']['application']['tags'].items():
+    if tag_uuid not in result and tag.matches_url(watch_url):
+        result[tag_uuid] = tag
+```
 
-**设计意图**：确保接收方导入后，过滤行为与原实例保持一致。
+### 3.3 分组与通知配置的耦合点
+
+**三级级联覆盖机制**：
+
+通知配置采用 Watch → Tag → Global 的三级优先级链，在 `_check_cascading_vars()` 中实现 [notification_service.py:17-54](changedetectionio/notification_service.py:17-54)：
+
+```python
+def _check_cascading_vars(datastore, var_name, watch):
+    # Level 1: Watch 级别（最高优先级）
+    v = watch.get(var_name)
+    if v and not watch.get('notification_muted'):
+        return v
+
+    # Level 2: Tag 级别（遍历所有关联 Tag）
+    tags = datastore.get_all_tags_for_watch(uuid=watch.get('uuid'))
+    if tags:
+        for tag_uuid, tag in tags.items():
+            v = tag.get(var_name)
+            if v and not tag.get('notification_muted'):
+                return v  # 第一个匹配的 Tag 生效
+
+    # Level 3: Global 级别（最低优先级）
+    if datastore.data['settings']['application'].get(var_name):
+        return datastore.data['settings']['application'].get(var_name)
+
+    return None
+```
+
+**可被 Tag 覆盖的通知字段**：
+- `notification_urls` - 通知目标 URL
+- `notification_title` - 通知标题模板
+- `notification_body` - 通知正文模板
+- `notification_format` - 通知格式（text/html/markdown）
+- `notification_muted` - 通知静音状态
+- `notification_screenshot` - 是否包含截图
+- `notification_alert_count` - 通知告警计数
+
+**静音状态的级联**：
+- 任意一级设置 `notification_muted=True` 会阻止该级别及其下级的通知
+- Watch 静音不影响 Tag，Tag 静音不影响 Global，但会跳过本级
+
+### 3.4 分享时的分组处理
+
+**分享导出时**：
+- Watch 的 `tags` 字段（UUID 列表）会包含在分享数据中
+- 但 Tag 实体本身（包括其通知配置、覆盖规则）**不会**被分享
+- 接收方导入后，若不存在对应 UUID 的 Tag，则标签关联失效
+
+**分享导入时**：
+- `tags` 字段在导入白名单中 [store/__init__.py:710](changedetectionio/store/__init__.py:710)
+- 但仅导入 UUID 引用，不导入 Tag 实体
+- `overrides_watch`、`notification_*` 等 Tag 级字段不在导入白名单中
+
+### 3.5 匿名与登录用户在分组功能上的权限差异
+
+**所有分组管理端点都受 `@login_optionally_required` 保护** [blueprint/tags/__init__.py:14-264](changedetectionio/blueprint/tags/__init__.py:14-264)：
+
+| 功能 | 路由 | 登录用户 | 匿名用户 |
+|------|------|---------|---------|
+| 查看分组列表 | `/tags/list` | ✅ 可访问 | ❌ 重定向到登录 |
+| 创建分组 | `/tags/add` | ✅ 可创建 | ❌ 重定向到登录 |
+| 编辑分组 | `/tags/edit/<uuid>` | ✅ 可编辑 | ❌ 重定向到登录 |
+| 静音分组 | `/tags/mute/<uuid>` | ✅ 可操作 | ❌ 重定向到登录 |
+| 删除分组 | `/tags/delete/<uuid>` | ✅ 可删除 | ❌ 重定向到登录 |
+| 取消关联 | `/tags/unlink/<uuid>` | ✅ 可操作 | ❌ 重定向到登录 |
+
+**间接权限边界**：
+- 匿名用户无法通过 `/tags/*` 路由直接管理分组
+- 但匿名用户通过 Diff 页面可**间接看到** Tag 级通知配置的效果（如通知标题、正文内容）
+- 匿名用户无法知道具体使用了哪个 Tag 或其 UUID
 
 ---
 
 ## 四、失效、撤销与历史 Diff 暴露面处理
 
-### 4.1 分享链接的有效性
+### 4.1 分享链接的有效性边界
 
-**当前设计限制：**
+**已实现的约束**：
 
-1.  **无本地失效机制**：分享链接的有效性完全由中央服务器 `changedetection.io` 控制
-2.  **无撤销机制**：本地实例无法主动撤销已分享的链接
-3.  **无过期时间**：分享链接不会自动过期
-4.  **修改不联动**：原 Watch 修改后，已分享的链接不会自动更新
+| 约束 | 实现位置 | 说明 |
+|------|---------|------|
+| 历史快照不分享 | [blueprint/ui/__init__.py:382-383](changedetectionio/blueprint/ui/__init__.py:382-383) | `del watch['history']` 明确删除 |
+| 通知配置不分享 | [blueprint/ui/__init__.py:386-388](changedetectionio/blueprint/ui/__init__.py:386-388) | 遍历删除所有 `notification_` 前缀字段 |
+| 导入字段白名单 | [store/__init__.py:696-717](changedetectionio/store/__init__.py:696-717) | 仅允许 21 个安全字段 |
+| 请求超时保护 | [store/__init__.py:688-692](changedetectionio/store/__init__.py:688-692) | 导入时 5 秒超时限制 |
 
-**风险提示**：一旦分享，数据就上传到了第三方服务器，本地无法控制其后续访问。
+**现状限制（未实现的功能）**：
+
+| 功能 | 现状 | 代码证据 |
+|------|------|---------|
+| 本地撤销机制 | ❌ 未实现 | 整个代码库无 `revoke_share`、`delete_share` 等相关逻辑 |
+| 过期时间 | ❌ 未实现 | 分享数据中无 `expires_at`、`ttl` 等字段 |
+| 分享链接列表 | ❌ 未实现 | 分享链接仅存储在 Flask Session 中，刷新即丢失 |
+| 修改联动 | ❌ 未实现 | 原 Watch 修改后不会通知中央服务器更新 |
+| 访问日志 | ❌ 未实现 | 无代码记录谁访问了分享链接 |
+| 访问密码 | ❌ 未实现 | 分享链接无需密码即可导入 |
+
+**风险提示**：一旦分享，数据就上传到了第三方服务器 `changedetection.io`，本地无法控制其后续访问、修改或删除。
 
 ### 4.2 历史 Diff 暴露面控制
 
@@ -165,6 +259,7 @@ title, trigger_text, url, use_page_title_in_list, webdriver_js_execute_code
 
 - **历史快照不分享**：`history` 字段在分享时被明确删除 [blueprint/ui/__init__.py:382-383](changedetectionio/blueprint/ui/__init__.py:382-383)
 - 分享的仅包含监控配置（URL、过滤器、Headers 等），不包含任何历史快照数据
+- **注意**：`previous_md5` 字段在导入白名单中，但这只是校验和，不包含实际内容
 
 #### 4.2.2 匿名访问时的历史数据控制
 
@@ -201,6 +296,16 @@ SHARED_DIFF_READ_ONLY_ENDPOINTS = frozenset({
 })
 ```
 
+**测试验证** [test_access_control.py:55-64](changedetectionio/tests/test_access_control.py:55-64)：
+```python
+# Extract GET/POST 必须重定向到登录
+res = c.get(url_for("ui.ui_diff.diff_history_page_extract_GET", uuid="first"))
+assert res.status_code == 302
+
+res = c.post(url_for("ui.ui_diff.diff_history_page_extract_POST", uuid="first"), data={...})
+assert res.status_code == 302
+```
+
 ---
 
 ## 五、架构总结
@@ -216,7 +321,17 @@ SHARED_DIFF_READ_ONLY_ENDPOINTS = frozenset({
 | 撤销能力 | 依赖中央服务器 | 关闭 `shared_diff_access` 即可 |
 | 适用场景 | 分享监控模板给他人 | 团队内共享变更结果 |
 
-### 5.2 安全设计原则
+### 5.2 分组（Tag）架构特性
+
+| 特性 | 说明 |
+|------|------|
+| 继承关系 | Tag 继承自 watch_base，与 Watch 共享所有字段 |
+| 覆盖机制 | Watch → Tag → Global 三级级联，`overrides_watch` 控制优先级 |
+| 自动匹配 | 支持 URL 模式自动分配 Tag 到 Watch |
+| 持久化 | 每个 Tag 独立存储，删除时自动清理文件 |
+| 分享范围 | 仅分享 Watch 中的 Tag UUID 引用，不分享 Tag 实体 |
+
+### 5.3 安全设计原则
 
 1.  **最小权限原则**：匿名用户仅能访问只读 Diff 相关端点
 2.  **隐私保护**：通知配置等敏感信息在分享时完全剥离
@@ -226,13 +341,14 @@ SHARED_DIFF_READ_ONLY_ENDPOINTS = frozenset({
     - 静态资源层：`static_content` 路由的额外检查
     - 视图层：根据 `password_enabled_and_share_is_off` 控制 UI
 
-### 5.3 潜在改进点
+### 5.4 潜在改进点
 
 1.  **分享链接管理**：增加本地分享链接列表，支持查看和撤销
 2.  **过期机制**：支持设置分享链接的过期时间
 3.  **端到端加密**：分享数据在上传前加密，仅分享方可解密
 4.  **访问日志**：记录匿名用户对 Diff 页面的访问
 5.  **标签映射**：跨实例分享时支持标签名称到 UUID 的映射
+6.  **Tag 分享**：支持单独分享 Tag 配置（不含敏感信息）
 
 ---
 
@@ -250,3 +366,9 @@ SHARED_DIFF_READ_ONLY_ENDPOINTS = frozenset({
 | Diff 页面权限变量 | `processors/text_json_diff/difference.py` | 161-163 |
 | 导入字段白名单 | `store/__init__.py` | 696-717 |
 | 通知字段删除逻辑 | `blueprint/ui/__init__.py` | 386-388 |
+| Tag 模型定义 | `model/Tag.py` | 26-68 |
+| Tag 集合类 | `model/Tags.py` | 9-39 |
+| 通知级联覆盖 | `notification_service.py` | 17-54 |
+| 获取 Watch 的所有 Tag | `store/__init__.py` | 980-994 |
+| Tag 管理路由 | `blueprint/tags/__init__.py` | 14-264 |
+| 访问控制测试 | `tests/test_access_control.py` | 55-75 |
