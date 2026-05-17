@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-本文档分析 changedetection.io 项目中 LLM 变更摘要功能的上下文体积控制机制，包括 Prompt 组装流程、Token Budget 裁剪顺序、四条路径的预算生效时机、重复累加 Bug、超限后行为以及响应解析失败的处理方式。
+本文档分析 changedetection.io 项目中 LLM 变更摘要功能的上下文体积控制机制，包括 Prompt 组装流程、Token Budget 裁剪顺序、四条路径的预算生效时机、超限后行为、双重累加 Bug 分析、测试覆盖情况以及响应解析失败的处理方式。
 
 ## 2. 上下文体积控制机制
 
@@ -16,7 +16,7 @@
 | 快照上下文字符限制 | `prompt_builder.SNAPSHOT_CONTEXT_CHARS` | 3,000 | 评估调用时的当前页面状态摘录限制 |
 | BM25 裁剪默认限制 | `bm25_trim.MAX_CONTEXT_CHARS` | 15,000 | BM25 相关性裁剪的默认字符数 |
 | 预览内容限制 | `build_preview_prompt()` | 6,000 | 实时预览提取的页面内容限制 |
-| 设置调用摘录限制 | `build_setup_prompt()` | 4,000 | 预过滤器设置调用的页面摘录限制 |
+| 设置调用摘录限制 | `build_setup_prompt()` | 4,000 | 预过滤器设置调用的页面内容摘录限制 |
 
 **关键代码位置**:
 - `evaluator.py:34-45` - `_get_max_input_chars()`
@@ -40,13 +40,13 @@ def _check_input_size(text: str, max_chars: int) -> None:
 - `summarise_change()` - 变更摘要生成前检查 (evaluator.py:521)
 - `preview_extract()` - 实时预览提取前检查 (evaluator.py:598)
 - `evaluate_change()` - 变更评估前检查 (evaluator.py:651)
-- ⚠️ `run_setup()` - **不进行**输入大小检查
+- ⚠️ `run_setup()` - **完全不进行**输入大小检查
 
 ## 3. 四条 LLM 路径的 Token Budget 生效顺序与超限行为
 
 ### 3.1 关键发现 1：`_check_token_budget` 的行为
 
-**重要纠正**：`_check_token_budget()` 函数只返回 `bool`，从不抛出异常。在大多数场景下，其返回值甚至被忽略，仅用于日志记录。
+**重要结论**：`_check_token_budget()` 函数只返回 `bool`，从不抛出异常。在大多数场景下，其返回值甚至被忽略，仅用于日志记录。
 
 ```python
 def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
@@ -61,11 +61,13 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
 
 ### 3.2 关键发现 2：`summarise_change` 存在双重累加 Bug
 
-**严重问题**：`summarise_change()` 中对 `llm_tokens_used_cumulative` 执行了**两次累加**，导致累计值是实际使用量的 2 倍，会提前触发累计阈值。
+**严重 Bug**：`summarise_change()` 中对 `llm_tokens_used_cumulative` 执行了**两次累加**，导致累计值是实际使用量的 2 倍，会提前触发累计阈值。
+
+**代码位置**：`evaluator.py:559-561`
 
 ```python
 # 第 559 行：第一次累加 — 在 _check_token_budget() 内部执行
-_check_token_budget(watch, cfg, tokens)
+_check_token_budget(watch, cfg, tokens)  # → 内部执行 watch['llm_tokens_used_cumulative'] += tokens
 
 # 第 561 行：第二次累加 — 手动重复执行
 watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') or 0) + tokens
@@ -73,10 +75,31 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
 
 **影响**：实际 token 使用量被翻倍计算，导致 Per-Watch 累计预算阈值提前触发。
 
-**对比**：
-- `evaluate_change()`：仅通过 `_check_token_budget()` 累加一次 ✓
-- `run_setup()`：仅通过 `_check_token_budget()` 累加一次 ✓
-- `preview_extract()`：完全不累加 Watch Token ✓
+**对比验证**：
+- `evaluate_change()`：仅通过 `_check_token_budget()` 累加一次 ✓ (evaluator.py:712)
+- `run_setup()`：仅通过 `_check_token_budget()` 累加一次 ✓ (evaluator.py:403)
+- `preview_extract()`：完全不累加 Watch Token ✓ (evaluator.py 第 579-626 行无 _check_token_budget 调用)
+
+#### 可复现实例分析
+
+**场景**：假设配置了 `max_tokens_cumulative = 1000`
+
+```python
+# 第一次调用 summarise_change，实际使用 400 tokens
+_check_token_budget(watch, cfg, 400)  # → watch['llm_tokens_used_cumulative'] = 400
+watch['llm_tokens_used_cumulative'] += 400  # → 第二次累加 → 800 ❌
+
+# 第二次调用 summarise_change，再使用 300 tokens
+_check_token_budget(watch, cfg, 300)  # → 800 + 300 = 1100
+watch['llm_tokens_used_cumulative'] += 300  # → 1100 + 300 = 1400 ❌
+
+# 结果：累计值显示 1400（已超过 1000 阈值），但实际仅使用 700 tokens
+```
+
+**后果**：
+1. `evaluate_change()` 调用前的预检查会错误地认为预算已超限（1400 > 1000）
+2. 提前触发"开放失败"逻辑，`important=True`，导致不应发送的通知被发送
+3. 用户认为已使用 1400 tokens，但实际只消耗了 700 tokens
 
 ### 3.3 路径一：设置预过滤器 (run_setup)
 
@@ -89,11 +112,11 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
     ↓
 2. 检查是否有 intent → 无 intent: return
     ↓
-3. ⚠️ 完全不检查输入字符大小!
+3. ⚠️ 完全不检查输入字符大小
     ↓
-4. ⚠️ 完全不检查全局月度预算!
+4. ⚠️ 完全不检查全局月度预算
     ↓
-5. ⚠️ 完全不检查 Per-Watch 累计预算!
+5. ⚠️ 完全不检查 Per-Watch 累计预算
     ↓
 6. 执行 LLM 调用
     ↓
@@ -112,7 +135,7 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
 - Token 仍会计入全局和 Watch 累计
 - 异常时静默失败，设置 `llm_prefilter = None`
 
-**代码位置**: `evaluator.py:373-410`
+**代码位置**：`evaluator.py:373-410`
 
 ### 3.4 路径二：变更摘要 (summarise_change)
 
@@ -127,17 +150,19 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
     ↓
 3. 检查输入字符大小 → 超限: 抛出 LLMInputTooLargeError
     ↓
-4. 执行 LLM 调用
+4. ⚠️ 完全不检查 Per-Watch 累计预算
+    ↓
+5. 执行 LLM 调用
     ↓
 调用 LLM 后（记账阶段）
     ↓
-5. 调用 _check_token_budget() → 返回值被 IGNORED!
+6. 调用 _check_token_budget() → 返回值被 IGNORED!
    - 第一次累加 tokens 到 watch['llm_tokens_used_cumulative']
     ↓
-6. ⚠️ 手动第二次累加 tokens（双重累加 Bug!）
+7. ⚠️ 手动第二次累加 tokens（双重累加 Bug!）
    - watch['llm_tokens_used_cumulative'] += tokens 再次执行
     ↓
-7. 累加全局 Token 计数
+8. 累加全局 Token 计数
 ```
 
 **超限后行为总结**：
@@ -147,7 +172,7 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
   - ⚠️ 此预算检查**不具有阻止调用或拦截返回的实际效果**
 - ⚠️ 双重累加 Bug 导致累计值是实际使用量的 2 倍，提前触发阈值
 
-**代码位置**: `evaluator.py:494-572`
+**代码位置**：`evaluator.py:494-572`
 
 ### 3.5 路径三：变更评估 (evaluate_change)
 
@@ -188,7 +213,7 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
 - 单次 Per-Watch 预算超限（调用后）：仅记录日志，结果正常返回
 - 无双重累加 Bug
 
-**代码位置**: `evaluator.py:633-728`
+**代码位置**：`evaluator.py:633-728`
 
 ### 3.6 路径四：实时预览 (preview_extract)
 
@@ -203,7 +228,7 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
     ↓
 3. 检查输入字符大小 → 超限: 抛出 LLMInputTooLargeError
     ↓
-4. ⚠️ 完全不检查全局月度预算!
+4. ⚠️ 完全不检查全局月度预算
     ↓
 5. 执行 LLM 调用
     ↓
@@ -223,7 +248,7 @@ watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') o
 - 仅参与全局 Token 预算累计
 - Per-Watch 预算限制对实时预览路径**完全无效**
 
-**代码位置**: `evaluator.py:579-626`
+**代码位置**：`evaluator.py:579-626`
 
 ### 3.7 四条路径统一对照表
 
@@ -272,7 +297,7 @@ the model enough surrounding text to describe each change accurately.
 **原因分析**：
 
 1. **幻觉问题**：完整的页面摘录会导致 LLM 将未变更的内容（如旧的发布说明 bullet）错误地报告为"变更了什么"
-2. **上下文已足够**：diff 本身通过 `unified_diff` 的 `n=3` 上下文行（变更前后各 3 行）已经提供了足够的周边文本来准确描述每个变更
+2. **上下文已足够**：diff 本身通过 unified diff 的 `n=3` 上下文行（变更前后各 3 行）已经提供了足够的周边文本来准确描述每个变更
 3. **准确性优先**：变更摘要的核心是描述 diff 中的实际变化，而非整个页面的状态。提供过多未变更的上下文反而会干扰 LLM 的判断
 
 ### 4.3 系统 Prompt 分离设计
@@ -383,7 +408,7 @@ def _summary_max_tokens(diff: str, max_cap: int = LLM_DEFAULT_MAX_SUMMARY_TOKENS
 2. UI 设置中的 token budget
 3. 0 = 无限制 (默认)
 
-**预算检查路径差异**: 详见第 3 章四条路径统一对照表
+**预算检查路径差异**: 详见第 3.7 节四条路径统一对照表
 
 ## 6. 响应解析失败处理
 
@@ -495,9 +520,65 @@ MD5( diff_text + '\x00' + prompt )
 
 每个唯一的 (intent, diff) 组合只评估一次，避免重复消耗 Token。
 
-## 8. 总结
+## 8. 测试覆盖分析
 
-### 8.1 上下文体积控制要点
+### 8.1 测试文件覆盖矩阵
+
+| 测试文件 | 覆盖路径 | 核心测试内容 |
+|---------|---------|-------------|
+| `tests/llm/test_evaluator.py` | evaluate_change, summarise_change | 缓存、token 预算、级联解析、失败开放策略 |
+| `tests/test_llm_change_summary.py` | summarise_change | 表单持久化、级联、通知 Token 替换、错误处理、全局默认、AJAX 集成 |
+| `tests/test_llm_token_budget.py` | evaluate_change (全局), run_setup | 全局月度预算、成本追踪、防篡改 |
+| `tests/test_llm_preview.py` | preview_extract | 意图匹配、无意图时不调用 LLM、LLM 失败不破坏预览 |
+
+### 8.2 四条路径的测试覆盖映射
+
+| 代码行为 | 对应测试用例 | 是否覆盖 | 备注 |
+|---------|-------------|---------|------|
+| **run_setup** | | | |
+| 不配置 LLM 时直接 return | 无专门测试 | ✗ | |
+| 无 intent 时直接 return | 无专门测试 | ✗ | |
+| 调用后执行 token 累计 | 无专门测试 | ✗ | |
+| 异常时静默设置 prefilter=None | 无专门测试 | ✗ | |
+| **summarise_change** | | | |
+| LLM 未配置时返回 '' | `test_returns_empty_when_llm_not_configured` | ✓ | `test_evaluator.py:441-446` |
+| 全局预算超限返回 '' | `test_summarise_change_global_budget_exceeded` | ✓ | `test_evaluator.py` |
+| 输入字符超限抛出异常 | `test_llm_summary_ajax_surfaces_rate_limit_error` | ✓ | `test_llm_change_summary.py:150-193` |
+| 空 diff 不调用 LLM | `test_returns_empty_when_diff_empty` | ✓ | `test_evaluator.py:463-470` |
+| 使用默认 prompt | `test_uses_default_prompt_when_no_summary_prompt` | ✓ | `test_evaluator.py:448-461` |
+| LLM 调用失败重新抛出 | `test_llm_failure_raises` | ✓ | `test_evaluator.py:493-500` |
+| 动态调整 token 上限 | `test_uses_higher_token_limit_than_eval` | ✓ | `test_evaluator.py:502-514` |
+| 双重累加 Bug | ❌ 无专门测试 | ✗ | 现有测试可能会误判 |
+| 调用前不检查 Per-Watch 累计 | ❌ 无专门测试 | ✗ | |
+| **evaluate_change** | | | |
+| LLM 未配置返回 None | `test_returns_none_when_llm_not_configured` | ✓ | `test_evaluator.py:163-168` |
+| 无 intent 返回 None | `test_returns_none_when_no_intent` | ✓ | `test_evaluator.py:170-175` |
+| 缓存命中跳过 LLM 调用 | `test_cache_hit_skips_llm_call` | ✓ | `test_evaluator.py:204-222` |
+| 全局预算超限开放失败 | `test_evaluate_change_global_budget_exceeded` | ✓ | `test_evaluator.py` |
+| Per-Watch 累计超限开放失败 | `test_evaluate_change_skips_call_when_cumulative_over_budget` | ✓ | `test_evaluator.py:362-375` |
+| 调用后单次超限仅记录日志 | `test_evaluate_change_per_check_limit_fails_open` | ✓ | `test_evaluator.py:377-392` |
+| LLM 失败开放失败 | `test_llm_failure_returns_important_true` | ✓ | `test_evaluator.py:224-235` |
+| last_tokens_used 存储 | `test_last_tokens_used_stored_after_eval` | ✓ | `test_evaluator.py:250-261` |
+| 累计 token 累加 | `test_cumulative_tokens_accumulate_across_evals` | ✓ | `test_evaluator.py:263-280` |
+| **preview_extract** | | | |
+| LLM 未配置返回 None | `test_preview_no_llm_evaluation_when_llm_not_configured` | ✓ | `test_llm_preview.py:183-203` |
+| 无 intent 返回 None | `test_preview_no_llm_evaluation_without_intent` | ✓ | `test_llm_preview.py:163-180` |
+| 内容为空返回 None | ❌ 无专门测试 | ✗ | |
+| LLM 失败不破坏预览 | `test_preview_llm_failure_does_not_break_preview` | ✓ | `test_llm_preview.py:210-232` |
+| 完全不累加 Watch Token | ❌ 无专门测试 | ✗ | 设计如此，不检查 |
+| 不检查全局月度预算 | ❌ 无专门测试 | ✗ | |
+
+### 8.3 测试缺口总结
+
+1. **run_setup 路径**：完全无覆盖（0 测试）
+2. **summarise_change 双重累加 Bug**：无专门测试验证累计值正确性
+3. **summarise_change 调用前 Per-Watch 检查**：未验证是否跳过检查
+4. **preview_extract 全局预算检查**：未验证是否跳过检查
+5. **四条路径一致性**：无测试直接对比四条路径的行为差异
+
+## 9. 总结
+
+### 9.1 上下文体积控制要点
 
 1. **多层级限制**: 从全局 100k 字符到各场景的精细限制
 2. **智能裁剪**: BM25 相关性优先裁剪，保留语义完整性
@@ -505,18 +586,18 @@ MD5( diff_text + '\x00' + prompt )
 4. **本地模型适配**: 为自托管模型提供额外的 Token 乘数
 5. **预算保护**: 全局月度预算 + Per-Watch 双重保护（但实际效果因路径而异）
 
-### 8.2 Token Budget 关键发现
+### 9.2 Token Budget 关键发现
 
-1. **`_check_token_budget` 从不抛异常**：仅返回 bool，大多数场景下返回值被忽略
-2. **四条路径行为高度不一致**：
+1. **`_check_token_budget` 从不抛异常**: 仅返回 bool，大多数场景下返回值被忽略
+2. **四条路径行为高度不一致**:
    - run_setup：完全不进行任何预检查
    - summarise_change：调用前只检查全局预算，存在双重累加 Bug
    - evaluate_change：调用前检查全局和累计预算，采用开放失败策略
    - preview_extract：完全不检查 Per-Watch 预算和全局预算
-3. **预算超限的实际效果有限**：多数情况下仅记录日志，不阻止调用或拦截结果
-4. **⚠️ 双重累加 Bug**：`summarise_change` 中 token 被重复累加，导致累计值是实际使用量的 2 倍
+3. **预算超限的实际效果有限**: 多数情况下仅记录日志，不阻止调用或拦截结果
+4. **⚠️ 双重累加 Bug**: `summarise_change` 中 token 被重复累加，导致累计值是实际使用量的 2 倍
 
-### 8.3 变更摘要不使用快照上下文的核心原因
+### 9.3 变更摘要不使用快照上下文的核心原因
 
 | 问题 | 影响 | 解决方案 |
 |-----|------|---------|
@@ -524,7 +605,7 @@ MD5( diff_text + '\x00' + prompt )
 | 上下文冗余 | diff 本身已包含 n=3 上下文行 | 依赖 diff 内置上下文而非额外快照 |
 | 准确性干扰 | 未变更内容会分散 LLM 注意力 | 聚焦于实际变更行，减少噪声 |
 
-### 8.4 失败处理原则
+### 9.4 失败处理原则
 
 1. **JSON 解析失败**: 保守默认值（不触发通知）
 2. **LLM 调用失败**: 开放失败（触发通知，不遗漏变更）
@@ -532,7 +613,7 @@ MD5( diff_text + '\x00' + prompt )
 4. **输入过大**: 明确错误提示，不进行部分处理
 5. **Per-Watch 预算超限**: 多数情况下仅记录日志，不影响功能
 
-### 8.5 关键设计决策与 Bug
+### 9.5 关键设计决策与 Bug
 
 | 决策 / Bug | 原因 / 影响 |
 |-----------|------------|
@@ -540,7 +621,7 @@ MD5( diff_text + '\x00' + prompt )
 | 系统/用户 Prompt 分离 | 用户可完全自定义输出格式，灵活性高 |
 | 移动行预标记 (~前缀) | 避免 LLM 误判重排序为变更，减少误报 |
 | 调用失败时开放失败 | 不因为 LLM 故障错过重要变更，保证不遗漏 |
-| 多级 Prompt 级联 | Watch > Tag > Global > 硬编码默认，配置灵活 |
+| 多级 Prompt 级联 | Watch > Tag > Global > 硬编码默认 |
 | 变更摘要不使用快照上下文 | 防止 LLM 将未变更内容报告为变更，提高准确性 |
 | _check_token_budget 返回值被忽略 | 预算仅作参考/监控，不阻断核心功能 |
 | **summarise_change 双重累加 Bug** | **Token 使用量被翻倍计算，累计阈值提前触发** |
