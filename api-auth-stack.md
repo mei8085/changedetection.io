@@ -459,20 +459,65 @@ Flask 路由匹配
 
 ---
 
-## 8. 为什么是这个顺序？设计合理性分析
+## 8. 开关维度下的行为矩阵
 
-### 8.1 当前顺序的设计意图
+### 8.1 核心条件分支
+
+装饰器的实际行为受两个关键条件控制：
+
+1. **`api_access_token_enabled` 开关**：
+   - 开启（`True`）：执行 `x-api-key` 验证，失败返回 403
+   - 关闭（`False`）：跳过认证，直接进入下一层
+
+2. **请求方法**：
+   - `GET`：`validate_openapi_request` 跳过验证（无请求体）
+   - `非 GET`（POST/PUT/DELETE）：`validate_openapi_request` 执行 schema 验证
+
+### 8.2 请求方法 × 开关状态 × 装饰器进入顺序 × 结果矩阵
+
+以下矩阵以标准接口（Watch/Tags）为例，Import/Spec 接口的差异在备注中说明：
+
+| 接口类 | api_access_token_enabled | 请求方法 | 进入装饰器顺序 | 可能的拦截点 | 可能返回结果 | 备注 |
+|--------|--------------------------|----------|----------------|--------------|--------------|------|
+| **Watch/Tags** | ✅ 开启 | **GET** | 1. csrf.exempt<br>2. check_token<br>3. validate_openapi_request（跳过）<br>4. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• 无其他拦截点 | • 403（密钥错误）<br>• 200（成功）<br>• 404（资源不存在） | GET 请求跳过 OpenAPI 验证 |
+| **Watch/Tags** | ✅ 开启 | **非 GET**（POST/PUT/DELETE） | 1. csrf.exempt<br>2. check_token<br>3. validate_openapi_request<br>4. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• validate_openapi_request：schema 无效 → 400 | • 403（密钥错误）<br>• 400（请求体无效）<br>• 200/201（成功）<br>• 404（资源不存在） | 非 GET 请求执行完整验证 |
+| **Watch/Tags** | ❌ 关闭 | **GET** | 1. csrf.exempt<br>2. check_token（跳过）<br>3. validate_openapi_request（跳过）<br>4. 原函数 | 无拦截点（check_token 和 validate 都跳过） | • 200（成功）<br>• 404（资源不存在） | 完全无保护，匿名可访问 |
+| **Watch/Tags** | ❌ 关闭 | **非 GET**（POST/PUT/DELETE） | 1. csrf.exempt<br>2. check_token（跳过）<br>3. validate_openapi_request<br>4. 原函数 | • validate_openapi_request：schema 无效 → 400 | • 400（请求体无效）<br>• 200/201（成功）<br>• 404（资源不存在） | 无认证，但仍有格式验证 |
+| **Import** | ✅ 开启 | **POST**（仅支持 POST） | 1. csrf.exempt<br>2. check_token<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | • check_token：x-api-key 不匹配 → 403<br>• validate_openapi_request：schema 无效 → 400 | • 403（密钥错误）<br>• 400（请求体无效）<br>• 200（成功） | default_content_type 必须在 validate 之前 |
+| **Import** | ❌ 关闭 | **POST**（仅支持 POST） | 1. csrf.exempt<br>2. check_token（跳过）<br>3. default_content_type<br>4. validate_openapi_request<br>5. 原函数 | • validate_openapi_request：schema 无效 → 400 | • 400（请求体无效）<br>• 200（成功） | 无认证，但仍有格式验证 |
+| **Spec** | ✅ 开启 | **GET**（仅支持 GET） | 1. csrf.exempt<br>2. 原函数（无装饰器） | 无拦截点（Spec 无 check_token） | • 200（成功） | Spec 接口无任何装饰器，始终公开 |
+| **Spec** | ❌ 关闭 | **GET**（仅支持 GET） | 1. csrf.exempt<br>2. 原函数（无装饰器） | 无拦截点 | • 200（成功） | 与开关开启时行为完全相同 |
+
+### 8.3 关键观察
+
+1. **Spec 接口是例外**：无论开关状态如何，都无认证保护（设计为公开元数据）
+2. **Import 接口仅支持 POST**：无 GET 场景
+3. **开关关闭时 GET 请求完全无保护**：认证和验证都跳过
+4. **开关关闭时非 GET 请求仍有格式验证**：但无认证保护
+5. **default_content_type 始终执行**：不受开关影响（不是条件装饰器）
+
+---
+
+## 9. 为什么是这个顺序？设计合理性分析
+
+### 9.1 当前顺序的设计意图
+
+> **注意**：以下安全/性能优势仅在 `api_access_token_enabled = True` 时成立
 
 **`auth.check_token` 在外层（先执行）**：
-- ✅ **安全优先**：尽早拦截未认证请求，避免消耗后续验证资源
-- ✅ **最小化攻击面**：未认证请求无法触及更复杂的 OpenAPI 验证逻辑
-- ✅ **性能优化**：认证失败快速返回，不加载 OpenAPI 规范
+- ✅ **安全优先（开关开启时）**：尽早拦截未认证请求，避免消耗后续验证资源
+- ✅ **最小化攻击面（开关开启时）**：未认证请求无法触及更复杂的 OpenAPI 验证逻辑
+- ✅ **性能优化（开关开启时）**：认证失败快速返回，不加载 OpenAPI 规范
 
 **`validate_openapi_request` 在内层（后执行）**：
-- ✅ **认证后验证**：只对已认证的请求进行格式验证，节省资源
-- ⚠️ **潜在风险**：如果认证被绕过，恶意请求可能触发 schema 验证漏洞
+- ✅ **认证后验证（开关开启时）**：只对已认证的请求进行格式验证，节省资源
+- ⚠️ **潜在风险（开关开启时）**：如果认证被绕过，恶意请求可能触发 schema 验证漏洞
 
-### 8.2 如果顺序颠倒会怎样？
+**开关关闭时**：
+- check_token 跳过，顺序优势失效
+- 非 GET 请求仍会执行 validate_openapi_request，但此时无认证保护
+
+### 9.2 如果顺序颠倒会怎样？
 
 假设代码写成：
 ```python
@@ -488,22 +533,25 @@ def get(self, uuid):
 3. auth.check_token（后验证认证）
 4. 原函数
 
-**安全影响**：
+**安全影响（仅开关开启时）**：
 - ⚠️ **资源消耗**：未认证的恶意请求可以触发 OpenAPI 验证逻辑，消耗 CPU/内存
 - ⚠️ **攻击面扩大**：攻击者可以在认证前探测 schema 验证器的漏洞
 - ❌ **不会绕过认证**：两个装饰器都会执行，只是顺序不同，认证仍然有效
 
 **功能影响**：
 - Import 接口的 `default_content_type` 如果放在 `validate_openapi_request` 之后，会导致验证时 Content-Type 尚未设置，可能验证失败
+- 此影响与开关状态无关
 
 ---
 
-## 9. 顺序差异的安全与功能影响
+## 10. 顺序差异的安全与功能影响
 
-### 9.1 认证与验证顺序的安全权衡
+### 10.1 认证与验证顺序的安全权衡
 
-| 顺序 | 安全特性 | 性能特性 | 推荐场景 |
-|------|----------|----------|----------|
+> **注意**：以下权衡仅在 `api_access_token_enabled = True` 时成立
+
+| 顺序 | 安全特性（开关开启时） | 性能特性（开关开启时） | 推荐场景 |
+|------|------------------------|------------------------|----------|
 | **认证 → 验证**（当前） | 攻击面小，未认证请求无法触发复杂验证 | 认证失败快速返回，节省验证资源 | ✅ 大多数场景 |
 | 验证 → 认证 | 攻击面大，未认证请求可触发验证逻辑 | 验证失败也快速返回，但验证本身消耗资源 | ❌ 不推荐 |
 
