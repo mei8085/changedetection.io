@@ -31,10 +31,12 @@
 
    **排序逻辑**：按元素面积（width × height）**从小到大**排序（升序）
 
+**排序逻辑**：按元素面积（width × height）**从小到大**排序（升序）
+
 **设计意图**：
-- 当鼠标悬停在某个区域时，遍历顺序是小元素在前
-- 但由于 `forEach` 会遍历所有匹配元素并不断覆盖 `currentSelection`，**最终匹配的是最后一个（最大的）元素**
-- 这是因为多个嵌套元素都包含鼠标点时，数组升序排列导致小元素先匹配、大元素后匹配，最后赋值的大元素成为最终结果
+- 注释写着"so we find the smallest one first"，希望优先匹配最小元素
+- **但实际效果相反**：由于 `forEach` 会遍历所有匹配元素并不断覆盖 `currentSelection`，升序排列时小元素先匹配、大元素后匹配，**最终匹配的是最后一个（最大的）元素**
+- 这个排序实际上会导致选中最外层的父容器元素，与注释意图相反
 
 **排序时机**：在浏览器端采集完成后、数据返回前进行排序
 
@@ -722,7 +724,7 @@ def get_filter_config_hash(self):
 | 编辑页面 | `changedetectionio/blueprint/ui/edit.py` | 编辑页面路由与表单处理 |
 | 编辑模板 | `changedetectionio/blueprint/ui/templates/edit.html` | 可视化选择器UI结构 |
 | 静态资源 | `changedetectionio/flask_app.py` | 元素数据与截图提供 |
-| 文本过滤 | `changedetectionio/html_tools.py` | CSS/XPath 过滤器执行 |
+| 文本过滤 | `changedetectionio/html_tools.py` | CSS 选择器 / XPath 过滤器分路径执行 |
 | 文本Diff处理器 | `changedetectionio/processors/text_json_diff/processor.py` | 文本差异检测 |
 | 图片Diff处理器 | `changedetectionio/processors/image_ssim_diff/` | 图片差异检测 |
 | 处理器配置管理 | `changedetectionio/processors/__init__.py` | 处理器配置提取与保存 |
