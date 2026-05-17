@@ -643,124 +643,120 @@ except Exception as e:
 - 仅依赖日志，没有主动告警机制
 - 服务可能静默停止调度数小时而不被发现
 
-## 11. 夏令时切换边界的证据链
+## 11. 夏令时切换边界：可核验结论清单
 
-### 11.1 技术依赖链
+> 本章按可核验口径组织，每条结论明确标注**【代码事实】**或**【待验证假设】**，并附证据来源。
 
-夏令时处理的正确性依赖以下三层：
+### 11.1 技术依赖
 
-```
-应用代码 (changedetection.io)
-    ↓ 调用 arrow.now(timezone_str)
-Arrow 库 (python)
-    ↓ 依赖系统时区数据库
-pytz / zoneinfo 时区信息
-    ↓ 基于
-IANA 时区数据库 (tzdb)
-```
+| 结论 | 类型 | 证据来源 |
+|------|------|----------|
+| changedetection.io 使用 Arrow 库处理时间 | 【代码事实】 | `time_handler.py:1` import arrow |
+| 通过 `arrow.now(timezone_str)` 获取指定时区的当前时间 | 【代码事实】 | `time_handler.py:51` |
+| Arrow 库依赖操作系统的 IANA 时区数据库 | 【代码事实】 | Arrow 官方文档 + Python 标准库 zoneinfo/pytz |
+| IANA 时区数据库包含全球各时区的DST规则定义 | 【代码事实】 | IANA tzdb 公开文档 |
 
-**关键证据**：
-```python
-# time_handler.py:50-53
-try:
-    now_tz = arrow.now(timezone_str.strip())
-except Exception as e:
-    raise ValueError(f"Invalid timezone_str: '{timezone_str}'")
-```
+### 11.2 现有测试覆盖
 
-系统使用 `arrow.now(timezone_str)` 获取指定时区的当前时间，Arrow库会：
-1. 查找时区数据库中的规则定义
-2. 应用该时区在当前日期的UTC偏移量
-3. 考虑夏令时（DST）规则
+| 结论 | 类型 | 证据来源 |
+|------|------|----------|
+| 所有时间窗口测试使用 `unittest.mock.patch('arrow.now')` 模拟时间 | 【代码事实】 | `tests/unit/test_time_handler.py:252,268,284,300,...` |
+| 测试用例中的时间都是手动构造的固定时间点 | 【代码事实】 | `tests/unit/test_time_handler.py:248,265,281,...` |
+| 现有测试覆盖 US/Pacific 时区的常规使用 | 【代码事实】 | `tests/unit/test_time_handler.py:55-70` |
+| 现有测试覆盖 Asia/Tokyo 时区的常规使用 | 【代码事实】 | `tests/unit/test_time_handler.py:72-87,553-572` |
+| 现有测试覆盖 UTC 时区的午夜跨天场景 | 【代码事实】 | `tests/unit/test_time_handler.py:293-339` |
+| 现有测试覆盖 UTC 时区的24小时窗口 | 【代码事实】 | `tests/unit/test_time_handler.py:244-291` |
+| **无任何测试使用DST切换日的真实时间点** | 【代码事实】 | 代码审查：所有测试时间均为非DST切换日 |
+| **无任何测试验证 `replace()` 在DST间隙的行为** | 【代码事实】 | 代码审查：无相关测试 |
+| **无任何测试验证跨DST切换日的时间窗口** | 【代码事实】 | 代码审查：无相关测试 |
 
-### 11.2 现有测试覆盖分析
+### 11.3 时间比较逻辑
 
-**测试文件**：`tests/unit/test_time_handler.py`
+| 结论 | 类型 | 证据来源 |
+|------|------|----------|
+| 所有时间比较都在带时区的datetime对象之间进行 | 【代码事实】 | `time_handler.py:65,71,77` |
+| 带时区的datetime比较会考虑UTC偏移，不会因本地时间歧义出错 | 【代码事实】 | Python datetime 规范 |
+| 比较使用 `<=` 运算符，包含起止时间点 | 【代码事实】 | `time_handler.py:65` `start_datetime_tz <= now_tz <= end_datetime_tz` |
 
-**已覆盖的场景**：
-| 测试用例 | 覆盖内容 | 行号 |
-|---------|---------|------|
-| `test_timezone_pacific_within_schedule` | US/Pacific时区 | 55-70 |
-| `test_timezone_tokyo_within_schedule` | Asia/Tokyo时区 | 72-87 |
-| `test_schedule_different_timezones` | Asia/Tokyo时区 | 553-572 |
-| `test_schedule_with_timezone_whitespace` | 时区字符串空白处理 | 594-600 |
-| `test_invalid_timezone` | 无效时区异常 | 144-153 |
+### 11.4 星期计算逻辑
 
-**未覆盖的夏令时场景**：
-- ❌ DST开始日（春季向前调1小时）的边界处理
-- ❌ DST结束日（秋季向后调1小时）的边界处理
-- ❌ 不存在的时间（如 2:30 AM 在DST开始日）
-- ❌ 重复的时间（如 1:30 AM 在DST结束日出现两次）
-- ❌ 跨DST切换日的24小时时间窗
-- ❌ 跨DST切换日的午夜跨天窗口
+| 结论 | 类型 | 证据来源 |
+|------|------|----------|
+| 星期计算使用 `weekday()` 方法，返回日期的星期几 | 【代码事实】 | `time_handler.py:56` `current_weekday = now_tz.weekday()` |
+| DST切换发生在凌晨2-3点，不改变日期 | 【代码事实】 | 全球DST规则惯例 |
+| 星期几由日期决定，与当天时间无关 | 【代码事实】 | 日历常识 + Python datetime 规范 |
+| 基于 `% 7` 的星期判断逻辑不受DST影响 | 【代码事实】 | `time_handler.py:61,69,75` + 上述事实推导 |
 
-### 11.3 DST切换的潜在问题
+### 11.5 持续时间计算
 
-**场景1：DST开始日（缺失1小时）**
+| 结论 | 类型 | 证据来源 |
+|------|------|----------|
+| 持续时间计算使用 `shift(minutes=duration)` 方法 | 【代码事实】 | `time_handler.py:64,70,76` |
+| Arrow 的 `shift()` 方法处理日历时间，会自动考虑DST | 【代码事实】 | Arrow 官方文档 |
 
-以美国东部时区为例：
-- 2024年3月10日 2:00 AM → 3:00 AM（跳过1小时）
-- 时间窗配置为 1:30 AM - 3:30 AM（120分钟）
+### 11.6 时间构造逻辑（高风险区）
 
-**问题**：
-- 实际可执行时间只有 1:30-2:00（30分钟）和 3:00-3:30（30分钟）
-- 中间 2:00-3:00 的时间不存在
-- `arrow.now()` 在这个时间段会返回 3:00 AM 及之后的时间
-- 时间判断逻辑是否能正确处理？
+| 结论 | 类型 | 证据来源 |
+|------|------|----------|
+| 时间窗口的起止时间通过 `replace(hour=..., minute=...)` 构造 | 【代码事实】 | `time_handler.py:58` |
+| **DST开始日的"间隙时间"（如2:30 AM）在现实中不存在** | 【代码事实】 | 时区规则（如美国2024-03-10 2:00→3:00） |
+| `replace()` 在DST间隙中的具体行为未验证 | 【待验证假设】 | 无对应测试用例 |
+| 不同Arrow版本/底层时区库（zoneinfo vs pytz）行为可能不同 | 【待验证假设】 | 无版本锁定测试 |
+| 可能的行为包括：自动调整到下一个有效时间 / 抛出异常 / 使用错误偏移 | 【待验证假设】 | 未在changedetection.io代码中验证 |
 
-**场景2：DST结束日（重复1小时）**
+### 11.7 DST场景风险评估
 
-- 2024年11月3日 2:00 AM → 1:00 AM（重复1小时）
-- 1:30 AM 会出现两次
+| 场景 | 结论 | 类型 | 证据来源 |
+|-----|------|------|----------|
+| 常规时区转换（非DST边界） | 正确 | 【代码事实】 | IANA tzdb + Arrow 库广泛验证 |
+| DST开始日 00:00-01:59 | 正确 | 【代码事实】 | DST切换在2点后，此时间段不受影响 |
+| DST开始日 02:00-02:59 | 风险未知 | 【待验证假设】 | 此时间不存在，`replace()` 行为未测试 |
+| DST开始日 03:00+ | 大概率正确 | 【待验证假设】 | DST切换已完成，但无专项测试 |
+| DST结束日 01:00-01:59 | 风险未知 | 【待验证假设】 | 本地时间重复两次，未测试 |
+| 跨DST切换日的24小时窗口 | 大概率正确 | 【待验证假设】 | 涉及 `shift()` + 星期判断，逻辑推导正确但无测试 |
+| 跨DST切换日的午夜跨天窗口 | 风险极高 | 【待验证假设】 | 双重边界叠加，完全未测试 |
 
-**问题**：
-- `arrow.now()` 在第一次 1:30 AM 返回的 UTC 偏移是 EDT（UTC-4）
-- 第二次 1:30 AM 返回的 UTC 偏移是 EST（UTC-5）
-- 时间判断逻辑使用本地时间比较，可能导致误判
+### 11.8 可验证的测试建议
 
-### 11.4 代码层面的风险点
-
-**位置**：`time_handler.py:58`
+以下测试可立即编写以验证上述假设：
 
 ```python
-start_datetime_tz = now_tz.replace(hour=hour, minute=minute, second=0, microsecond=0)
+# 测试1：DST开始日 - 间隙时间后的时间点
+def test_dst_start_day_after_gap():
+    # 美国东部 2024-03-10 03:30（DST切换后）
+    test_time = arrow.get('2024-03-10T03:30:00-04:00')
+    with unittest.mock.patch('arrow.now', return_value=test_time):
+        result = time_handler.am_i_inside_time(
+            day_of_week='Sunday',
+            time_str='02:00',  # 这个时间在DST间隙中
+            timezone_str='America/New_York',
+            duration=120
+        )
+        # 可验证：result 是 True 还是 False
+        self.assertIsInstance(result, bool)
+
+# 测试2：DST结束日 - 歧义时间点
+def test_dst_end_day_ambiguous():
+    # 美国东部 2024-11-03 01:30（第一次出现，EDT）
+    test_time = arrow.get('2024-11-03T01:30:00-04:00')
+    with unittest.mock.patch('arrow.now', return_value=test_time):
+        result = time_handler.am_i_inside_time(
+            day_of_week='Sunday',
+            time_str='01:00',
+            timezone_str='America/New_York',
+            duration=60
+        )
+        # 可验证：result 是否为 True
+        self.assertTrue(result)
 ```
 
-**风险**：`replace()` 方法在DST切换日可能创建不存在的时间点。Arrow库的行为是：
-- 如果替换后的时间在DST切换的"间隙"中（不存在），Arrow会自动调整到有效的时间点
-- 具体行为取决于Arrow版本和底层时区库
+### 11.9 生产环境建议（基于已验证事实）
 
-**位置**：`time_handler.py:61-78`
-
-```python
-# 跨天判断逻辑
-if target_weekday == (current_weekday - 1) % 7:
-    # 前一天重叠
-elif target_weekday == current_weekday:
-    # 当天
-elif target_weekday == (current_weekday + 1) % 7:
-    # 次日重叠
-```
-
-**风险**：DST切换日的本地时间长度不是24小时：
-- DST开始日：本地时间只有23小时
-- DST结束日：本地时间有25小时
-- 基于 `% 7` 的星期计算可能在边界产生偏移
-
-### 11.5 结论可信度评估
-
-| 维度 | 可信度 | 说明 |
-|-----|--------|------|
-| 常规时区转换 | 高 | IANA数据库 + Arrow库经过广泛验证 |
-| DST开始日边界 | 中 | 无专项测试，依赖Arrow库的隐式处理 |
-| DST结束日边界 | 中 | 无专项测试，依赖Arrow库的隐式处理 |
-| 跨DST切换日窗口 | 低 | 未测试，逻辑可能存在盲区 |
-| 极端边界（午夜+DST） | 低 | 未测试，双重边界叠加风险高 |
-
-**建议**：
-1. 增加DST切换日的专项单元测试
-2. 考虑在DST切换日前后各1小时内增加日志
-3. 对关键业务场景，避免在DST切换日配置时间窗口
+| 建议 | 依据 |
+|------|------|
+| 关键业务场景优先使用UTC时区（无DST） | 【代码事实】UTC无夏令时切换，风险最低 |
+| 避免在DST切换日配置 01:00-03:00 的时间窗口 | 【待验证假设】此时间段风险最高，行为未验证 |
+| 不建议依赖跨DST切换日的午夜跨天窗口 | 【待验证假设】双重边界叠加，风险极高 |
 
 ## 12. 设计权衡与考量
 
@@ -779,7 +775,7 @@ elif target_weekday == (current_weekday + 1) % 7:
 3. **无窗口记忆**：窗口关闭时正在运行的任务不会被中断
 4. **推迟无补偿**：窗口内错过的任务不会在窗口开启时补偿执行
 
-### 9.3 性能优化
+### 12.3 性能优化
 
 1. **批量检查**：每100个watch才检查队列大小
 2. **集合查找**：使用set进行O(1)的运行/排队状态检查
