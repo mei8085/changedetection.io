@@ -366,6 +366,192 @@ if watch.history_n >= 2:
         await send_content_changed_notification(uuid, notification_q, datastore)
 ```
 
+#### 3.6.5 三类异常的 Worker 层分流结果
+
+当浏览器无法常规渲染非 PDF 内容时，会抛出三类异常。以下是它们在 `worker.py` 中的具体处理逻辑：
+
+##### 异常类型 1：EmptyReply（空响应）
+
+**抛出时机**：
+- **requests.py:181-184**：HTTP 客户端收到空响应且 `empty_pages_are_a_change=False`
+- **playwright.py:311**：浏览器通信无响应对象
+- **playwright.py:363**：页面内容为空且 `empty_pages_are_a_change=False`
+- **puppeteer.py:423**：重试 2 次后仍无响应对象
+- **puppeteer.py:460**：页面内容为空且 `empty_pages_are_a_change=False`
+
+**Worker 层处理** (`worker.py:361-366`)：
+```python
+except content_fetchers_exceptions.EmptyReply as e:
+    err_text = "EmptyReply - try increasing 'Wait seconds before extracting text', Status Code {}".format(e.status_code)
+    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
+                                                'last_check_status': e.status_code})
+    process_changedetection_results = False
+```
+
+| 处理项 | 结果 |
+|-------|------|
+| **是否终止本轮** | ✅ 是 (`process_changedetection_results = False`) |
+| **last_error** | `"EmptyReply - try increasing 'Wait seconds before extracting text', Status Code {status_code}"` |
+| **是否进入变更检测** | ❌ 否 |
+| **是否触发通知** | ❌ 否 |
+| **历史快照更新** | ❌ 否 |
+
+##### 异常类型 2：PageUnloadable（页面无法加载）
+
+**抛出时机**：
+- **playwright.py:332**：执行自定义 JS 代码异常
+- **playwright.py:345**：无法获取响应状态码
+- **puppeteer.py:435**：执行自定义 JS 代码异常
+- **puppeteer.py:443**：无法获取响应状态码
+
+**Worker 层处理** (`worker.py:383-395`)：
+```python
+except content_fetchers_exceptions.PageUnloadable as e:
+    err_text = "Page request from server didnt respond correctly"
+    if e.message:
+        err_text = "{} - {}".format(err_text, e.message)
+
+    if e.screenshot:
+        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
+        e.screenshot = None
+
+    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
+                                                'last_check_status': e.status_code,
+                                                'has_ldjson_price_data': None})
+    process_changedetection_results = False
+```
+
+| 处理项 | 结果 |
+|-------|------|
+| **是否终止本轮** | ✅ 是 (`process_changedetection_results = False`) |
+| **last_error** | `"Page request from server didnt respond correctly - {message}"`（如有错误信息） |
+| **是否保存截图** | ✅ 是（`as_error=True` 标记为错误快照） |
+| **是否进入变更检测** | ❌ 否 |
+| **是否触发通知** | ❌ 否 |
+| **历史快照更新** | ❌ 否 |
+| **其他字段** | 清除 `has_ldjson_price_data` |
+
+##### 异常类型 3：Non200ErrorCodeReceived（非 200 状态码）
+
+**抛出时机**：
+- **requests.py:190-192**：HTTP 客户端收到非 200 状态码且 `ignore_status_codes=False`
+- **playwright.py:354-357**：浏览器收到非 200 状态码且 `ignore_status_codes=False`
+- **puppeteer.py:451-454**：浏览器收到非 200 状态码且 `ignore_status_codes=False`
+
+**Worker 层处理** (`worker.py:238-261`)：
+```python
+except content_fetchers_exceptions.Non200ErrorCodeReceived as e:
+    if e.status_code == 403:
+        err_text = "Error - 403 (Access denied) received"
+    elif e.status_code == 404:
+        err_text = "Error - 404 (Page not found) received"
+    elif e.status_code == 407:
+        err_text = "Error - 407 (Proxy authentication required) received, did you need a username and password for the proxy?"
+    elif e.status_code == 500:
+        err_text = "Error - 500 (Internal server error) received from the web site"
+    else:
+        extra = ' (Access denied or blocked)' if str(e.status_code).startswith('4') else ''
+        err_text = f"Error - Request returned a HTTP error code {e.status_code}{extra}"
+
+    if e.screenshot:
+        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
+    if e.xpath_data:
+        watch.save_xpath_data(data=e.xpath_data, as_error=True)
+    if e.page_text:
+        watch.save_error_text(contents=e.page_text)
+
+    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+    process_changedetection_results = False
+```
+
+| 处理项 | 结果 |
+|-------|------|
+| **是否终止本轮** | ✅ 是 (`process_changedetection_results = False`) |
+| **last_error** | 根据状态码生成用户友好提示（403/404/407/500 有专门文案） |
+| **是否保存截图** | ✅ 是（如有） |
+| **是否保存 XPath** | ✅ 是（如有） |
+| **是否保存错误文本** | ✅ 是（如有） |
+| **是否进入变更检测** | ❌ 否 |
+| **是否触发通知** | ❌ 否 |
+| **历史快照更新** | ❌ 否 |
+
+##### 三类异常处理对比总表
+
+| 异常类型 | 终止本轮 | last_error 内容 | 保存截图 | 保存 XPath | 变更检测 | 触发通知 |
+|---------|---------|----------------|---------|-----------|---------|---------|
+| **EmptyReply** | ✅ | EmptyReply - try increasing 'Wait seconds before extracting text' | ❌ | ❌ | ❌ | ❌ |
+| **PageUnloadable** | ✅ | Page request from server didnt respond correctly - {message} | ✅（如有） | ❌ | ❌ | ❌ |
+| **Non200ErrorCodeReceived** | ✅ | 根据状态码的用户友好提示 | ✅（如有） | ✅（如有） | ❌ | ❌ |
+
+#### 3.6.6 人工决策清单：异常场景的应对策略
+
+当遇到上述三类异常时，根据具体场景选择合适的解决方案：
+
+##### 决策维度
+
+| 解决方案 | 适用场景 | 操作方式 |
+|---------|---------|---------|
+| **🔄 改 fetch_backend** | 内容本质是 API/数据文件，不需要浏览器渲染 | 将 `fetch_backend` 从 `html_webdriver` 改为 `html_requests` |
+| **📝 用 source:** | 需要保留原始响应格式（JSON/XML/YAML/CSV） | 在 URL 前添加 `source:` 前缀 |
+| **📊 开启 empty_pages_are_a_change** | 监控页面是否消失/被清空，空内容本身就是信号 | 在全局设置中开启 `empty_pages_are_a_change = True` |
+| **⏱️ 增加等待时间** | SPA 应用渲染慢，内容还没加载完 | 增加 `webdriver_delay` 或 `Wait seconds before extracting text` |
+| **✅ 开启 ignore_status_codes** | 非 200 状态码是预期行为（如 404 表示已删除） | 在 watch 配置中开启 `ignore_status_codes = True` |
+| **🔐 检查认证/代理** | 403/407 状态码表示权限问题 | 检查 Headers、Cookie、代理配置 |
+
+##### 场景 → 解决方案映射表
+
+| 异常类型 | 典型场景 | 推荐方案 | 备选方案 |
+|---------|---------|---------|---------|
+| **EmptyReply** | API 端点返回 JSON，浏览器渲染为空 | 🔄 改 fetch_backend + 📝 source: | ⏱️ 增加等待时间 |
+| **EmptyReply** | SPA 应用渲染慢，内容延迟加载 | ⏱️ 增加等待时间 | 🔄 改 fetch_backend（如果不需要 JS） |
+| **EmptyReply** | 页面内容被清空（需要监控删除事件） | 📊 开启 empty_pages_are_a_change | - |
+| **PageUnloadable** | 网站反爬，浏览器指纹被识别 | 🔄 改 fetch_backend | 配置 User-Agent/Headers |
+| **PageUnloadable** | 自定义 JS 执行错误 | 修复 JS 代码 | 🔄 改 fetch_backend（如果不需要 JS） |
+| **PageUnloadable** | 网络不稳定，页面加载超时 | ⏱️ 增加超时时间 | 🔄 改 fetch_backend |
+| **Non200 (403)** | 网站需要登录或认证 | 🔐 添加 Cookie/Headers | 配置代理 |
+| **Non200 (404)** | 页面被删除（需要监控） | ✅ 开启 ignore_status_codes | 📊 开启 empty_pages_are_a_change |
+| **Non200 (404)** | URL 配置错误 | 修正 URL | - |
+| **Non200 (500)** | 服务器端错误 | 等待重试 | 🔄 改 fetch_backend（如果 API 端点不同） |
+| **Non200 (其他)** | 非 200 是预期行为 | ✅ 开启 ignore_status_codes | - |
+
+##### 决策流程图
+
+```
+遇到异常
+  │
+  ▼
+┌─────────────────────────────────────────────────────────┐
+│ 异常类型是什么?                                           │
+└──────────┬─────────────────────┬─────────────────────────┘
+           ▼                     ▼                         ▼
+      EmptyReply            PageUnloadable            Non200
+           │                     │                         │
+           ▼                     ▼                         ▼
+┌──────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│ 内容是 API/数据? │  │ 是自定义 JS 错误?   │  │ 是权限问题(403/407)?│
+└──────┬───────────┘  └──────────┬──────────┘  └──────────┬──────────┘
+       │ 是                     │ 是                     │ 是
+       ▼                        ▼                        ▼
+   改 fetch_backend          修复 JS                  🔐 检查认证/代理
+   + source:                  或改 fetch_backend
+       │ 否                     │ 否                     │ 否
+       ▼                        ▼                        ▼
+┌──────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│ SPA 渲染慢?      │  │ 是反爬/网络问题?    │  │ 是 404/500?         │
+└──────┬───────────┘  └──────────┬──────────┘  └──────────┬──────────┘
+       │ 是                     │ 是                     │ 是
+       ▼                        ▼                        ▼
+   增加等待时间              改 fetch_backend       是预期行为吗?
+       │ 否                     │ 否                     │ 是
+       ▼                        ▼                        ▼
+┌──────────────────┐  ┌─────────────────────┐      开启 ignore_status_codes
+│ 监控删除事件?    │  │ ⏱️ 增加超时/重试     │
+└──────┬───────────┘  └─────────────────────┘
+       │ 是
+       ▼
+开启 empty_pages_are_a_change
+```
+
 ## 4. 备用渲染策略：PDF 转 HTML
 
 ### 4.1 预处理触发条件
