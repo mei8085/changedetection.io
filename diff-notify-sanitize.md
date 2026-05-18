@@ -158,16 +158,130 @@ SYSTEM_MANAGED_NON_SPEC_FIELDS = frozenset({
 通知 URL（如 `json://token@host/path`）本身包含的敏感信息：
 
 - **存储时**: 完整保存，无遮蔽
-- **API 返回时**: 完整返回，无遮蔽（`api/Notifications.py`）
-- **日志输出时**: 部分场景下会记录完整 URL（存在泄露风险）
+- **API 返回时**: 完整返回，无遮蔽
+- **日志输出时**: 多处场景下会记录完整 URL（高泄露风险）
 
-### 3.3 LLM API Key 的保护
+#### 3.2.1 通知 URL 的 API 暴露证据链
 
-LLM API Key 是特殊的敏感字段，有专门的保护机制：
+**证据 1: GET /api/v1/notifications 直接返回完整 URL**
 
-1. **存储**: 保存在 `settings.application.llm.api_key`
-2. **API 过滤**: 通过 `strip_internal_api_fields()` 机制不会直接暴露
-3. **测试保障**: `tests/test_llm_api_key_security.py` 中有专门的安全测试确保不会泄露
+代码位置: `api/Notifications.py:12-19
+```python
+@auth.check_token
+@validate_openapi_request('getNotifications')
+def get(self):
+    """Return Notification URL List."""
+    notification_urls = self.datastore.data.get('settings', {}).get('application', {}).get('notification_urls', [])        
+    return {
+            'notification_urls': notification_urls,
+           }, 200
+```
+
+**证据 2: POST /api/v1/notifications 回显添加的 URL**
+
+代码位置: `api/Notifications.py:46
+```python
+return {'notification_urls': added_urls}, 201
+```
+
+**证据 3: PUT /api/v1/notifications 回显替换后的 URL**
+
+代码位置: `api/Notifications.py:68
+```python
+return {'notification_urls': clean_urls}, 200
+```
+
+**风险影响**:
+- 任何拥有 API Token 的用户/攻击者可以读取所有通知 URL
+- 通知 URL 中包含的 Token、密码、Webhook 密钥等全部明文暴露
+- 例如: `tgram://123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` 这样的 Telegram Bot Token 会被完整获取
+
+#### 3.2.2 通知 URL 的日志暴露证据链
+
+**证据 1: 添加通知 URL 时的 DEBUG 日志
+
+代码位置: `store/__init__.py:1085
+```python
+logger.debug(f">>> Adding new notification_url - '{notification_url}'")
+```
+
+**证据 2: 发送通知时的 INFO 日志**
+
+代码位置: `notification/handler.py:416
+```python
+logger.info(f">> Process Notification: AppRise start notifying '{url}'")
+```
+
+**风险影响**:
+- 在 DEBUG 或 INFO 日志级别下，完整的通知 URL（包含敏感凭证）会被记录到日志系统
+- 日志系统通常被多个团队/人员访问，存在严重的横向泄露风险
+- 日志持久化后，敏感凭证可能在备份中永久留存
+
+### 3.3 LLM API Key 的保护机制与真实防护边界
+
+#### 3.3.1 真实防护机制（修正版）
+
+LLM API Key 是特殊的敏感字段，其保护机制如下：
+
+**层级 1: 根本没有读取 API 端点（最核心防护）
+
+代码证据: `tests/test_llm_api_key_security.py:265-294
+```python
+def test_no_api_settings_endpoint_exists(
+        client, live_server, measure_memory_usage, datastore_path):
+    """
+    There is currently no /api/v1/settings endpoint.
+    If one is added in the future it must be covered by its own
+    security tests before reaching production.
+    """
+    res_get = client.get('/api/v1/settings', headers={'x-api-key': api_token})
+    assert res_get.status_code in (404, 405)
+```
+
+**关键事实**: 系统目前**没有 `/api/v1/settings` 端点**，LLM API Key 无法通过 API 直接读取。
+
+**层级 2: 设置页面使用 PasswordField 保护**
+
+代码证据: `tests/test_llm_api_key_security.py:301-317
+```python
+def test_settings_page_does_not_render_llm_api_key_in_plaintext(
+        client, live_server, measure_memory_usage, datastore_path):
+    """
+    The settings page renders the API key form.  Because the field uses
+    PasswordField, WTForms must NOT embed the current key value in the HTML
+    (PasswordField intentionally omits the value attribute for security).
+    """
+    res = client.get(url_for('settings.settings_page'))
+    assert res.status_code == 200
+    body = res.data.decode('utf-8', errors='replace')
+    assert CANARY_KEY not in body
+```
+
+**层级 3: 系统字段过滤机制
+
+通过 `strip_internal_api_fields()` 过滤 `SYSTEM_MANAGED_NON_SPEC_FIELDS` 中的内部字段（如 `_llm_result`, `_llm_intent` 等 LLM 运行时数据。
+
+**层级 4: 全面的安全测试保障
+
+`tests/test_llm_api_key_security.py` 包含 9 个测试用例，确保 LLM API Key 不会出现在：
+- GET/POST/PUT /api/v1/watch 响应
+- GET /api/v1/tag 响应
+- GET /api/v1/systeminfo 响应
+- GET/POST/PUT /api/v1/notifications 响应
+- GET /api/v1/search 响应
+- GET /api/v1/full-spec 响应
+- 设置页面 HTML 源码
+
+#### 3.3.2 LLM API Key 的防护边界总结
+
+| 防护层级 | 防护机制 | 代码位置 |
+|---------|---------|----------|
+| API 读取 | ❌ 无设置 API 端点（核心防护） | `tests/test_llm_api_key_security.py:265-294 |
+| Web UI | PasswordField 不渲染值 | `tests/test_llm_api_key_security.py:301-317 |
+| 系统字段过滤 | `strip_internal_api_fields()` | `api/__init__.py |
+| 测试保障 | 9 个安全测试用例 | `tests/test_llm_api_key_security.py |
+
+**注意**: LLM API Key 的保护主要依赖于「没有 API 读取端点」这一事实，而非主动的遮蔽/加密机制。如果未来添加 `/api/v1/settings` 端点，必须立即引入额外的安全措施。
 
 ---
 
