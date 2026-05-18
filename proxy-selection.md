@@ -1,22 +1,40 @@
 # 代理选择策略完整说明
 
+## 概述
+
+本文档详细说明了 changedetection.io 项目中为每次抓取选择代理的整套策略，包括全局代理池配置、watch 级别覆盖、no-proxy 判定顺序、请求库与浏览器 fetcher 之间的代理传递，以及失败回退机制。
+
+---
+
 ## 1. 全局代理池配置
 
-### 1.1 代理配置来源
+### 1.1 代理池的来源与初始化
 
-代理池由以下几部分组成，在 `store/__init__.py:815-853` 中构建：
+代理池的配置位于 `store/__init__.py:825-853`，由以下几个来源组成：
 
-1. **环境变量配置的代理**：通过 `HTTP_PROXY`、`HTTPS_PROXY` 等环境变量配置的系统代理
-2. **UI配置的额外代理**：在设置页面通过 `extra_proxies` 配置的自定义代理（`forms.py:963-974`）
-3. **no-proxy 选项**：当 `ENABLE_NO_PROXY_OPTION` 环境变量为 `True` 时自动添加（`store/__init__.py:850-851`）
+#### 1.1.1 配置文件来源 (proxies.json)
+- 从 `datastore_path/proxies.json` 文件加载
+- 支持 orjson (优先) 和标准 json 格式
 
-### 1.2 代理数据结构
+#### 1.1.2 UI 配置来源 (extra_proxies)
+- 从 `settings['requests']['extra_proxies']` 中读取
+- 每个代理包含 `proxy_name` 和 `proxy_url` 字段
+- 键名格式：`ui-{index}{proxy_name}`
+
+#### 1.1.3 系统环境变量来源
+- `HTTP_PROXY` / `HTTPS_PROXY` 环境变量（在 `content_fetchers/base.py:61-62` 中读取，主要用于请求库）
+
+#### 1.1.4 No-Proxy 选项
+- 当 `ENABLE_NO_PROXY_OPTION` 环境变量为 `True` 时，自动添加 `no-proxy` 选项
+- 该选项的 URL 为空字符串，表示不使用代理
+
+### 1.2 代理池数据结构
 
 ```python
 proxy_list = {
     "proxy-key": {
-        "label": "代理显示名称",
-        "url": "socks5://user:pass@host:port"  # 实际代理URL
+        "label": "显示名称",
+        "url": "代理地址"
     },
     "no-proxy": {
         "label": "No proxy",
@@ -25,210 +43,351 @@ proxy_list = {
 }
 ```
 
-### 1.3 全局默认代理
+### 1.3 全局默认代理配置
 
-在 `settings/requests/proxy` 中配置全局默认代理，在 `blueprint/settings/__init__.py:52-60` 中初始化。
-
----
-
-## 2. Watch 级别代理覆盖
-
-### 2.1 配置方式
-
-每个 Watch 可以在编辑页面单独选择代理，存储在 `watch['proxy']` 字段中：
-
-- **空字符串 `''`**：使用系统默认代理
-- **`"no-proxy"`**：不使用任何代理
-- **具体代理 key**：使用指定的代理
-
-### 2.2 表单处理
-
-在 `blueprint/ui/edit.py:171-177` 中构建代理选择下拉框：
-- 第一个选项为 `('Default', '')`
-- 后续选项为所有可用代理
-
-在 `blueprint/ui/edit.py:202-203` 中保存时，如果代理值为空字符串，则设置为 `None`。
+在 `model/App.py:31` 中定义了默认配置：
+- `settings['requests']['proxy']`: 系统默认代理的键
+- `settings['requests']['extra_proxies']: UI 配置的额外代理列表
 
 ---
 
-## 3. 代理选择判定顺序
+## 2. Watch 级别代理覆盖机制
 
-### 3.1 核心选择逻辑
+### 2.1 Watch 级别的代理配置
 
-代理选择的核心逻辑在 `store/__init__.py:855-886` 的 `get_preferred_proxy_for_watch()` 方法中，优先级从高到低：
+每个 Watch 对象可以独立配置自己的代理设置，存储在 `watch['proxy']` 字段中。
+
+在 `blueprint/ui/edit.py:84-89` 中：
+- 当 Watch 的 `proxy` 字段为 `None` 或无效时，使用系统默认代理
+- 当 Watch 的 `proxy` 字段为有效代理键时，使用该代理
+
+### 2.2 代理选择的优先级
+
+代理选择的核心逻辑位于 `store/__init__.py:855-886` 的 `get_preferred_proxy_for_watch()` 方法：
+
+```python
+def get_preferred_proxy_for_watch(self, uuid):
+    # 1. 如果代理池为空，返回 None
+    if self.proxy_list is None:
+        return None
+    
+    # 2. 如果 Watch 选择了 no-proxy，返回 None（不使用代理
+    if watch.get('proxy') == "no-proxy":
+        return None
+    
+    # 3. 如果 Watch 配置了有效代理键，返回该键
+    if watch.get('proxy') in list(self.proxy_list.keys()):
+        return watch.get('proxy')
+    
+    # 4. 否则使用系统默认代理
+    system_proxy_id = self.data['settings']['requests'].get('proxy')
+    if self.proxy_list.get(system_proxy_id):
+        return system_proxy_id
+    
+    # 5. 最后返回代理池中的第一个代理
+    first_default = list(self.proxy_list)[0]
+    return first_default
+```
+
+### 2.3 代理选择优先级总结
 
 ```
-1. 如果代理池为空 → 返回 None
-2. 如果 ENABLE_NO_PROXY_OPTION=True 且 watch['proxy'] == "no-proxy" → 返回 None (不使用代理)
-3. 如果 watch['proxy'] 存在且在代理列表中 → 返回该代理 key
-4. 尝试使用全局默认代理 (settings['requests']['proxy'])
-5. 如果全局默认代理有效 → 返回该代理 key
-6. 否则返回代理列表中的第一个可用代理
+Watch 级别代理配置 (watch['proxy'])
+    ↓
+系统默认代理 (settings['requests']['proxy'])
+    ↓
+代理池第一个代理
 ```
 
-### 3.2 no-proxy 判定
+---
 
-no-proxy 的判定在 `store/__init__.py:868-869`：
+## 3. No-Proxy 判定顺序
+
+### 3.1 No-Proxy 的判定逻辑
+
+No-Proxy 的判定发生在 `get_preferred_proxy_for_watch()` 方法中 `store/__init__.py:868-869`：
+
 ```python
 if strtobool(os.getenv('ENABLE_NO_PROXY_OPTION', 'True')) and watch.get('proxy') == "no-proxy":
     return None
 ```
 
-返回 `None` 表示不使用任何代理。
+### 3.2 判定顺序
+
+1. **检查 `ENABLE_NO_PROXY_OPTION` 环境变量（默认为 `True`
+2. **检查 Watch 的 `proxy` 字段是否等于 `"no-proxy"`
+3. **如果两者都满足，返回 `None`，表示不使用代理
+
+### 3.3 No-Proxy 的效果
+
+当返回 `None` 时：
+- 在 `processors/base.py:176-183` 中，`proxy_url` 为 `None`
+- 不向 fetcher 传递 `proxy_override=None`
+- 各 fetcher 根据自己的逻辑决定如何处理 `None` 代理
 
 ---
 
-## 4. 抓取层代理传递
+## 4. 抓取层代理传递机制
 
-### 4.1 代理选择到代理 URL 的转换
+### 4.1 代理选择的入口点
 
-在 `processors/base.py:117-192` 的 `call_browser()` 方法中完成代理选择和传递：
-
-1. 调用 `get_preferred_proxy_for_watch()` 获取代理 key
-2. 如果代理 key 存在且不是自定义浏览器端点，从 `proxy_list` 获取实际代理 URL
-3. 将代理 URL 作为 `proxy_override` 参数传递给 fetcher 构造函数
+代理选择的入口点位于 `processors/base.py:117-192` 的 `call_browser()` 方法中：
 
 ```python
-# processors/base.py:176-189
-proxy_url = None
-if preferred_proxy_id:
-    if not prefer_fetch_backend.startswith('extra_browser_'):
-        proxy_url = self.datastore.proxy_list.get(preferred_proxy_id).get('url')
-
-self.fetcher = fetcher_obj(proxy_override=proxy_url,
-                           custom_browser_connection_url=custom_browser_connection_url,
-                           screenshot_format=self.screenshot_format)
+async def call_browser(self, preferred_proxy_id=None):
+    # 1. 获取首选代理 ID
+    preferred_proxy_id = preferred_proxy_id if preferred_proxy_id else self.datastore.get_preferred_proxy_for_watch(uuid=self.watch.get('uuid'))
+    
+    # 2. 转换为代理 URL
+    proxy_url = None
+    if preferred_proxy_id:
+        if not prefer_fetch_backend.startswith('extra_browser_'):
+            proxy_url = self.datastore.proxy_list.get(preferred_proxy_id).get('url')
+    
+    # 3. 传递给 fetcher
+    self.fetcher = fetcher_obj(
+        proxy_override=proxy_url,
+        custom_browser_connection_url=custom_browser_connection_url,
+        ...
+    )
 ```
 
-### 4.2 各 Fetcher 的代理处理
+### 4.2 Requests Fetcher 的代理传递
 
-#### 4.2.1 Requests Fetcher (`content_fetchers/requests.py`)
+#### 4.2.1 Requests Fetcher (`content_fetchers/requests.py:19-57`
 
 ```python
-# requests.py:45-57
-if self.proxy_override:
-    proxies = {'http': self.proxy_override, 'https': self.proxy_override, 'ftp': self.proxy_override}
-else:
-    if self.system_http_proxy:
-        proxies['http'] = self.system_http_proxy
-    if self.system_https_proxy:
-        proxies['https'] = self.system_https_proxy
+def __init__(self, proxy_override=None, **kwargs):
+    self.proxy_override = proxy_override
+
+def _run_sync(self, ...):
+    proxies = {}
+    
+    # 如果有代理覆盖
+    if self.proxy_override:
+        proxies = {
+            'http': self.proxy_override,
+            'https': self.proxy_override,
+            'ftp': self.proxy_override
+        }
+    else:
+        # 否则使用系统环境变量
+        if self.system_http_proxy:
+            proxies['http'] = self.system_http_proxy
+        if self.system_https_proxy:
+            proxies['https'] = self.system_https_proxy
+    
+    # 传递给 requests.Session.request()
 ```
 
-直接将 `proxy_override` 设置为 requests 的 `proxies` 字典。
+#### 4.2.2 代理优先级
 
-#### 4.2.2 Playwright Fetcher (`content_fetchers/playwright.py`)
-
-```python
-# playwright.py:196-215
-if proxy_override:
-    self.proxy = {'server': proxy_override}
-
-# 解析用户名密码
-if self.proxy:
-    parsed = urlparse(self.proxy.get('server'))
-    if parsed.username:
-        self.proxy['username'] = parsed.username
-        self.proxy['password'] = parsed.password
+```
+proxy_override (Watch 级别)
+    ↓
+HTTP_PROXY / HTTPS_PROXY (系统环境变量)
+    ↓
+不使用代理
 ```
 
-在创建浏览器上下文时传入：
+### 4.3 Playwright Fetcher 的代理传递
+
+#### 4.3.1 Playwright Fetcher (`content_fetchers/playwright.py:183-216`
+
 ```python
-context = await browser.new_context(
-    proxy=self.proxy,
-    # ... 其他参数
-)
+def __init__(self, proxy_override=None, **kwargs):
+    # 1. 从环境变量读取代理配置
+    proxy_args = {}
+    for k in ['bypass', 'server', 'username', 'password']:
+        v = os.getenv('playwright_proxy_' + k, False)
+        if v:
+            proxy_args[k] = v.strip('"')
+    
+    if proxy_args:
+        self.proxy = proxy_args
+    
+    # 2. Watch 级别代理覆盖
+    if proxy_override:
+        self.proxy = {'server': proxy_override}
+    
+    # 3. 解析代理 URL 中的用户名和密码
+    if self.proxy:
+        parsed = urlparse(self.proxy.get('server'))
+        if parsed.username:
+            self.proxy['username'] = parsed.username
+            self.proxy['password'] = parsed.password
+
+async def run(self, ...):
+    # 传递给 browser.new_context()
+    context = await browser.new_context(
+        proxy=self.proxy,
+        ...
+    )
 ```
 
-#### 4.2.3 Puppeteer Fetcher (`content_fetchers/puppeteer.py`)
+#### 4.3.2 代理优先级
 
-```python
-# puppeteer.py:210-225
-if proxy_override:
-    parsed = urlparse(proxy_override)
-    if parsed:
-        self.proxy = {'username': parsed.username, 'password': parsed.password}
-        # 将代理服务器地址附加到浏览器连接URL
-        proxy_url = parsed.scheme + "://" if parsed.scheme else 'http://'
-        proxy_url += f"{parsed.hostname}{port}{parsed.path}{q}"
-        self.browser_connection_url += f"{r}--proxy-server={proxy_url}"
+```
+proxy_override (Watch 级别)
+    ↓
+playwright_proxy_* 环境变量
+    ↓
+不使用代理
 ```
 
-#### 4.2.4 Selenium WebDriver Fetcher (`content_fetchers/webdriver_selenium.py`)
+### 4.4 Puppeteer Fetcher 的代理传递
+
+#### 4.4.1 Puppeteer Fetcher (`content_fetchers/puppeteer.py:197-225`
 
 ```python
-# webdriver_selenium.py:45-62
-proxy_sources = [
-    self.system_http_proxy,
-    self.system_https_proxy,
-    # ... 其他环境变量代理
-    proxy_override,  # 最后一个会覆盖前面的
-]
-for k in filter(None, proxy_sources):
-    self.proxy_url = k.strip()
+def __init__(self, proxy_override=None, **kwargs):
+    if proxy_override:
+        parsed = urlparse(proxy_override)
+        if parsed:
+            self.proxy = {
+                'username': parsed.username,
+                'password': parsed.password
+            }
+            # 代理服务器通过 URL 参数传递给浏览器
+            proxy_url = parsed.scheme + "://" + parsed.hostname + ...
+            self.browser_connection_url += f"&--proxy-server={proxy_url}
+```
 
-# 传递给 Chrome
-if self.proxy_url:
-    options.add_argument(f'--proxy-server={self.proxy_url}')
+### 4.5 Selenium WebDriver Fetcher 的代理传递
+
+#### 4.5.1 Selenium Fetcher (`content_fetchers/webdriver_selenium.py:31-62`
+
+```python
+def __init__(self, proxy_override=None, **kwargs):
+    proxy_sources = [
+        self.system_http_proxy,
+        self.system_https_proxy,
+        os.getenv('webdriver_proxySocks'),
+        os.getenv('webdriver_socksProxy'),
+        ...,
+        proxy_override,  # 最后一个覆盖
+    ]
+    
+    for k in filter(None, proxy_sources):
+        if k:
+            self.proxy_url = k.strip()
+
+def run(self, ...):
+    if self.proxy_url:
+        options.add_argument(f'--proxy-server={self.proxy_url}')
+```
+
+#### 4.5.2 代理优先级
+
+```
+proxy_override (Watch 级别)
+    ↓
+webdriver_* 环境变量
+    ↓
+HTTP_PROXY / HTTPS_PROXY (系统环境变量)
+    ↓
+不使用代理
 ```
 
 ---
 
-## 5. 失败回退机制
+## 5. 失败时的回退机制
 
 ### 5.1 代理失败处理
 
-**当前代码库中没有代理失败自动回退机制**。当代理失败时：
+#### 5.1.1 Requests Fetcher 的重试机制 (`content_fetchers/requests.py:61-80`
 
-1. **异常捕获**：在 `worker.py` 中捕获各种异常（如 `ProxyError`、`ConnectionError`、`BrowserConnectError` 等）
-2. **错误记录**：将错误信息记录到 `watch['last_error']` 中
-3. **不自动切换代理**：不会自动尝试其他代理
+```python
+max_retries = int(os.getenv("REQUESTS_RETRY_MAX_COUNT", "6"))
+retry_strategy = Retry(
+    total=max_retries,
+    connect=max_retries,
+    read=max_retries,
+    status=0,  # 不重试 HTTP 状态码
+    backoff_factor=0.5,
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+    raise_on_status=False
+)
+```
 
-### 5.2 Requests 重试机制
+- **重试触发条件：
+  - 连接超时
+  - 读取超时
+  - 连接重置
+  - **不重试：HTTP 状态码
 
-Requests fetcher 有内置的重试机制（`content_fetchers/requests.py:68-80`），但仅限于：
-- 连接超时
-- 读取超时
-- 连接重置
+#### 5.1.2 代理连接错误处理
 
-**注意**：这是网络级别的重试，不会切换到其他代理。重试策略：
-- 最大重试次数：`REQUESTS_RETRY_MAX_COUNT` 环境变量，默认 6 次
-- 退避因子：0.5 秒
-- 重试方法：HEAD、GET、OPTIONS、POST
+在 `content_fetchers/requests.py:127-131`：
 
-### 5.3 代理认证失败
+```python
+except Exception as e:
+    msg = str(e)
+    if proxies and 'SOCKSHTTPSConnectionPool' in msg:
+        msg = f"Proxy connection failed? {msg}"
+    raise Exception(msg) from e
+```
 
-当遇到 407 错误时（`worker.py:243-244`），会给出明确的错误提示：
-> "Error - 407 (Proxy authentication required) received, did you need a username and password for the proxy?"
+### 5.2 无代理回退
+
+**重要：系统不支持代理失败自动切换到其他代理。**
+
+- 当代理失败时：
+1. 请求会根据重试指定次数（默认 6 次）
+2. 重试失败后，异常会被抛出
+3. 没有自动切换到其他代理或直连的机制
+4. Watch 会记录错误信息到 `watch['last_error']`
+
+### 5.3 Worker 层的错误处理
+
+在 `worker.py:187-409` 中：
+
+- 捕获各种异常并记录到 Watch 的 `last_error` 字段：
+
+```python
+except content_fetchers_exceptions.Non200ErrorCodeReceived as e:
+    if e.status_code == 407:
+        err_text = "Error - 407 (Proxy authentication required) received, did you need a username and password for the proxy?"
+    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+```
 
 ---
 
-## 6. 完整流程图
+## 6. 代理选择完整流程图
 
 ```
-抓取任务开始
+抓取请求
     ↓
-调用 get_preferred_proxy_for_watch(uuid)
-    ├─ 代理池为空? → 无代理
-    ├─ watch.proxy == "no-proxy"? → 无代理
-    ├─ watch.proxy 在代理列表中? → 使用该代理
-    ├─ 全局默认代理有效? → 使用全局默认
-    └─ 否则 → 使用代理列表第一个
+worker.py 处理队列
     ↓
-获取代理 URL (proxy_url)
+processors/base.py: call_browser()
     ↓
-根据 fetch_backend 选择 fetcher
-    ├─ html_requests → requests fetcher
-    │   └─ 设置 proxies 字典
-    ├─ html_webdriver → playwright/puppeteer/selenium
-    │   ├─ playwright: 传入 context proxy 参数
-    │   ├─ puppeteer: 附加 --proxy-server 到连接URL
-    │   └─ selenium: 添加 --proxy-server Chrome 参数
-    └─ 其他自定义 fetcher
+get_preferred_proxy_for_watch()
+    ├─ 检查代理池是否为空 → 返回 None
+    ├─ 检查是否为 no-proxy → 返回 None
+    ├─ 检查 Watch 级别代理配置 → 有效则返回
+    ├─ 检查系统默认代理 → 有效则返回
+    └─ 返回代理池第一个代理
     ↓
-执行抓取
-    ├─ 成功 → 正常处理
-    └─ 失败 → 记录错误，不回退到其他代理
+转换为 proxy_url
+    ↓
+创建 fetcher 实例 (proxy_override=proxy_url)
+    ↓
+fetcher.run()
+    ├─ Requests: proxies 参数
+    ├─ Playwright: context.proxy 参数
+    ├─ Puppeteer: --proxy-server URL 参数
+    └─ Selenium: --proxy-server 启动参数
+    ↓
+执行请求
+    ↓
+成功 / 失败
+    ↓
+重试 (Requests: 最多 6 次重试)
+    ↓
+成功 / 抛出异常
+    ↓
+记录到 Watch.last_error
 ```
 
 ---
@@ -237,13 +396,27 @@ Requests fetcher 有内置的重试机制（`content_fetchers/requests.py:68-80`
 
 | 功能 | 文件位置 | 行号 |
 |------|---------|------|
-| 代理池构建 | `store/__init__.py` | 815-853 |
-| 代理选择逻辑 | `store/__init__.py` | 855-886 |
-| no-proxy 判定 | `store/__init__.py` | 868-869 |
-| 代理传递到 fetcher | `processors/base.py` | 176-192 |
-| Requests 代理处理 | `content_fetchers/requests.py` | 45-57 |
-| Playwright 代理处理 | `content_fetchers/playwright.py` | 196-215 |
-| Puppeteer 代理处理 | `content_fetchers/puppeteer.py` | 210-225 |
-| Selenium 代理处理 | `content_fetchers/webdriver_selenium.py` | 45-103 |
-| Watch 代理表单 | `blueprint/ui/edit.py` | 171-177, 202-203 |
-| 全局代理设置 | `blueprint/settings/__init__.py` | 52-80 |
+| 代理池初始化 | `store/__init__.py | 825-853 |
+| 代理选择逻辑 | `store/__init__.py | 855-886 |
+| 代理传递入口 | `processors/base.py | 117-192 |
+| Requests 代理 | `content_fetchers/requests.py | 19-57 |
+| Playwright 代理 | `content_fetchers/playwright.py | 183-216 |
+| Puppeteer 代理 | `content_fetchers/puppeteer.py | 197-225 |
+| Selenium 代理 | `content_fetchers/webdriver_selenium.py | 31-62 |
+| Watch 代理配置 | `blueprint/ui/edit.py | 84-89, 202-203 |
+| 全局代理配置 | `model/App.py | 28-39 |
+| 重试机制 | `content_fetchers/requests.py | 61-80 |
+| 错误处理 | `worker.py | 187-409 |
+
+---
+
+## 8. 注意事项
+
+1. **No-Proxy 选项需要 `ENABLE_NO_PROXY_OPTION=True`（默认启用）
+2. **自定义浏览器端点（`extra_browser_*）不使用代理
+3. **代理失败不会自动切换到其他代理
+4. **Requests 库的重试只重试网络层错误，不重试 HTTP 状态码
+5. **不同 fetcher 的代理配置方式不同，需根据 fetcher 类型进行适配
+6. **Watch 级别的代理优先级高于系统默认代理
+7. **系统默认代理优先级高于环境变量代理
+8. **Selenium 的代理优先级顺序为：proxy_override → webdriver_* 环境变量 → HTTP_PROXY/HTTPS_PROXY
