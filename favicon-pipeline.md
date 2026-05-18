@@ -412,7 +412,152 @@ if ('IntersectionObserver' in window) {
 - Base64 解码时使用 `validate=True` 确保数据完整性
 - MIME 类型基于文件内容检测，不依赖扩展名
 
-## 7. 关键文件索引
+## 7. 跨抓取后端对照
+
+### 7.1 后端支持矩阵
+
+目前支持 favicon 抓取的后端只有浏览器渲染类后端，纯 HTTP 客户端不支持：
+
+| 后端 | favicon 抓取支持 | 抓取方式 |
+|------|-----------------|----------|
+| Playwright (`html_webdriver`) | ✅ 完整支持 | 浏览器端 JS 注入 |
+| Puppeteer (`html_puppeteer`) | ✅ 完整支持 | 浏览器端 JS 注入 |
+| Requests (`html_requests`) | ❌ 不支持 | 无 |
+| Selenium/WebDriver | ❌ 不支持 | 无 |
+
+### 7.2 触发条件对比
+
+所有后端都接收 `fetch_favicon` 参数，但只有浏览器后端实际执行：
+
+| 维度 | Playwright | Puppeteer | Requests | Selenium |
+|------|------------|-----------|----------|----------|
+| 参数接收 | ✅ `fetch_favicon` | ✅ `fetch_favicon` | ✅ `fetch_favicon`（忽略） | ✅ `fetch_favicon`（忽略） |
+| 触发条件 | `favicon_is_expired() == True` | `favicon_is_expired() == True` | 永不触发 | 永不触发 |
+| 执行位置 | `playwright.py:347-352` | `puppeteer.py:445-449` | 无 | 无 |
+
+**Playwright 实现**：
+```python
+if fetch_favicon:
+    try:
+        self.favicon_blob = await self.page.evaluate(FAVICON_FETCHER_JS)
+        await self.page.request_gc()
+    except Exception as e:
+        logger.error(f"Error fetching FavIcon info {str(e)}, continuing.")
+```
+
+**Puppeteer 实现**：
+```python
+if fetch_favicon:
+    try:
+        self.favicon_blob = await self.page.evaluate(FAVICON_FETCHER_JS)
+    except Exception as e:
+        logger.error(f"Error fetching FavIcon info {str(e)}, continuing.")
+```
+
+**Requests/Selenium**：仅在方法签名中声明参数，方法体内无任何 favicon 相关逻辑。
+
+### 7.3 代理参数传递对比
+
+#### 7.3.1 Playwright 代理传递
+
+**传递链路**：
+1. `processors/base.py:189` → `proxy_override=proxy_url`
+2. `playwright.py:207-208` → 解析为 `self.proxy = {'server': proxy_override}`
+3. `playwright.py:290` → `browser.new_context(proxy=self.proxy)`
+
+**关键特性**：
+- 支持环境变量 `playwright_proxy_server`, `playwright_proxy_bypass`, `playwright_proxy_username`, `playwright_proxy_password`
+- 自动从代理 URL 解析 username/password
+- 浏览器上下文级别应用，页面内所有请求（包括 favicon fetch）共享代理
+
+#### 7.3.2 Puppeteer 代理传递
+
+**传递链路**：
+1. `processors/base.py:189` → `proxy_override=proxy_url`
+2. `puppeteer.py:210-214` → 解析 username/password，设置启动参数
+3. `puppeteer.py:358-363` → 如需认证调用 `page.authenticate(self.proxy)`
+
+**关键特性**：
+- 代理通过 Chrome 启动参数 `--proxy-server` 传入
+- 认证信息通过 `page.authenticate()` 单独设置
+- 浏览器实例级别应用
+
+#### 7.3.3 Requests 代理传递
+
+**传递链路**：
+1. `processors/base.py:189` → `proxy_override=proxy_url`
+2. `requests.py:51-52` → `proxies = {'http': proxy_override, 'https': proxy_override}`
+3. `requests.py:101` → `session.request(proxies=proxies)`
+
+**关键特性**：
+- 仅用于主页面请求，不影响 favicon（因为 Requests 不抓取 favicon）
+- 支持系统环境变量 `HTTP_PROXY` / `HTTPS_PROXY`
+
+#### 7.3.4 Selenium 代理传递
+
+**传递链路**：
+1. `processors/base.py:189` → `proxy_override=proxy_url`
+2. `webdriver_selenium.py:55-61` → 优先级最高的代理源
+3. `webdriver_selenium.py:103` → `options.add_argument(f'--proxy-server={self.proxy_url}')`
+
+**关键特性**：
+- 代理通过 Chrome 启动参数传入
+- 不支持 favicon 抓取
+
+### 7.4 失败后对主流程影响对比
+
+所有后端的 favicon 抓取（或缺失）都不会影响主流程：
+
+| 后端 | 失败场景 | 处理方式 | 对主流程影响 |
+|------|----------|----------|-------------|
+| Playwright | JS 执行异常、网络超时 | try-catch 包裹，记录 error 日志 | 无影响 |
+| Puppeteer | JS 执行异常、网络超时 | try-catch 包裹，记录 error 日志 | 无影响 |
+| Requests | 不支持抓取 | 无操作 | 无影响 |
+| Selenium | 不支持抓取 | 无操作 | 无影响 |
+
+**共性设计**：
+- favicon 抓取在页面内容获取完成后执行
+- 使用独立的 try-catch 块隔离
+- 失败仅记录日志，不抛出异常
+- `favicon_blob` 为 `None` 时，worker 层直接跳过存储
+
+### 7.5 同一 Watch 在不同 fetch_backend 下的行为差异总表
+
+假设同一 watch 配置：URL 相同、代理相同、favicon 已过期（超过 24 小时）
+
+| 行为维度 | Playwright | Puppeteer | Requests | Selenium |
+|----------|------------|-----------|----------|----------|
+| 是否触发 favicon 抓取 | ✅ 是 | ✅ 是 | ❌ 否 | ❌ 否 |
+| 抓取脚本是否相同 | ✅ 同一 `favicon-fetcher.js` | ✅ 同一 `favicon-fetcher.js` | - | - |
+| 代理是否影响 favicon 抓取 | ✅ 影响（浏览器上下文共享） | ✅ 影响（浏览器实例共享） | - | - |
+| 抓取成功后是否存储 | ✅ `bump_favicon()` | ✅ `bump_favicon()` | ❌ 不会 | ❌ 不会 |
+| 前端是否显示 favicon | ✅ 显示新抓取的 | ✅ 显示新抓取的 | ⚠️ 显示旧的（如有） | ⚠️ 显示旧的（如有） |
+| 24 小时内切换回浏览器后端 | ⚠️ 不会重抓（文件未过期） | ⚠️ 不会重抓（文件未过期） | - | - |
+| 主流程是否受 favicon 影响 | ❌ 不受 | ❌ 不受 | ❌ 不受 | ❌ 不受 |
+| 内存缓存是否失效 | ✅ 更新后失效 | ✅ 更新后失效 | ❌ 不涉及 | ❌ 不涉及 |
+
+### 7.6 后端切换时的结论变化
+
+当你从浏览器后端（Playwright/Puppeteer）切换到非浏览器后端（Requests/Selenium）时：
+
+1. **不变的结论**：
+   - 缓存目录结构和失效条件（文件级）
+   - 前端拉取方式和兜底机制
+   - 安全访问控制
+   - Worker 层存储逻辑
+
+2. **变化的结论**：
+   - ❌ favicon 不会被重新抓取（即使已过期）
+   - ❌ 代理配置不影响 favicon（因为不抓取）
+   - ⚠️ 已有的 favicon 文件会继续显示直到过期
+   - ⚠️ 新添加的 watch 永远不会有 favicon
+
+3. **从 Requests 切换回 Playwright 时**：
+   - 下次检查时，如果 favicon 已过期（或不存在），会立即抓取
+   - 抓取成功后会更新文件并失效内存缓存
+   - 前端会在下一次刷新时显示新 favicon（受 5 分钟浏览器缓存影响）
+
+## 8. 关键文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
@@ -422,4 +567,5 @@ if ('IntersectionObserver' in window) {
 | MIME 检测 | `changedetectionio/favicon_utils.py` |
 | 前端模板 | `changedetectionio/blueprint/watchlist/templates/watch-overview.html` |
 | Playwright 抓取 | `changedetectionio/content_fetchers/playwright.py:347-352` |
+| Puppeteer 抓取 | `changedetectionio/content_fetchers/puppeteer.py:445-449` |
 | Worker 整合 | `changedetectionio/worker.py:606-611` |
