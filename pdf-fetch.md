@@ -33,6 +33,34 @@ def is_pdf(self):
 - 通过 URL 后缀判断：`.pdf` 结尾
 - 通过 HTTP `Content-Type` 头判断：`application/pdf`
 
+#### 2.1.2 Watch.is_source_type_url 属性
+
+**位置**：`changedetectionio/model/Watch.py:353-354`
+
+```python
+@property
+def is_source_type_url(self):
+    return self.get('url', '').startswith('source:')
+```
+
+**触发场景**：
+- 用户在 URL 前手动添加 `source:` 前缀，明确要求获取原始响应
+- 典型用法：`source:https://api.example.com/data.json`
+- 系统会跳过 HTML → 文本转换，直接对原始内容进行变更检测
+
+#### 2.1.3 浏览器抓取失败信号
+
+浏览器抓取器（Playwright/Puppeteer/Selenium）可能在以下情况下抛出异常，表明页面无法被浏览器常规渲染：
+
+| 异常类型 | 触发条件 | 代码位置 |
+|---------|---------|----------|
+| `EmptyReply` | 页面内容完全为空（`await page.content()` 返回空字符串） | `playwright.py:359-363` |
+| `PageUnloadable` | 页面加载超时、JS 执行致命错误、导航失败 | `playwright.py:328-332` |
+| `Non200ErrorCodeReceived` | HTTP 状态码非 200（403/404/500 等） | `playwright.py:354-357` |
+| `BrowserStepsStepException` | 浏览器自动化步骤执行失败 | `playwright.py:369-373` |
+
+**重要**：浏览器抓取失败后**没有自动回退机制**。抓取器在 `call_browser()` 阶段被选定后就不会改变。用户必须手动将抓取器切换为 `html_requests` 才能获取原始响应内容。
+
 ### 2.2 第二层识别：guess_stream_type 智能检测
 
 **位置**：`changedetectionio/processors/magic.py`
@@ -94,6 +122,248 @@ self.raw_content = r.content  # 原始字节始终保存
 ```
 
 **注意**：虽然 `self.content` 被设置为 MD5 哈希，但 `self.raw_content` 保存了完整的原始字节，供后续 PDF 转 HTML 使用。
+
+### 3.3 source: 原始内容路径
+
+**分叉点：跳过 HTML → 文本转换**
+
+**位置**：`changedetectionio/processors/text_json_diff/processor.py:510-511`
+
+```python
+if watch.is_source_type_url:
+    # For source URLs, keep raw content
+    stripped_text = html_content
+```
+
+**特性**：
+- 使用用户配置的抓取器（可以是 html_requests 或 html_webdriver）
+- 不进行 HTML 到文本的转换，直接使用原始响应内容
+- 过滤器仍然生效（subtractive_selectors、include_filters）
+- 适用于监控 API 响应、原始数据文件等
+
+### 3.4 非 HTML 文本格式路径
+
+对于纯文本、CSV、YAML、XML 等格式：
+- 使用 `html_requests` 抓取器（大多数情况下）
+- 不进行 HTML 混淆 workaround 处理
+- 文本提取阶段直接保留原始格式（`is_plaintext` 标志）
+- JSON 会进行格式化和排序，避免因键顺序变化导致的误报
+
+### 3.5 空/无文本页面的回退机制
+
+**配置选项**：`empty_pages_are_a_change`（全局设置）
+
+| 配置值 | 行为 | 适用场景 |
+|-------|------|---------|
+| `False`（默认） | 抛出 `ReplyWithContentButNoText` 异常，不记录变更 | 正常网页监控，避免误报 |
+| `True` | 将空内容视为有效内容，继续进行变更检测 | 监控页面是否消失、API 是否返回空响应 |
+
+**异常处理流程** (`worker.py:214-236`)：
+1. 捕获 `ReplyWithContentButNoText` 异常
+2. 检查过滤器是否仅匹配到图片等非文本元素
+3. 更新 watch 的 `last_error` 字段，提供用户友好的错误提示
+4. 保存截图和 XPath 数据（如果有），帮助用户调试
+5. 跳过本次变更检测
+
+### 3.6 浏览器无法常规渲染但非 PDF 的完整处理链路
+
+#### 3.6.1 触发该分支的判定信号
+
+**定义**：用户配置了浏览器抓取器（`html_webdriver`/Playwright），但目标 URL 返回的内容无法被浏览器正常渲染为有意义的文本页面。
+
+**判定信号矩阵**：
+
+| 判定阶段 | 判定信号 | 代码位置 |
+|---------|---------|----------|
+| 抓取前预判 | 不是 PDF（`watch.is_pdf == False`） | `Watch.py:411-421` |
+| 抓取前预判 | 用户配置为浏览器抓取器（`fetch_backend` 为 `html_webdriver` 或 `system` 且全局默认是浏览器） | `base.py:133-141` |
+| 内容类型检测 | `guess_stream_type` 检测结果为非 HTML：<br>- `is_plaintext = True`<br>- `is_json = True`<br>- `is_csv = True`<br>- `is_yaml = True`<br>- `is_xml = True` | `magic.py:50-138` |
+| 文本提取后 | 过滤和提取后文本为空（`ReplyWithContentButNoText`） | `processor.py:542-550` |
+
+**典型场景**：
+1. **纯文本文件**：`.txt`、`.log`、`.md` 等
+2. **结构化数据**：JSON API、CSV 数据、YAML 配置、XML 文档
+3. **二进制文件**：图片、音频、视频等（无文本内容）
+4. **SPA 渲染失败**：Angular/React 应用未正确渲染，仅返回空骨架
+
+#### 3.6.2 抓取器选择：无自动回退，按用户配置执行
+
+**重要说明**：系统**没有**"浏览器抓取失败后自动回退到 html_requests"的机制。抓取器在抓取前就已确定。
+
+**抓取器选择逻辑** (`base.py:133-174`)：
+
+```python
+# 1. 获取用户配置的抓取器
+prefer_fetch_backend = self.watch.get('fetch_backend', 'system')
+
+# 2. 如果是 'system'，使用全局默认
+if not prefer_fetch_backend or prefer_fetch_backend == 'system':
+    prefer_fetch_backend = self.datastore.data['settings']['application'].get('fetch_backend')
+
+# 3. 仅 PDF 会强制切换到 html_requests
+if self.watch.is_pdf:
+    prefer_fetch_backend = "html_requests"
+
+# 4. 其他情况按配置执行
+if hasattr(content_fetchers, prefer_fetch_backend):
+    fetcher_obj = getattr(content_fetchers, prefer_fetch_backend)
+else:
+    # 抓取器不存在时的默认回退
+    fetcher_obj = getattr(content_fetchers, "html_requests")
+```
+
+**抓取器执行结果**：
+
+| 内容类型 | 使用 html_webdriver 结果 | 使用 html_requests 结果 |
+|---------|-------------------------|------------------------|
+| 纯文本/CSV/YAML | 浏览器将文本包裹在 HTML 中（`<html><body>文本</body></html>`），需额外处理 | 直接获取原始文本，效率更高 |
+| JSON | 浏览器可能渲染为交互式 JSON 查看器，文本提取不稳定 | 直接获取原始 JSON，可预测性强 |
+| XML | 浏览器可能渲染为 XML 树视图 | 直接获取原始 XML |
+| 二进制（图片/视频） | 浏览器显示媒体播放器，无可用文本 | 直接获取二进制数据，`is_binary=True` 时返回 MD5 |
+
+**用户可选的回退方案**：
+- 手动将该 watch 的 `fetch_backend` 改为 `html_requests`
+- 使用 `source:` 前缀强制获取原始内容
+- 配置 `empty_pages_are_a_change = True` 允许空内容进入检测流程
+
+#### 3.6.3 文本抽取与过滤的实际执行方式
+
+**位置**：`processor.py:461-521`
+
+当 `guess_stream_type` 检测到非 HTML 内容时，文本抽取流程会跳过 HTML→文本转换：
+
+```python
+# === TEXT EXTRACTION ===
+if watch.is_source_type_url:
+    # For source URLs, keep raw content
+    stripped_text = html_content
+elif stream_content_type.is_plaintext:
+    # For plaintext, keep as-is without HTML-to-text conversion
+    stripped_text = html_content
+else:
+    # Extract text from HTML/RSS content (not generic XML)
+    if stream_content_type.is_html or stream_content_type.is_rss:
+        stripped_text = content_processor.extract_text_from_html(html_content, stream_content_type)
+    else:
+        stripped_text = html_content
+```
+
+**各类型的具体执行路径**：
+
+##### 路径 A：纯文本 (`is_plaintext = True`)
+
+**触发条件** (`magic.py:98-99, 130-137`)：
+- `Content-Type: text/plain`
+- 或 `puremagic` 检测为 `text/plain` 且无 HTML 标签
+- 或其他 `text/*` 类型但不是 HTML
+
+**执行流程**：
+1. **跳过 HTML 混淆 workaround** (`processor.py:487-488`)
+   ```python
+   if stream_content_type.is_html:
+       content = html_tools.workarounds_for_obfuscations(content)
+   ```
+2. **过滤器应用** (`processor.py:502-507`)
+   - 减法选择器：如果是纯文本，CSS 选择器不生效
+   - 包含过滤器：CSS 选择器不生效，但 XPath 和正则提取可能仍有用
+3. **跳过 HTML→文本转换** (`processor.py:513-515`)
+   ```python
+   elif stream_content_type.is_plaintext:
+       stripped_text = html_content
+   ```
+4. **文本转换** (`processor.py:523-584`)
+   - 空白修剪、去重、排序、行过滤、正则提取等全部正常执行
+
+##### 路径 B：JSON (`is_json = True`)
+
+**触发条件** (`magic.py:102-109, 119-120`)：
+- `Content-Type: application/json` 等 JSON 类型
+- 且不是 JSONP（`cb({...})` 格式）
+
+**执行流程**：
+1. **JSON 预处理** (`processor.py:481-483`)
+   ```python
+   if stream_content_type.is_json:
+       if not filter_config.has_include_json_filters:
+           content = content_processor.preprocess_json(raw_content=content)
+   ```
+   - 键排序：避免因键顺序变化导致的误报
+   - 格式化：`json.dumps(..., sort_keys=True, indent=2)`
+   - 如果用户配置了 `json:`/`jq:` 过滤器，则跳过此步骤
+2. **跳过 HTML 混淆 workaround**
+3. **过滤器应用**
+   - `json:`/`jq:`/`jqraw:` 过滤器正常生效
+   - CSS 选择器不生效
+4. **跳过 HTML→文本转换** (`processor.py:520-521`)
+   - 因为 `is_html = False` 且 `is_plaintext = False`
+   - 直接使用 JSON 内容
+5. **文本转换**：全部正常执行
+
+##### 路径 C：空页面 (`ReplyWithContentButNoText`)
+
+**触发条件** (`processor.py:542-550`)：
+```python
+if not stream_content_type.is_json and not empty_pages_are_a_change and len(stripped_text.strip()) == 0:
+    raise content_fetchers.exceptions.ReplyWithContentButNoText(...)
+```
+
+**执行流程**：
+1. 抛出异常，携带：URL、状态码、截图、是否有过滤器、HTML 内容、XPath 数据
+2. `worker.py:214-236` 捕获异常
+3. 生成用户友好的错误提示：
+   ```python
+   datastore.update_watch(uuid=uuid, update_obj={
+       'last_error': f"Got HTML content but no text found (With {e.status_code} reply code){extra_help}"
+   })
+   ```
+4. 保存截图和 XPath 数据作为错误快照
+5. `process_changedetection_results = False`，跳过变更检测
+
+**配置 `empty_pages_are_a_change = True` 时**：
+- 不抛出异常
+- 空文本继续进入校验和计算流程
+- 如果与上一次内容不同（例如从有文本变为空），则检测为变更
+
+#### 3.6.4 回接到 Diff 计算与通知触发
+
+无论经过哪条路径，只要没有抛出异常，最终都会进入相同的变更检测流程：
+
+**位置**：`processor.py:586-650`
+
+```python
+# === CHECKSUM CALCULATION ===
+if text_for_checksuming is None:
+    text_for_checksuming = stripped_text
+
+# Calculate checksum
+ignore_whitespace = self.datastore.data['settings']['application'].get('ignore_whitespace', False)
+fetched_md5 = ChecksumCalculator.calculate(text_for_checksuming, ignore_whitespace=ignore_whitespace)
+
+# === BLOCKING RULES EVALUATION ===
+blocked = False
+# Check trigger_text
+if rule_engine.evaluate_trigger_text(text_for_checksuming, filter_config.trigger_text):
+    blocked = True
+# Check text_should_not_be_present
+if rule_engine.evaluate_text_should_not_be_present(stripped_text, filter_config.text_should_not_be_present):
+    blocked = True
+
+# === CHANGE DETECTION ===
+if watch.get('previous_md5') != fetched_md5 and not blocked:
+    changed_detected = True
+    update_obj['previous_md5'] = fetched_md5
+else:
+    changed_detected = False
+    update_obj['previous_md5'] = fetched_md5
+```
+
+**通知触发** (`worker.py:566-569`)：
+```python
+if watch.history_n >= 2:
+    logger.info(f"Change detected in UUID {uuid} - {watch['url']}")
+    if not watch.get('notification_muted'):
+        await send_content_changed_notification(uuid, notification_q, datastore)
+```
 
 ## 4. 备用渲染策略：PDF 转 HTML
 
@@ -212,9 +482,9 @@ if watch.get('previous_md5') != fetched_md5:
 2. **禁止文本** (`text_should_not_be_present`)：包含禁止文本则不报告
 3. **条件规则** (`conditions`)：自定义条件插件评估
 
-## 7. 下游通知流程
+## 7. 下游通知流程（所有分支汇合）
 
-当检测到变更后，通知流程与普通 HTML 完全相同：
+无论哪种内容类型，当检测到变更后，通知流程完全相同：
 
 ### 7.1 历史记录保存
 
@@ -226,7 +496,23 @@ watch.save_history_blob(contents=contents,
                         snapshot_id=update_obj.get('previous_md5', 'none'))
 ```
 
-### 7.2 通知触发
+**各分支的历史内容**：
+- **普通 HTML**：提取后的纯文本
+- **PDF 文档**：pdftohtml 转换后提取的纯文本
+- **source: / 纯文本**：原始内容（经过过滤器和文本转换）
+- **JSON**：格式化排序后的 JSON 文本
+
+### 7.2 最后抓取的 HTML 保存
+
+**位置**：`worker.py:557-559`
+
+```python
+empty_pages_are_a_change = datastore.data['settings']['application'].get('empty_pages_are_a_change', False)
+if update_handler.fetcher.content or (not update_handler.fetcher.content and empty_pages_are_a_change):
+    watch.save_last_fetched_html(contents=update_handler.fetcher.content, timestamp=int(fetch_start_time))
+```
+
+### 7.3 通知触发
 
 **位置**：`worker.py:566-569`
 
@@ -238,12 +524,13 @@ if watch.history_n >= 2:
         await send_content_changed_notification(uuid, notification_q, datastore)
 ```
 
-### 7.3 通知内容渲染
+### 7.4 通知内容渲染
 
-通知服务使用相同的 diff 渲染引擎：
-- `FormattableDiff`：可格式化的差异字符串
+通知服务使用相同的 diff 渲染引擎，对所有内容类型一视同仁：
+- `FormattableDiff`：可格式化的差异字符串（支持 `lines`、`added_only`、`removed_only` 等参数）
 - `FormattableExtract`：仅提取变更部分（`diff_changed_from` / `diff_changed_to`）
 - 支持 Jinja2 模板自定义通知格式
+- 支持通过 Apprise 发送到 70+ 通知渠道
 
 ## 8. 处理路径总览图
 
