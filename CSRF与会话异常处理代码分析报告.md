@@ -1,470 +1,371 @@
-# CSRF校验失败一次性提示信息传递与会话异常文案分析报告
+# CSRF校验失败提示链路与会话异常文案分析报告
 
-## 一、项目概述
+## 一、分析背景
 
-本报告基于 **changedetection.io** 项目代码，深入分析跨站请求伪造（CSRF）校验失败时一次性提示信息在前后端之间的传递机制，以及会话异常时用户最终看到的文案内容。
-
----
-
-## 二、CSRF校验机制
-
-### 2.1 后端CSRF保护初始化
-
-项目使用 Flask-WTF 扩展的 `CSRFProtect` 实现CSRF保护：
-
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L158-L159)
-```python
-csrf = CSRFProtect()
-csrf.init_app(app)
-```
-
-CSRF保护对所有非API路由生效，API路由通过 `csrf.exempt` 装饰器豁免：
-
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L170-L170)
-```python
-watch_api = Api(app, decorators=[csrf.exempt])
-```
-
-### 2.2 CSRF Token 下发到前端
-
-CSRF Token 通过两种方式传递到前端：
-
-**方式1：JavaScript全局变量**
-
-[base.html](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/templates/base.html#L36-L40)
-```html
-<script>
-    const csrftoken="{{ csrf_token() }}";
-    // ...
-</script>
-```
-
-**方式2：表单隐藏字段**
-
-[login.html](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/templates/login.html#L7-L7)
-```html
-<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-```
-
-所有表单页面（edit.html、preview.html、settings.html 等）均采用此模式。
-
-### 2.3 前端AJAX请求附带CSRF Token
-
-通过 `csrf.js` 统一为所有AJAX POST请求添加CSRF Token请求头：
-
-[csrf.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/csrf.js#L1-L9)
-```javascript
-$(document).ready(function () {
-    $.ajaxSetup({
-        beforeSend: function (xhr, settings) {
-            if (!/^(GET|HEAD|OPTIONS|TRACE)$/i.test(settings.type) && !this.crossDomain) {
-                xhr.setRequestHeader("X-CSRFToken", csrftoken)
-            }
-        }
-    })
-});
-```
-
-### 2.4 动态表单CSRF Token注入
-
-`modal.js` 在动态创建POST表单时，会自动注入CSRF Token：
-
-[modal.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/modal.js#L197-L208)
-```javascript
-if (method === 'POST') {
-  const form = document.createElement('form');
-  form.method = 'POST';
-  form.action = url;
-  form.style.display = 'none';
-  if (typeof csrftoken !== 'undefined' && csrftoken) {
-    const tok = document.createElement('input');
-    tok.type = 'hidden';
-    tok.name = 'csrf_token';
-    tok.value = csrftoken;
-    form.appendChild(tok);
-  }
-  document.body.appendChild(form);
-  form.submit();
-}
-```
+本报告从概念架构层面解析 Web 应用中跨站请求伪造（CSRF）校验失败时的一次性提示信息传递链路，以及各类会话异常场景下前端提示信息的来源与用户可见性。
 
 ---
 
-## 三、CSRF校验失败时的信息传递
+## 二、CSRF防护的体系架构
 
-### 3.1 后端校验失败默认行为
+### 2.1 防护层的分层设计
 
-Flask-WTF 的 `CSRFProtect` 在CSRF校验失败时，默认返回 **400 Bad Request** HTTP状态码，不经过自定义的 `flash` 消息机制。
+整个CSRF防护体系分为三个逻辑层次：
 
-项目中**没有**注册自定义的 `@csrf.errorhandler`，因此使用Flask-WTF的默认行为。
+| 层次 | 作用域 | 核心职能 |
+|------|--------|----------|
+| 服务端中间件层 | 全部非API路由 | 请求到达业务逻辑前执行令牌校验，校验失败直接终止请求 |
+| 令牌下发层 | 页面渲染阶段 | 生成令牌并嵌入到页面中，供后续请求携带 |
+| 客户端请求层 | 浏览器端所有异步请求 | 自动向请求中注入令牌，确保请求合法性 |
 
-### 3.2 前端对400错误的处理
+### 2.2 令牌下发的双轨机制
 
-前端JavaScript在多个文件中针对400状态码进行处理，并通过 `alert()` 向用户显示一次性提示信息：
+令牌通过两种并行通道下发到客户端：
 
-**diff-overview.js**（忽略文本选择功能）：
+**通道一：全局脚本变量**
 
-[diff-overview.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/diff-overview.js#L137-L142)
-```javascript
-statusCode: {
-    400: function () {
-        // More than likely the CSRF token was lost when the server restarted
-        alert("There was a problem processing the request, please reload the page.");
-    }
-}
-```
+在页面的初始HTML文档中，令牌被直接内联注入为全局JavaScript常量。这种方式适用于所有需要发起异步请求的场景，异步请求框架通过读取该常量获取令牌值。
 
-**browser-steps.js**（浏览器步骤功能）：
+**通道二：表单隐藏字段**
 
-[browser-steps.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/browser-steps.js#L249-L254)
-```javascript
-statusCode: {
-    400: function () {
-        alert("There was a problem processing the request, please reload the page.");
-        $("#loading-status-text").hide();
-        $('#browser-steps-ui .loader .spinner').fadeOut();
-    },
-}
-```
+在所有需要提交POST数据的表单中，令牌作为隐藏字段与表单数据融为一体。当用户通过原生表单提交（非JavaScript提交）时，令牌随表单字段一同发送。
 
-[browser-steps.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/browser-steps.js#L289-L298)
-```javascript
-statusCode: {
-    400: function () {
-        // More than likely the CSRF token was lost when the server restarted
-        alert("There was a problem processing the request, please reload the page.");
-    },
-    401: function (err) {
-        // This will be a custom error
-        alert(err.responseText);
-    }
-}
-```
+### 2.3 客户端令牌自动携带机制
 
-### 3.3 CSRF校验失败信息传递完整流程
+**异步请求场景**：通过全局请求拦截器，在每一个非幂等请求（非GET/HEAD/OPTIONS/TRACE方法）发送前，将令牌作为自定义HTTP请求头注入。跨域请求不执行该注入，以避免令牌泄露。
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  服务器重启/     │────▶│  CSRF Token     │────▶│  AJAX请求带     │
-│  Session失效     │     │  与服务端不匹配  │     │  旧CSRF Token   │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                                                          │
-                                                          ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  用户看到alert   │◀────│  前端JS捕获400  │◀────│  后端返回       │
-│  提示刷新页面    │     │  状态码         │     │  400 Bad Request│
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
-
-### 3.4 CSRF校验失败用户最终文案
-
-| 场景 | 英文原文 | 说明 |
-|------|---------|------|
-| CSRF Token失效 | `There was a problem processing the request, please reload the page.` | 无中文翻译，直接显示英文 |
+**动态表单场景**：当用户交互触发动态创建表单并提交时，脚本会在表单提交前自动创建一个隐藏输入节点，将当前令牌值填入后再触发表单提交，以满足嵌套HTML结构中无法合法嵌套表单时的需求。
 
 ---
 
-## 四、Flash一次性提示消息传递机制
+## 三、CSRF校验失败的一次性提示链路
 
-### 4.1 后端Flash消息存储
+### 3.1 校验失败的服务端行为
 
-后端使用 Flask 内置的 `flash()` 函数存储一次性提示消息，消息存储在 Session 中：
+CSRF校验发生在服务端中间件层，早于任何业务逻辑代码的执行。当校验失败时，框架的默认行为是：
 
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L23-L23)
-```python
-from flask import flash
-```
+- 不执行任何业务级别的消息入队（即不使用框架提供的一次性消息机制）
+- 不生成页面级别的重定向
+- 直接向客户端返回 **400 Bad Request** 状态码
+- 响应体为框架默认的错误信息，不带业务语义
 
-使用示例：
+本应用未注册自定义的校验失败处理器，因此完全遵循上述默认行为。
 
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L679-L679)
-```python
-flash(gettext("You must be logged in, please log in."), 'error')
-```
+### 3.2 客户端对校验失败的识别
 
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L694-L694)
-```python
-flash(gettext('Incorrect password'), 'error')
-```
+服务端返回的400状态码在客户端有两条独立的识别路径：
 
-### 4.2 模板层消息渲染
+**路径一：状态码映射处理器**
 
-在 `base.html` 基模板中，通过 `get_flashed_messages()` 获取并渲染所有flash消息：
+异步请求配置中预先注册了针对400状态码的专用处理函数。当响应返回400时，该函数被触发执行。
 
-[base.html](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/templates/base.html#L226-L234)
-```html
-{% with messages = get_flashed_messages(with_categories = true) %}
-{% if messages %}
-  <ul class="messages">
-    {% for category, message in messages %}
-      <li class="{{ category }}">{{ message }}</li>
-    {% endfor %}
-  </ul>
-{% endif %}
-{% endwith %}
-```
+**路径二：请求失败通用回调**
 
-**关键特性**：
-- `with_categories = true` 同时获取消息类别（success/error/warning/info等）
-- 消息类别作为CSS class，用于样式区分
-- `get_flashed_messages()` 调用后会自动清空Session中的消息，确保只显示一次
+当请求因任何原因（包括400）被标记为失败时，通用失败回调也会被执行，作为路径一的补充兜底。
 
-### 4.3 前端Toast通知转换
+### 3.3 提示信息的一次性呈现
 
-`flask-toast-bridge.js` 将flash消息自动转换为Toast通知（错误消息除外）：
+无论通过哪条路径触发，客户端对CSRF校验失败的最终提示方式是 **浏览器原生模态弹窗（alert）**。
 
-[flask-toast-bridge.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/flask-toast-bridge.js#L15-L56)
-```javascript
-document.addEventListener('DOMContentLoaded', function() {
-  const messagesContainer = document.querySelector('ul.messages');
-  if (!messagesContainer) return;
+提示文案内容为英文原文，未被纳入多语言翻译体系：
 
-  const messages = messagesContainer.querySelectorAll('li');
-  if (messages.length === 0) return;
+> *"There was a problem processing the request, please reload the page."*
 
-  messages.forEach(function(messageEl) {
-    const text = messageEl.textContent.trim();
-    const category = getMessageCategory(messageEl);
+文案设计的语义指向为：请求处理出错，建议重新加载页面。注释明确说明此场景大概率由服务端重启导致令牌与服务端不匹配。
 
-    // Skip error messages - they should stay in the page
-    if (category === 'error') {
-      return;
-    }
-
-    const toastType = mapCategoryToToastType(category);
-    setTimeout(function() {
-      Toast[toastType](text, { duration: 6000 });
-    }, toastIndex * 200);
-
-    messageEl.style.display = 'none';
-  });
-});
-```
-
-**消息类别映射**：
-
-| Flask类别 | Toast类型 | 处理方式 |
-|----------|----------|----------|
-| success | success | 转换为Toast，6秒后消失 |
-| info/message/notice | info | 转换为Toast，6秒后消失 |
-| warning | warning | 转换为Toast，6秒后消失 |
-| error/danger | error | 保留在页面中，不转换为Toast |
-
-### 4.4 Flash消息完整传递流程
+### 3.4 完整提示链路的拓扑图
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  后端调用       │────▶│  消息存储在     │────▶│  重定向到新页面 │
-│  flash(message) │     │  Session Cookie │     │  (302 Redirect) │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                                                          │
-                                                          ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  非error消息    │◀────│  模板调用       │◀────│  新页面请求时   │
-│  转为Toast通知  │     │  get_flashed_   │     │  从Session读取  │
-│  6秒后消失      │     │  messages()      │     │  消息并清空     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-          │
-          ▼
-┌─────────────────┐
-│  error消息      │
-│  保留在页面中   │
-│  直到用户刷新   │
-└─────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        触发条件层                                   │
+│  服务端重启 / 会话Cookie丢失 / 令牌生成密钥变化                      │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        令牌失配层                                   │
+│  客户端持有旧令牌  →  与服务端当前生成的校验令牌不匹配                │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        服务端校验层                                 │
+│  CSRF中间件拦截请求  →  校验失败  →  返回400 Bad Request             │
+│  （无flash消息 / 无重定向 / 无业务错误码）                           │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        客户端识别层                                 │
+│  路径A：statusCode[400] 处理器被触发                                │
+│  路径B：AJAX通用fail回调被触发（并行执行）                           │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        用户提示层                                   │
+│  调用浏览器alert()  →  模态弹窗显示英文提示  →  用户点击确认后消失    │
+│  （一次性：仅在当前响应触发一次，刷新后不再出现）                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### 3.5 提示链路的关键特性
 
-## 五、会话异常处理与用户文案
-
-### 5.1 会话异常类型与文案
-
-项目中定义了多种会话异常场景，每种场景对应不同的用户提示文案：
-
-#### 场景1：未登录访问需要认证的页面
-
-**后端代码**：
-
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L679-L679)
-```python
-flash(gettext("You must be logged in, please log in."), 'error')
-```
-
-**中文翻译**：
-
-[messages.po](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/translations/zh/LC_MESSAGES/messages.po#L2584-L2585)
-```
-msgid "You must be logged in, please log in."
-msgstr "需要登录，请先登录。"
-```
-
-**用户最终看到**：`需要登录，请先登录。`
-
----
-
-#### 场景2：登录密码错误
-
-**后端代码**：
-
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L694-L694)
-```python
-flash(gettext('Incorrect password'), 'error')
-```
-
-**中文翻译**：
-
-[messages.po](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/translations/zh/LC_MESSAGES/messages.po#L2588-L2589)
-```
-msgid "Incorrect password"
-msgstr "密码错误"
-```
-
-**用户最终看到**：`密码错误`
-
----
-
-#### 场景3：已登录用户访问登录页面
-
-**后端代码**：
-
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L677-L677)
-```python
-flash(gettext("Already logged in"))
-```
-
-**中文翻译**：
-
-[messages.po](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/translations/zh/LC_MESSAGES/messages.po#L2580-L2581)
-```
-msgid "Already logged in"
-msgstr "已登录"
-```
-
-**用户最终看到**：`已登录`（以Toast形式显示，6秒后消失）
-
----
-
-#### 场景4：无Session Cookie时设置语言
-
-**后端代码**：
-
-[flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py#L632-L633)
-```python
-logger.error("Cannot set language without session cookie")
-flash("Cannot set language without session cookie", 'error')
-```
-
-**用户最终看到**：`Cannot set language without session cookie`（无中文翻译，直接显示英文）
-
----
-
-#### 场景5：浏览器会话过期（Browser Steps功能）
-
-**前端检测代码**：
-
-[browser-steps.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/browser-steps.js#L271-L272)
-```javascript
-if (data.responseText && data.responseText.includes("Browser session expired")) {
-    disable_browsersteps_ui();
-}
-```
-
-**后端检测代码**：
-
-[browser_steps.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/browser_steps/browser_steps.py#L433-L436)
-```python
-# Check if session has expired based on age
-if max_age_seconds and age_seconds > max_age_seconds:
-    logger.debug(f"Browser steps session expired after {max_age_seconds} seconds")
-```
-
-**用户最终看到**：UI被禁用，无明确提示文案
-
----
-
-### 5.2 会话异常处理流程图
-
-```
-用户请求
-    │
-    ▼
-┌─────────────────────────────┐
-│  check_authentication()     │  [flask_app.py:526]
-│  before_request钩子         │
-└─────────────┬───────────────┘
-              │
-    ┌─────────┴─────────┐
-    │  已认证？         │
-    └─────────┬─────────┘
-              │
-     ┌────────┴────────┐
-     │                 │
-     ▼                 ▼
-   放行          ┌──────────────────┐
-                 │  需要登录？      │
-                 └────────┬─────────┘
-                          │
-                 ┌────────┴────────┐
-                 │                 │
-                 ▼                 ▼
-          白名单路径        ┌──────────────────────┐
-          (静态资源等)      │ flash("需要登录，请先 │
-                            │  登录。", 'error')   │
-                            └──────────┬───────────┘
-                                       │
-                                       ▼
-                            重定向到 /login 页面
-                                       │
-                                       ▼
-                            模板渲染error类消息
-                                       │
-                                       ▼
-                            用户看到红色错误提示
-                            「需要登录，请先登录。」
-```
-
----
-
-## 六、关键代码文件索引
-
-| 文件路径 | 功能说明 |
+| 特性维度 | 具体表现 |
 |---------|---------|
-| [flask_app.py](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/flask_app.py) | 主应用文件，CSRF保护初始化、登录逻辑、flash消息 |
-| [base.html](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/templates/base.html) | 基模板，flash消息渲染、CSRF Token下发 |
-| [csrf.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/csrf.js) | AJAX请求自动添加CSRF Token头 |
-| [flask-toast-bridge.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/flask-toast-bridge.js) | flash消息转换为Toast通知 |
-| [modal.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/modal.js) | 动态表单CSRF Token注入 |
-| [diff-overview.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/diff-overview.js) | 400错误处理（CSRF失效提示） |
-| [browser-steps.js](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/static/js/browser-steps.js) | 400错误处理、浏览器会话过期检测 |
-| [messages.po](file:///d:/fz/0601-1/solo-dogfeeding/code/8-changedetection.io/changedetectionio/translations/zh/LC_MESSAGES/messages.po) | 中文翻译文件 |
+| 提示方式 | 浏览器原生模态弹窗（阻塞式） |
+| 语言支持 | 仅有英文，无国际化翻译 |
+| 提示持续时间 | 用户手动确认后消失 |
+| 触发次数 | 每次失败响应触发一次，真正的一次性 |
+| 消息传递载体 | HTTP状态码，非Cookie/非响应体JSON |
+| 与页面刷新关系 | 刷新页面后通常恢复正常（令牌重新生成） |
 
 ---
 
-## 七、总结
+## 四、会话异常场景的提示信息溯源
 
-### 7.1 CSRF校验失败信息传递机制
+本系统存在三种不同语义的"会话"概念，各自的异常提示链路截然不同：
 
-1. **后端**：Flask-WTF CSRFProtect 默认返回400 Bad Request，不使用flash消息
-2. **前端**：通过AJAX的 `statusCode: {400: ...}` 捕获400错误，使用 `alert()` 显示一次性提示
-3. **用户文案**：`There was a problem processing the request, please reload the page.`（无中文翻译）
+| 会话类型 | 生命周期管理方 | 典型异常场景 |
+|---------|---------------|-------------|
+| 用户认证会话 | 登录管理框架 | 未登录访问受限资源、密码错误 |
+| Flask会话Cookie | Web框架会话机制 | 客户端禁用Cookie导致会话无法建立 |
+| 浏览器自动化会话 | 独立的浏览器步骤子系统 | 会话超时、会话被后台清理 |
 
-### 7.2 会话异常用户文案汇总
+---
 
-| 异常场景 | 用户看到的中文文案 | 显示方式 |
-|---------|-------------------|----------|
-| 未登录访问受限页面 | `需要登录，请先登录。` | 页面内红色错误提示 |
-| 登录密码错误 | `密码错误` | 页面内红色错误提示 |
-| 已登录访问登录页 | `已登录` | Toast通知，6秒消失 |
-| 无Session Cookie设置语言 | `Cannot set language without session cookie` | 页面内错误提示（英文） |
-| CSRF Token失效 | `There was a problem processing the request, please reload the page.` | alert弹窗（英文） |
-| 浏览器会话过期 | 无明确提示，UI被禁用 | - |
+### 4.1 场景一：用户认证异常
 
-### 7.3 技术要点
+#### 4.1.1 未登录访问受限页面
 
-1. **Flash消息**：基于Session的一次性消息，通过 `get_flashed_messages()` 消费后自动清除
-2. **消息分类**：error类消息保留在页面，其他类消息转为Toast通知
-3. **CSRF Token**：通过JavaScript全局变量和表单隐藏字段双轨下发，AJAX请求通过请求头传递
-4. **国际化**：使用Flask-Babel的 `gettext()` 进行多语言支持，翻译字符串存储在 `.po` 文件中
+**提示信息来源（服务端）**：
+
+在请求进入业务处理前的全局前置拦截阶段，系统检查访问者的认证状态。当检测到以下条件同时满足时，触发异常分支：
+1. 系统已启用密码保护
+2. 当前用户未通过认证
+3. 请求路径不在白名单内（静态资源、登录入口、API等）
+
+此时服务端执行两个操作：
+- 将用户重定向至登录页面（302跳转）
+- 将提示文本写入框架提供的**一次性消息存储区**（基于签名Cookie实现）
+
+消息内容经过多语言翻译函数处理，中文翻译结果为：**"需要登录，请先登录。"**
+
+消息类别标记为 `error`，用于控制后续的呈现样式。
+
+**提示信息呈现（客户端）**：
+
+登录页面渲染阶段，模板引擎从一次性消息存储区读取全部消息（读取后自动清除）。由于消息类别为 `error`，按系统规则不转换为自动消失的通知，而是保留在页面顶部的固定区域内，以醒目的红色样式呈现。
+
+**用户可见性**：✅ **明确可见**，用户到达登录页后立即看到中文错误提示。
+
+---
+
+#### 4.1.2 登录密码错误
+
+**提示信息来源（服务端）**：
+
+登录表单提交后，密码校验逻辑执行密码哈希比对。比对失败后，服务端：
+- 将错误消息写入一次性消息存储区
+- 重定向回登录页面（POST-Redirect-GET模式，防止重复提交）
+
+中文翻译结果为：**"密码错误"**，类别同样标记为 `error`。
+
+**提示信息呈现（客户端）**：
+
+与上述未登录场景的呈现路径完全一致——页面顶部红色区域显示，不自动消失。
+
+**用户可见性**：✅ **明确可见**。
+
+---
+
+#### 4.1.3 已登录状态访问登录页
+
+**提示信息来源（服务端）**：
+
+登录页面的GET请求阶段检测到用户已认证，执行快速路径：
+- 将信息性消息写入一次性消息存储区（无 `error` 类别标记，默认 `info` 类）
+- 直接重定向至首页
+
+中文翻译结果为：**"已登录"**。
+
+**提示信息呈现（客户端）**：
+
+首页渲染时读取消息。由于消息类别不是 `error`，系统执行自动转换逻辑：
+- 将消息内容从页面元素中提取
+- 转换为右下角弹出的轻量级Toast通知
+- 设置6秒显示时长，到期自动消失
+- 原始页面元素被设置为隐藏
+
+**用户可见性**：✅ **可见但短暂**，以Toast形式出现6秒后自动消失。
+
+---
+
+### 4.2 场景二：Flask会话Cookie缺失
+
+**提示信息来源（服务端）**：
+
+用户切换语言的请求处理阶段，系统检测到客户端未提交任何Cookie（通常由浏览器隐私设置或Cookie禁用导致）。此时会话无法建立，无法存储用户语言偏好，因此：
+- 将错误消息写入一次性消息存储区
+- 重定向回当前页面或首页
+
+该消息**未经过多语言翻译函数处理**，直接使用英文原文：
+
+> *"Cannot set language without session cookie"*
+
+类别标记为 `error`。
+
+**提示信息呈现（客户端）**：
+
+按error类别规则，保留在页面顶部错误区域。
+
+**用户可见性**：✅ **可见但为英文**，中文用户可能无法准确理解。
+
+---
+
+### 4.3 场景三：浏览器自动化会话过期
+
+这是三种会话类型中最为复杂的一种，涉及前后端多阶段交互。
+
+#### 4.3.1 后端过期检测机制
+
+浏览器自动化子系统为每个会话维护独立的生命周期管理，过期判定基于以下条件：
+
+**主动过期判定**：
+每个会话实例暴露一个过期状态属性，判定逻辑为：
+1. 若底层浏览器页面资源已被清理 → 判定为过期
+2. 若自会话创建时刻起已超过最大存活时间（默认为10分钟，可通过环境变量调整）→ 判定为过期
+
+**后台清理机制**：
+存在一个机会式清理流程——每当有会话相关操作时，系统遍历全部活跃会话，对判定为过期的会话执行资源回收（关闭浏览器页面、释放浏览器上下文、移除内存中的会话映射）。
+
+**请求入口检查**：
+每个操作请求到达时，首先检查会话ID是否存在于内存映射表中。若不存在（已被清理或从未创建），直接返回500状态码，响应文本为通用错误提示。
+
+操作执行过程中若发生异常（包括底层会话因超时被远端浏览器服务关闭），异常信息被提取首行后以401状态码返回给客户端。
+
+#### 4.3.2 前端过期感知路径
+
+前端对浏览器会话过期的感知存在三条路径，各自对应不同的用户呈现：
+
+**路径一：倒计时显式提示**
+
+会话建立后，前端启动秒级递减计时器，页面顶部持续显示剩余秒数文本（格式如 "500 seconds remaining in session"）。此为**预防性提示**，但仅为粗略估算，与后端真实过期时间可能存在偏差。
+
+**路径二：响应文本关键字匹配**
+
+异步请求失败时，客户端检查响应体文本中是否包含特定关键字 **"Browser session expired"**。若匹配成功：
+- 触发UI禁用逻辑：将整个交互区域的不透明度降低至0.3（视觉灰化）
+- 移除画布上的全部鼠标事件监听（功能冻结）
+
+**关键点**：该关键字并非由服务端主动生成的结构化错误码，而是来自底层异常对象的字符串化输出（可能源自远端浏览器驱动服务、网络层超时或其他运行时异常），属于脆弱的字符串匹配方式。
+
+路径二触发后，**仅执行UI灰化+冻结，不向用户弹出任何解释性文本**。
+
+**路径三：状态码处理映射**
+
+- **400状态码**：触发通用的请求失败弹窗（与CSRF校验失败共用文案）
+- **401状态码**：将服务端返回的原始异常文本直接通过弹窗展示给用户（内容取决于底层抛出的具体异常，可能是技术化的错误信息）
+- **500状态码**：进入通用失败回调，显示"与服务器通信出错"的通用提示
+
+#### 4.3.3 用户可见性总结
+
+| 过期阶段 | 用户感知 | 用户是否看到明确提示 |
+|---------|---------|---------------------|
+| 过期前倒计时 | 页面显示剩余秒数 | ✅ 可见（英文数字） |
+| 刚过期，触发关键字匹配 | 区域突然灰化，点击无反应 | ❌ **无明确提示文案**，用户需自行推断 |
+| 过期后继续操作触发401 | 弹窗显示原始异常文本 | ⚠️ 可见但可能是技术化错误信息 |
+| 过期后继续操作触发500 | 弹窗显示"服务器通信错误" | ⚠️ 可见但指向性不明确 |
+
+**核心发现**：浏览器自动化会话过期的主要用户反馈是**无文案的视觉灰化**，这是一种不友好的交互设计。用户无法区分"程序卡死"、"网络中断"与"会话过期"三种状态，只能依靠视觉灰化这一弱信号进行推断。
+
+---
+
+## 五、一次性消息系统的通用传递模型
+
+除CSRF校验失败使用独立的状态码+弹窗路径外，其余所有会话异常均通过框架提供的一次性消息系统进行传递。该系统的运行模型如下：
+
+### 5.1 消息生命周期
+
+```
+  写入阶段                存储阶段               读取阶段               呈现阶段
+┌──────────┐          ┌──────────┐          ┌──────────┐          ┌──────────┐
+│ 业务代码 │          │ 签名     │          │ 模板引擎 │          │ 页面渲染 │
+│ 调用消息 │─────────▶│ Cookie   │─────────▶│ 调用消费 │─────────▶│ 分类呈现 │
+│ 入队函数 │          │ 客户端侧 │          │ 接口     │          │ 或转Toast│
+└──────────┘          └──────────┘          └──────────┘          └──────────┘
+                          │                      │
+                          │  302重定向期间         │  消费即销毁：
+                          │  Cookie携带消息       │  同一消息仅
+                          │  跨请求传递           │  渲染一次
+                          ▼                      ▼
+                     ┌─────────────────────────────────────┐
+                     │  核心特性：一次写入，一次读取，读后即焚  │
+                     └─────────────────────────────────────┘
+```
+
+### 5.2 消息分类呈现规则
+
+| 消息类别 | CSS样式 | 呈现方式 | 持续时间 | 典型用途 |
+|---------|---------|---------|---------|---------|
+| `success` | 绿色系 | 转换为Toast | 6秒自动消失 | 操作成功通知 |
+| `info` / `message` / `notice` | 蓝色系 | 转换为Toast | 6秒自动消失 | 中性信息提示 |
+| `warning` | 黄色系 | 转换为Toast | 6秒自动消失 | 警告类提示 |
+| `error` / `danger` | 红色系 | 保留在页面固定区域 | 用户刷新或下一次跳转前 | 需要用户关注的错误 |
+
+分类呈现的转换逻辑在页面加载完成后由专门的桥接脚本执行：遍历消息列表中的每个元素，读取CSS类名进行类别判定；非error类消息逐一转换为Toast并添加显示延迟（多条消息间隔200毫秒依次弹出），原DOM元素隐藏。
+
+---
+
+## 六、异常场景用户文案汇总表
+
+下表整合所有分析场景的用户可见文案及呈现方式：
+
+| 异常场景 | 用户实际看到的文案 | 语言 | 呈现方式 | 可见性评级 |
+|---------|-------------------|------|---------|-----------|
+| CSRF令牌校验失败 | `There was a problem processing the request, please reload the page.` | 英文 | 浏览器alert模态弹窗 | ⭐⭐⭐ 可见（需手动确认） |
+| 未登录访问受限页面 | `需要登录，请先登录。` | 中文 | 页面顶部红色错误区（常驻） | ⭐⭐⭐⭐⭐ 明确可见 |
+| 登录密码错误 | `密码错误` | 中文 | 页面顶部红色错误区（常驻） | ⭐⭐⭐⭐⭐ 明确可见 |
+| 已登录访问登录页 | `已登录` | 中文 | 右下角Toast通知（6秒消失） | ⭐⭐⭐⭐ 可见但短暂 |
+| 无Cookie时切换语言 | `Cannot set language without session cookie` | 英文 | 页面顶部红色错误区（常驻） | ⭐⭐⭐ 可见但非中文 |
+| 浏览器会话过期-主路径 | 无文案，仅UI灰化点击无反应 | - | 视觉灰化 | ⭐ 不可见（仅视觉暗示） |
+| 浏览器会话过期-401异常弹窗 | 取决于底层异常（可能是技术化文本） | 通常英文 | alert弹窗 | ⭐⭐ 可见但不可理解 |
+| 浏览器会话过期-500异常 | `There was an error communicating with the server.` | 英文 | alert弹窗 | ⭐⭐ 可见但指向性不明 |
+
+---
+
+## 七、关键发现与设计洞察
+
+### 7.1 两套独立的一次性提示体系
+
+系统实际运行着**两套互不关联的一次性提示机制**：
+
+1. **框架级一次性消息系统**（flash → get_flashed_messages → 页面/Toast）
+   - 用于服务端渲染页面的常规交互反馈
+   - 传递载体为签名Cookie，依赖页面重定向流程
+   - 支持多语言翻译与分类呈现
+
+2. **HTTP状态码驱动的前端弹窗系统**（statusCode[400] → alert）
+   - 专门用于CSRF校验失败及浏览器自动化相关异常
+   - 传递载体为HTTP状态码，无服务端消息入队操作
+   - 文案硬编码于前端脚本，未接入国际化体系
+
+两套体系的割裂导致异常提示的用户体验不一致：常规操作错误有中文提示且分类友好，而底层安全校验与浏览器会话异常则以英文弹窗为主甚至完全无文案。
+
+### 7.2 浏览器会话过期的信息真空
+
+这是最值得关注的设计缺陷：当浏览器自动化会话过期时，**系统首选的反馈机制是UI灰化而不给出任何文案说明**。这种设计假设用户能够从"按钮变灰、点击没反应"推断出"需要重新开始会话"，但实际上用户更可能的归因是"网页卡住了"、"浏览器崩了"或"断网了"。
+
+底层原因是过期检测依赖于脆弱的响应体关键字匹配，而该关键字并非系统主动构造的结构化错误信号，而是异常信息的被动捕获。缺少明确的错误码契约，使得前端无法安全地给出"会话已过期，请重新开始"的确定性提示。
+
+### 7.3 国际化覆盖的盲点
+
+三类关键错误文案未被纳入多语言翻译体系：
+- CSRF校验失败提示（英文硬编码）
+- 无Cookie时的语言设置失败（英文硬编码）
+- 浏览器自动化会话相关错误（异常透传）
+
+这三类场景恰好是用户在长时间操作后或网络环境变化时最可能遇到的错误，缺少中文支持对非英语用户构成了实质性的使用障碍。
 
 ---
 
