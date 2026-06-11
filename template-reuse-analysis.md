@@ -200,9 +200,220 @@ app.jinja_env.globals.update({
 
 ---
 
-## 四、列表页 ↔ 详情页的复用边界
+## 四、Tag 编辑场景的变量清单与缺失边界
 
-### 4.1 共享的部分
+这是之前分析的重要遗漏点 —— Tag 编辑页向模板传递的变量比 Watch 编辑页少得多。
+
+### 4.1 Watch 编辑页完整 template_args（28 个变量）
+
+位置：[`edit.py:318-354`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/ui/edit.py#L318-L354)
+
+```python
+template_args = {
+    'available_processors': processors.available_processors(),
+    'available_timezones': sorted(available_timezones()),
+    'browser_steps_config': browser_step_ui_config,
+    'emailprefix': os.getenv('NOTIFICATION_MAIL_BUTTON_PREFIX', False),
+    'extra_classes': ' '.join(c),
+    'extra_notification_token_placeholder_info': datastore.get_unique_notification_token_placeholders_available(),
+    'extra_processor_config': form.extra_tab_content(),
+    'extra_title': f" - {gettext('Edit')} - {watch.label}",
+    'form': form,
+    'has_default_notification_urls': True if len(datastore.data['settings']['application']['notification_urls']) else False,
+    'has_extra_headers_file': len(datastore.get_all_headers_in_textfile_for_watch(uuid=uuid)) > 0,
+    'has_special_tag_options': _watch_has_tag_options_set(watch=watch),
+    'jq_support': jq_support,  # True/False，取决于 import jq 是否成功
+    'playwright_enabled': os.getenv('PLAYWRIGHT_DRIVER_URL', False),
+    'app_rss_token': app_rss_token,
+    'rss_uuid_feed' : {'label': watch.label, 'url': ...},
+    'settings_application': datastore.data['settings']['application'],
+    'ui_edit_stats_extras': collect_ui_edit_stats_extras(watch),
+    'visual_selector_data_ready': datastore.visualselector_data_is_ready(watch_uuid=uuid),
+    'timezone_default_config': datastore.data['settings']['application'].get('scheduler_timezone_default'),
+    'using_global_webdriver_wait': not default['webdriver_delay'],
+    'uuid': uuid,
+    'watch': watch,
+    'capabilities': capabilities,
+    'auto_applied_tags': {tag_uuid: tag ...},
+    'llm_configured': bool(_get_llm_config(datastore)),
+    'llm_group_overrides': _resolve_llm_group_overrides(watch, datastore),
+}
+```
+
+### 4.2 Tag 编辑页完整 template_args（仅 5 个变量）
+
+位置：[`tags/__init__.py:182-188`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L182-L188)
+
+```python
+template_args = {
+    'data': default,                              # Tag 对象
+    'form': form,
+    'watch': default,                             # Tag 对象赋值给 watch
+    'extra_notification_token_placeholder_info': datastore.get_unique_notification_token_placeholders_available(),
+    'llm_configured': bool(_get_llm_config(datastore)),
+}
+```
+
+**render_template 额外补充（4 个变量）**：
+```python
+output = render_template("edit-tag.html",
+                         extra_form_content=included_content,
+                         extra_tab_content=form.extra_tab_content() if form.extra_tab_content() else None,
+                         matching_watches=matching_watches,
+                         settings_application=datastore.data['settings']['application'],
+                         **template_args
+                         )
+```
+
+### 4.3 Tag 编辑页缺失的关键变量清单
+
+| 缺失变量 | Watch 页有 | Tag 页有 | 影响范围 | 未定义时的行为 |
+|---------|-----------|---------|---------|---------------|
+| `jq_support` | ✅ | ❌ | `include_subtract.html:20`、`:36` | Jinja2 Undefined 在 bool 上下文为 **False**，不报错但 jq 相关提示不显示 |
+| `emailprefix` | ✅ | ❌ | `edit-tag.html:12`、`render_common_settings_form` 参数 2 | `{% if emailprefix %}` 为 False，邮件按钮不显示；但宏调用仍传参，宏内 `{% if emailprefix %}` 也为 False |
+| `has_default_notification_urls` | ✅ | ❌ | `edit-tag.html:131` | `{% if has_default_notification_urls %}` 为 False，系统级通知 URL 警告不显示 |
+| `llm_group_overrides` | ✅ | ❌ | `include_llm_intent.html:26`、`:49`、`:88` | `{% if llm_group_overrides is defined %}` 为 False，走 Tag 模式分支 |
+| `has_special_tag_options` | ✅ | ❌ | `edit-tag.html:40`（通过 `has_tag_filters_extra` 间接使用） | Tag 页在模板中直接 `{% set has_tag_filters_extra='' %}`，绕开了对 `has_special_tag_options` 的依赖 |
+
+### 4.4 Tag 对象的 processor 字段真实值
+
+**关键事实修正**：Tag 对象默认继承 `watch_base` 类，其默认值是 `'processor': 'text_json_diff'`（[`model/__init__.py:225`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/model/__init__.py#L225-L225)）。仅在 POST 提交时（[`tags/__init__.py:254`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L254-L254)）才会设置为 `'restock_diff'`。
+
+这意味着：
+- **GET 请求（首次加载编辑页）**：Tag 对象的 `processor` 字段是 `'text_json_diff'`
+- **POST 保存后重新加载**：Tag 对象的 `processor` 字段是 `'restock_diff'`
+
+但在 `include_llm_intent.html` 中，由于 Tag 模式下 `llm_group_overrides is defined` 为 False，`is_text_json_diff` 始终被设置为 `true`，`watch.get('processor')` 的值实际上**不会影响分支走向**。
+
+---
+
+## 五、三类共享片段在两类编辑页中的真实分支路径
+
+### 5.1 `include_llm_intent.html` — 完整分支路径对比
+
+#### Watch 编辑模式路径
+
+```
+llm_group_overrides is defined → ✅ True
+├─ is_text_json_diff = not watch.get('processor') or watch.get('processor') == 'text_json_diff'
+│  ├─ 如果 processor 是 text_json_diff → ✅ True
+│  └─ 如果是 restock_diff → ❌ False（外层 if 会隐藏整个片段）
+│
+└─ {% if is_text_json_diff %} → ✅ 显示
+   ├─ {% if watch is defined and watch %} → ✅ True
+   │  ├─ 显示 "An accurate plain-English description..." 描述
+   │  └─ 显示 processor='text_json_diff' 的例子
+   │
+   ├─ {% if llm_group_overrides.llm_intent %} → 取决于组设置
+   │  ├─ 显示 "From group 'XXX': YYY" 占位符
+   │  └─ intent_placeholder 设置为组覆盖值
+   │  └─ {% elif watch is defined and watch %} → ✅ True
+   │     └─ intent_placeholder 为默认值
+   │
+   ├─ {% if watch is defined and watch %} → ✅ True
+   │  └─ 渲染 form.llm_intent 字段
+   │
+   ├─ {% if watch.get('llm_prefilter') %} → 取决于 watch 设置
+   │  └─ 显示 "AI pre-filter active: ..." 提示
+   │
+   └─ llm_change_summary 区域逻辑同上
+```
+
+#### Tag 编辑模式路径
+
+```
+llm_group_overrides is defined → ❌ False
+├─ is_text_json_diff = true （硬编码为 true，忽略 watch.get('processor') 的值）
+│
+└─ {% if is_text_json_diff %} → ✅ 始终显示
+   ├─ {% if watch is defined and watch %} → ✅ True（watch 是 Tag 对象）
+   │  ├─ 显示 "Set a change intent for all watches in this tag/group..." 描述
+   │  └─ 显示 tag 模式的例子
+   │
+   ├─ {% if llm_group_overrides.llm_intent %} → ❌ False（llm_group_overrides 未定义）
+   │  └─ 跳过组占位符分支
+   │  └─ {% elif watch is defined and watch %} → ✅ True
+   │     └─ intent_placeholder 为默认值
+   │
+   ├─ {% if watch is defined and watch %} → ✅ True
+   │  └─ 渲染 form.llm_intent 字段
+   │
+   ├─ {% if watch.get('llm_prefilter') %} → 取决于 Tag 设置
+   │  └─ 显示 "AI pre-filter active: ..." 提示
+   │
+   └─ llm_change_summary 区域逻辑同上
+```
+
+### 5.2 `include_subtract.html` — 完整分支路径对比
+
+#### Watch 编辑模式
+
+```
+render_field(form.include_filters, ...) → ✅ 正常渲染
+  placeholder = has_tag_filters_extra + "#example..."
+  has_tag_filters_extra 由 edit.html:40 预 set，值为 '' 或警告字符串
+
+{% if jq_support %} → ✅ True 或 False（取决于 import jq 是否成功）
+└─ 显示 jq 例子（如 "jq: [.[] | .version]"）
+
+{% if jq_support %} → 同上
+└─ 帮助文案中包含 "or jq selector" 提示
+
+render_field(form.subtractive_selectors, ...) → ✅ 正常渲染
+  placeholder = has_tag_filters_extra + "header, footer..."
+```
+
+#### Tag 编辑模式
+
+```
+render_field(form.include_filters, ...) → ✅ 正常渲染
+  placeholder = '' + "#example..." （has_tag_filters_extra 由 edit-tag.html:16 预 set 为 ''）
+
+{% if jq_support %} → ❌ False（jq_support 未定义，Undefined 在 bool 上下文为 False）
+└─ 不显示 jq 例子
+
+{% if jq_support %} → ❌ False
+└─ 帮助文案中只有 "CSS, JSONPath, XPath"，没有 "jq selector"
+
+render_field(form.subtractive_selectors, ...) → ✅ 正常渲染
+```
+
+### 5.3 `text-options.html` — 变量可用性核查
+
+| 依赖项 | Watch 编辑页 | Tag 编辑页 | 验证 |
+|-------|-------------|-----------|-----|
+| `render_field` 宏 | ✅ import | ✅ import | `edit.html:7` / `edit-tag.html:3` 都 import 了 |
+| `render_ternary_field` 宏 | ✅ import | ✅ import | `edit.html:7` / `edit-tag.html:3` 都 import 了 |
+| `form.trigger_text` | ✅ 有字段 | ✅ 有字段 | 继承自 `processor_text_json_diff_form` |
+| `form.ignore_text` | ✅ 有字段 | ✅ 有字段 | 同上 |
+| `form.strip_ignored_lines` | ✅ 有字段 | ✅ 有字段 | 同上 |
+| `form.text_should_not_be_present` | ✅ 有字段 | ✅ 有字段 | 同上 |
+| `form.extract_lines_containing` | ✅ 有字段 | ✅ 有字段 | 同上 |
+| `form.extract_text` | ✅ 有字段 | ✅ 有字段 | 同上 |
+
+**字段继承链**：`group_restock_settings_form` → `restock_settings_form` → `processor_settings_form` → `processor_text_json_diff_form` → `commonSettingsForm`。所有字段在两边都可用。
+
+### 5.4 `render_common_settings_form` 宏 — 参数传递完整性
+
+宏签名（[`_common_fields.html:151`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/templates/_common_fields.html#L151-L151)）：
+```jinja2
+{% macro render_common_settings_form(form, emailprefix, settings_application, extra_notification_token_placeholder_info) %}
+```
+
+| 参数 | Watch 编辑页 | Tag 编辑页 | 宏内行为 |
+|-----|-------------|-----------|---------|
+| `form` | ✅ 传 | ✅ 传 | 正常渲染字段 |
+| `emailprefix` | ✅ 传（`os.getenv('NOTIFICATION_MAIL_BUTTON_PREFIX', False)`） | ❌ **未传**（Undefined） | 宏内 `{% if emailprefix %}` 为 False，邮件通知按钮不显示 |
+| `settings_application` | ✅ 传 | ✅ 传 | 正常获取系统默认的 notification_title / notification_body 占位符 |
+| `extra_notification_token_placeholder_info` | ✅ 传 | ✅ 传 | 正常显示可用占位符列表 |
+
+**边界风险**：Tag 编辑页虽然没有传递 `emailprefix`，但仍然将它作为第 2 个参数传入了宏调用（[`edit-tag.html:139`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/templates/edit-tag.html#L139-L139)）。此时 Jinja2 会将 Undefined 值传入宏。宏内通过 `{% if emailprefix %}` 安全地判断，不会抛出异常，但邮件按钮功能在 Tag 编辑页实际上被静默禁用了。
+
+---
+
+## 六、列表页 ↔ 详情页的复用边界
+
+### 6.1 共享的部分
 
 | 共享层级 | 具体内容 | 共享方式 |
 |---------|---------|---------|
@@ -213,7 +424,7 @@ app.jinja_env.globals.update({
 | 全局函数 | `get_darkmode_state()`、`is_checking_now()` 等 20+ 个 | template_global |
 | 全局过滤器 | `format_last_checked_time`、`format_timestamp_timeago`、`pagination_slice` 等 | template_filter |
 
-### 4.2 不共享的部分（列表页特有）
+### 6.2 不共享的部分（列表页特有）
 
 - 快速添加 Watch 表单（`#form-quick-watch-add`）
 - 批量操作工具栏（暂停/静音/重检/删除）
@@ -222,7 +433,7 @@ app.jinja_env.globals.update({
 - Favicon 懒加载逻辑
 - LLM 快速输入框（简化版，不使用 include 片段）
 
-### 4.3 不共享的部分（详情页特有）
+### 6.3 不共享的部分（详情页特有）
 
 - Tab 页切换系统（General / Request / Browser Steps / AI / Filters / Notifications / Stats）
 - 所有 `include` 级共享片段（LLM Intent、Subtract、Text Options）
@@ -231,61 +442,9 @@ app.jinja_env.globals.update({
 
 ---
 
-## 五、Tag 编辑页 ↔ Watch 编辑页的复用边界
+## 七、避免重复渲染的策略与失败边界
 
-这是模板复用最密集的区域，两个页面共享了三个完整的 include 片段和一个宏。
-
-### 5.1 共享全景
-
-| 共享片段 | 复用方式 | 适配机制 |
-|---------|---------|---------|
-| `include_llm_intent.html` | include | `llm_group_overrides is defined` 切换模式 + `watch` Duck Typing |
-| `include_subtract.html` | include | `has_tag_filters_extra` 预 set 变量 + `jq_support` 存在性探测 |
-| `text-options.html` | include | 纯表单字段渲染，依赖 `form` 对象的字段兼容性 |
-| `render_common_settings_form` | macro import | 显式参数列表 |
-
-### 5.2 Duck Typing 适配：Tag 对象如何"冒充" Watch 对象
-
-Tag 编辑页中（[`tags/__init__.py:182-188`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L182-L188)）：
-
-```python
-template_args = {
-    'data': default,       # Tag 对象
-    'form': form,
-    'watch': default,      # 关键：把 Tag 对象赋值给 watch 变量
-    ...
-}
-```
-
-这样做的前提是 Tag 对象和 Watch 对象在 include 片段访问的字段上保持了**接口一致性**：
-
-| 字段访问 | Watch 对象 | Tag 对象 | 兼容性 |
-|---------|-----------|---------|-------|
-| `watch.get('processor')` | ✅ 有 | ✅ 有（tag.processor = 'restock_diff'） | ✅ |
-| `watch.get('llm_prefilter')` | ✅ 有 | ⚠️ 可能有 / 可能没有（取决于 form） | `get()` 安全 |
-| `watch.get('llm_intent')` | ✅ 有 | ✅ 有 | ✅ |
-| `watch.label` | ✅ 有 | ✅ 有 | ✅ |
-
-> **边界风险**：这种隐式接口契约没有编译期保障。如果未来 Watch 新增一个字段而 Tag 没有对应添加，include 片段中对应的 `watch.get('new_field')` 会静默返回 None，可能导致难以排查的显示 bug。
-
-### 5.3 各自独立的部分
-
-| 功能 | Watch 编辑页 | Tag 编辑页 |
-|-----|-------------|-----------|
-| URL 编辑 | ✅ 完整 URL + 变量支持 | ❌ 改为 `url_match_pattern` 通配符 |
-| 处理器选择 | ✅ 可切换 text_json_diff / restock_diff 等 | ❌ 固定 restock_diff |
-| Browser Steps | ✅ 完整编辑器 | ❌ 无 |
-| 可视化选择器 | ✅ 有 | ❌ 无 |
-| 请求设置 | ✅ Headers / Cookies / 代理 | ❌ 无 |
-| 统计信息 | ✅ 详细检查统计 | ❌ 无 |
-| 标签颜色 | ❌ 无 | ✅ 颜色选择器 |
-| 匹配的 Watch 列表 | ❌ 无 | ✅ 显示当前匹配此 tag 的 watches |
-
----
-
-## 六、避免重复渲染的五种策略
-
-### 6.1 策略一：CSS visibility 切换（内容一次渲染，前端切换）
+### 7.1 策略一：CSS visibility 切换（内容一次渲染，前端切换）
 
 **应用场景**：Tab 页切换、子 Tab 切换
 
@@ -299,7 +458,7 @@ template_args = {
 - 前端切换零延迟
 - 隐藏 Tab 中的表单字段仍然会被提交（visibility:hidden 不影响 form 提交）
 
-### 6.2 策略二：前端 JS 条件显示（基于 data 属性）
+### 7.2 策略二：前端 JS 条件显示（基于 data 属性）
 
 **应用场景**：编辑页中根据处理器类型、fetcher 类型动态显示/隐藏字段
 
@@ -309,7 +468,7 @@ template_args = {
 - 服务器端只渲染一次所有可能的字段
 - 用户切换处理器类型时无需重新请求
 
-### 6.3 策略三：分页切片（列表页渲染量控制）
+### 7.3 策略三：分页切片（列表页渲染量控制）
 
 **应用场景**：Watch 列表分页
 
@@ -331,7 +490,7 @@ def _jinja2_filter_pagination_slice(arr, skip):
 
 **效果**：默认每页 50 条，避免一次性渲染数千行 DOM。
 
-### 6.4 策略四：Favicon 懒加载（前端延迟请求）
+### 7.4 策略四：Favicon 懒加载（前端延迟请求）
 
 **应用场景**：列表页 Favicon 图片
 
@@ -343,24 +502,41 @@ def _jinja2_filter_pagination_slice(arr, skip):
 - 首屏减少 N 个 HTTP 请求（N = 不在视口的 watch 数量）
 - 服务器端无需为不在首屏的 watch 生成/读取 favicon
 
-### 6.5 策略五：插件内容预渲染（独立 Jinja2 Environment）
+### 7.5 策略五：插件内容预渲染（独立 Jinja2 Environment）
 
 **应用场景**：处理器插件的 `extra_form_content`
 
-**实现**：[`edit.py:356-363`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/ui/edit.py#L356-L363)
+#### Watch 编辑页实现（[`edit.py:356-363`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/ui/edit.py#L356-L363)）
 
 ```python
-templates_dir = str(importlib.resources.files("changedetectionio").joinpath('templates'))
-env = Environment(loader=FileSystemLoader(templates_dir))
-template = env.from_string(form.extra_form_content())
-included_content = template.render(**template_args)  # 预渲染为字符串
+included_content = None
+if form.extra_form_content():
+    templates_dir = str(importlib.resources.files("changedetectionio").joinpath('templates'))
+    env = Environment(loader=FileSystemLoader(templates_dir))
+    template = env.from_string(form.extra_form_content())
+    included_content = template.render(**template_args)  # ⚠️ 无 try-except
 
 output = render_template("edit.html",
-                         extra_form_content=included_content,  # 字符串传入主模板
+                         extra_form_content=included_content,
                          ...)
 ```
 
-主模板中只做字符串拼接（[`edit.html:113-115`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/ui/templates/edit.html#L113-L115)）：
+#### Tag 编辑页实现（[`tags/__init__.py:190-214`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L190-L214)）
+
+```python
+included_content = {}  # ⚠️ 初始值是空字典 {}，不是 None！
+if form.extra_form_content():
+    from jinja2 import Environment, FileSystemLoader
+    import importlib.resources
+    templates_dir = str(importlib.resources.files("changedetectionio").joinpath('templates'))
+    env = Environment(loader=FileSystemLoader(templates_dir))
+    template_str = """<tag-specific template code>"""  # 预先拼接Tag特有代码
+    template_str += form.extra_form_content()
+    template = env.from_string(template_str)
+    included_content = template.render(**template_args)  # ⚠️ 无 try-except
+```
+
+主模板中使用（[`edit.html:113-115`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/ui/templates/edit.html#L113-L115)）：
 ```jinja2
 {% if extra_form_content %}
     {{ extra_form_content|safe }}
@@ -369,14 +545,44 @@ output = render_template("edit.html",
 
 **优势**：
 - 插件模板可以 `{% from '_helpers.html' import ... %}` 复用同一套宏
-- 插件渲染错误不会污染主模板（异常隔离）
 - 主模板避免了动态 include 的模板查找开销
 
-Tag 编辑页采用完全相同的模式 — [`tags/__init__.py:191-214`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L191-L214)
+#### 失败边界分析
+
+**1. 缺少 try-except 的风险**
+
+两个页面的 `template.render(**template_args)` 调用都**没有 try-except 包裹**。如果插件模板中存在：
+- Jinja2 语法错误（如 `{{ unterminated }}`）
+- 引用了不存在的变量（如 `{{ nonexistent_var }}`）
+- 调用了不存在的宏
+
+会直接抛出异常，导致**整个页面 500 错误**。
+
+**2. Tag 编辑页的 included_content 初始值 bug**
+
+Tag 编辑页中 `included_content = {}`（空字典），而 Watch 编辑页是 `None`。
+
+- 如果 `form.extra_form_content()` 返回 falsy 值（`None`、`""`、`[]` 等），`if` 分支不会执行，`included_content` 保持为 `{}`
+- 在模板中 `{% if extra_form_content %}` 会判定为 **True**（因为非空字典 `{}` 是 truthy）
+- 然后 `{{ extra_form_content|safe }}` 会将字符串 `"{}"` 输出到页面上！
+
+这是一个真实的 bug：当插件没有 `extra_form_content` 时，Tag 编辑页会在页面上多出一个 `"{}"` 字符串。
+
+**3. 插件模板的变量作用域差异**
+
+插件模板通过 `template.render(**template_args)` 渲染，可以访问 template_args 中的所有变量：
+- Watch 编辑页：28 个变量可用
+- Tag 编辑页：只有 5 个变量可用
+
+如果插件模板引用了 Watch 编辑页特有的变量（如 `jq_support`、`capabilities`），在 Tag 编辑页中就会抛出 `UndefinedError`，导致整个页面崩溃。
+
+**4. 宏 import 的隐式依赖**
+
+插件模板可以 `{% from '_helpers.html' import render_field %}`，但如果插件模板需要使用 `render_ternary_field` 或其他宏而忘记 import，也会抛出 `UndefinedError`。
 
 ---
 
-## 七、复用边界全景图
+## 八、复用边界全景图
 
 ```
                               ┌──────────────────────────────┐
@@ -400,29 +606,44 @@ Tag 编辑页采用完全相同的模式 — [`tags/__init__.py:191-214`](file:/
           │                     │                     │  ┌───────────────┐   │
           │  宏:                │                     │  │ Watch 编辑页  │   │
           │   - render_field    │                     │  │  edit.html    │   │
-          │   - render_simple_  │                     │  └───────┬───────┘   │
-          │     field           │                     │          │           │
-          │   - render_nolabel_ │                     │  ┌───────▼───────┐   │
-          │     field           │                     │  │ Tag 编辑页    │   │
-          │                     │                     │  │ edit-tag.html │   │
-          │  无 include 片段    │                     │  └───────────────┘   │
-          └─────────────────────┘                     │                     │
-                                                      │  三者共享:          │
-                                                      │   - include_llm_    │
-                                                      │     intent          │
-                                                      │   - include_        │
-                                                      │     subtract        │
-                                                      │   - text-options    │
-                                                      │   - render_common_  │
-                                                      │     settings_form   │
+          │   - render_simple_  │                     │  │  28 vars      │   │
+          │     field           │                     │  └───────┬───────┘   │
+          │   - render_nolabel_ │                     │          │           │
+          │     field           │                     │          │ 变量差异    │
+          │                     │                     │          ▼           │
+          │  无 include 片段    │                     │  ┌───────────────┐   │
+          └─────────────────────┘                     │  │ Tag 编辑页    │   │
+                                                      │  │ edit-tag.html │   │
+                                                      │  │  5 + 4 vars   │   │
+                                                      │  └───────────────┘   │
+                                                      │                     │
+                                                      │  共享 include 片段: │
+                                                      │  ┌──────────────────┐│
+                                                      │  │ include_llm_     ││
+                                                      │  │   intent         ││
+                                                      │  │ 分支由 llm_group_││
+                                                      │  │  overrides 切换   ││
+                                                      │  ├──────────────────┤│
+                                                      │  │ include_subtract ││
+                                                      │  │  jq_support 在 Tag││
+                                                      │  │  页为 Undefined  ││
+                                                      │  ├──────────────────┤│
+                                                      │  │ text-options     ││
+                                                      │  │  字段完全兼容    ││
+                                                      │  ├──────────────────┤│
+                                                      │  │ render_common_   ││
+                                                      │  │   settings_form  ││
+                                                      │  │  emailprefix 在  ││
+                                                      │  │  Tag 页为 Undef  ││
+                                                      │  └──────────────────┘│
                                                       └─────────────────────┘
 ```
 
 ---
 
-## 八、设计评价与改进建议
+## 九、设计评价与改进建议
 
-### 8.1 设计优点
+### 9.1 设计优点
 
 | 模式 | 评价 |
 |-----|------|
@@ -431,15 +652,26 @@ Tag 编辑页采用完全相同的模式 — [`tags/__init__.py:191-214`](file:/
 | `llm_group_overrides is defined` 模式切换 | ✅ 巧妙利用变量存在性实现双模式适配，单一模板服务两种场景 |
 | `has_tag_filters_extra` 预 set | ⚠️ 隐式契约，依赖调用方自觉，缺少编译期检查 |
 | Watch/Tag Duck Typing | ⚠️ 最大化代码复用，但隐式接口无保障 |
-| 插件独立 Environment 预渲染 | ✅ 错误隔离 + 宏复用 + 性能优化 |
+| `jq_support` Undefined 优雅降级 | ✅ 利用 Jinja2 Undefined 的 bool 行为实现功能渐进式降级 |
+| 插件独立 Environment 预渲染 | ✅ 宏复用 + 性能优化，但 ⚠️ 缺少异常处理 |
 | CSS visibility Tab 切换 | ✅ 一次渲染，零延迟切换，表单完整提交 |
 
-### 8.2 可改进点
+### 9.2 已发现的 Bug
 
-1. **include 片段的自包含性**：`include_subtract.html` 和 `text-options.html` 可以在文件头部自行 `{% from '_helpers.html' import render_field %}`，减少对调用方的隐式依赖。目前调用方必须自行 import 所需的宏，否则会报 `UndefinedError`。
+1. **Tag 编辑页 `included_content = {}` bug**（[`tags/__init__.py:190`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L190-L190)）
+   - 初始值应为 `None` 而非 `{}`，否则在没有插件内容时页面会输出 `"{}"`
+
+2. **Tag 编辑页 `emailprefix` 静默缺失**
+   - 宏调用虽然传了 Undefined 值，但功能被静默禁用，用户无法得知为什么邮件按钮不显示
+
+### 9.3 可改进点
+
+1. **include 片段的自包含性**：`include_subtract.html` 和 `text-options.html` 可以在文件头部自行 `{% from '_helpers.html' import render_field, render_ternary_field %}`，减少对调用方的隐式依赖。目前调用方必须自行 import 所需的宏，否则会报 `UndefinedError`。
 
 2. **跨视图上下文构建的重复代码**：`settings_application`、`emailprefix`、`extra_notification_token_placeholder_info`、`timezone_default_config` 这 4 个变量在 3 个视图中用相同代码构建，可以提取为 `build_form_template_context(datastore)` 辅助函数。
 
 3. **Tag 对象的 Duck Typing 风险**：建议为 Tag 和 Watch 共享字段定义一个显式的 Protocol 或基类，至少在文档中明确列出 include 片段依赖的字段清单。
 
-4. **列表页 Tag 颜色 CSS 的服务端生成**：目前每个标签的颜色 CSS 在列表页内联生成（[`watch-overview.html:70-103`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/watchlist/templates/watch-overview.html#L70-L103)），每次请求都重新生成。如果 tag 数量较多，可以考虑缓存或移到 CSS 文件中。
+4. **插件预渲染的异常处理**：应为 `template.render()` 添加 try-except，失败时记录日志并输出一个占位符（如 "插件加载失败"），而不是让整个页面 500。
+
+5. **Tag 编辑页变量缺失的可观测性**：对于 `emailprefix`、`has_default_notification_urls` 这类功能开关型变量的缺失，要么在 Tag 视图中显式传递 False，要么在模板中添加显式的 `is defined` 检查。
