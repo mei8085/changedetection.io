@@ -568,11 +568,34 @@ if form.extra_form_content():
 
 Tag 编辑页中 `included_content = {}`（空字典），而 Watch 编辑页是 `None`。
 
-- 如果 `form.extra_form_content()` 返回 falsy 值，`if` 分支不执行，`included_content` 保持为 `{}`
-- 在模板中 `{% if extra_form_content %}` 判定为 **FALSE**（空字典是 falsy），不会进入内容输出分支
-- **不会**出现 `"{}"` 输出到页面的问题
+**2. Tag 编辑页 `included_content = {}` 的实际影响 — 死代码 + 类型不一致**
 
-> **代码质量问题而非功能 bug**：这是一个类型不一致的问题（初始值应为 `None` 或 `""`，而非 `{}`），但在当前模板代码路径下不会导致功能异常。如果未来模板移除了 `{% if %}` 保护而直接 `{{ extra_form_content|safe }}`，就会输出 `"{}"` 字符串。
+完整代码路径分析（[`tags/__init__.py:190-214`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L190-L214)）：
+
+**Form 继承链：**
+```
+group_restock_settings_form (tags/form.py)
+  ↓ 继承
+restock_settings_form (processors/restock_diff/forms.py)
+  ↓ 继承
+processor_text_json_diff_form (forms.py)
+  ↓ 继承
+commonSettingsForm (forms.py, 基类 extra_form_content() 返回 None)
+```
+
+**关键代码路径：**
+1. [`tags/__init__.py:190`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L190-L190): `included_content = {}`
+2. [`tags/__init__.py:191`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L191-L191): `if form.extra_form_content():`
+3. `form.extra_form_content()` 调用的是 [`restock_diff/forms.py:39-80`](file:///d:/fz/0601-1/solo-dogfeeding/code/9-changedetection.io/changedetectionio/processors/restock_diff/forms.py#L39-L80) 的实现
+4. 这个方法**无条件**返回包含 HTML 模板的字符串（即使 `watch`/`datastore` 不存在，也会返回第 49-80 行的表单字段代码）
+5. 唯一的条件 `if getattr(self, 'watch', None) and getattr(self, 'datastore'):` 仅控制是否显示"Note! A Group tag overrides..."提示，**不影响整体返回值**
+
+**结论：**
+- `form.extra_form_content()` **永远返回非空字符串**
+- `if form.extra_form_content():` **永远为 True**
+- `included_content = {}` 这个初始值**永远不会被使用**，是**死代码**
+- 这是**代码质量问题（类型不一致 + 死代码）**，不是功能 bug
+- 但如果未来 `restock_settings_form.extra_form_content()` 重构为可能返回 None/空字符串，就可能暴露问题
 
 **3. 缺少 try-except 的风险**
 
@@ -689,4 +712,11 @@ Tag 编辑页中 `included_content = {}`（空字典），而 Watch 编辑页是
 
 4. **插件预渲染的异常处理**：应为 `template.render()` 添加 try-except，失败时记录日志并输出一个占位符（如 "插件加载失败"），而不是让整个页面 500。
 
-5. **Tag 编辑页变量缺失的可观测性**：对于 `emailprefix`、`has_default_notification_urls` 这类功能开关型变量的缺失，要么在 Tag 视图中显式传递 False，要么在模板中添加显式的 `is defined` 检查。
+5. **Tag 编辑页变量缺失的可观测性**：
+   - `emailprefix`、`has_default_notification_urls`、`jq_support` 这类功能开关型变量的缺失
+   - 要么在 Tag 视图中显式传递 False，要么在模板中添加显式的 `is defined` 检查
+   - 避免功能被静默隐藏，用户无法得知原因
+
+6. **消除 `llm_configured` 重复传递**：Watch/Tag 视图无需显式传递 `llm_configured`，该变量已通过 context_processor 全局注入。
+
+7. **Tag 编辑页 `included_content` 初始值统一**：将 `{}` 改为 `None`，与 Watch 编辑页保持一致，避免潜在的类型不一致问题。
