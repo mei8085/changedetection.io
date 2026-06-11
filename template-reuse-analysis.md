@@ -549,7 +549,32 @@ if form.extra_form_content():
 
 #### 失败边界分析
 
-**1. 缺少 try-except 的风险**
+**1. Jinja2 空字典行为的代码事实验证**
+
+通过实际测试 Jinja2 模板引擎的条件判断行为：
+
+| 输入值 | `{% if x %}` 结果 | `{{ x|safe }}` 输出 |
+|--------|-----------------|-------------------|
+| `None` | FALSE | `'None'` |
+| `{}`（空字典） | **FALSE** | `'{}'` |
+| `{'a': 1}` | TRUE | `"{'a': 1}"` |
+| `""`（空字符串） | FALSE | `''` |
+| `[]`（空列表） | FALSE | `'[]'` |
+| `Undefined` | FALSE | 抛出 UndefinedError |
+
+> **关键校准**：空字典 `{}` 在 Jinja2 条件中是 **FALSE**，不是之前分析的 TRUE。这是因为 Jinja2 遵循 Python 的 truthiness 规则：空容器（dict、list、str 等）在 bool 上下文中都是 False。
+
+**2. Tag 编辑页 `included_content = {}` 的实际影响**
+
+Tag 编辑页中 `included_content = {}`（空字典），而 Watch 编辑页是 `None`。
+
+- 如果 `form.extra_form_content()` 返回 falsy 值，`if` 分支不执行，`included_content` 保持为 `{}`
+- 在模板中 `{% if extra_form_content %}` 判定为 **FALSE**（空字典是 falsy），不会进入内容输出分支
+- **不会**出现 `"{}"` 输出到页面的问题
+
+> **代码质量问题而非功能 bug**：这是一个类型不一致的问题（初始值应为 `None` 或 `""`，而非 `{}`），但在当前模板代码路径下不会导致功能异常。如果未来模板移除了 `{% if %}` 保护而直接 `{{ extra_form_content|safe }}`，就会输出 `"{}"` 字符串。
+
+**3. 缺少 try-except 的风险**
 
 两个页面的 `template.render(**template_args)` 调用都**没有 try-except 包裹**。如果插件模板中存在：
 - Jinja2 语法错误（如 `{{ unterminated }}`）
@@ -558,17 +583,7 @@ if form.extra_form_content():
 
 会直接抛出异常，导致**整个页面 500 错误**。
 
-**2. Tag 编辑页的 included_content 初始值 bug**
-
-Tag 编辑页中 `included_content = {}`（空字典），而 Watch 编辑页是 `None`。
-
-- 如果 `form.extra_form_content()` 返回 falsy 值（`None`、`""`、`[]` 等），`if` 分支不会执行，`included_content` 保持为 `{}`
-- 在模板中 `{% if extra_form_content %}` 会判定为 **True**（因为非空字典 `{}` 是 truthy）
-- 然后 `{{ extra_form_content|safe }}` 会将字符串 `"{}"` 输出到页面上！
-
-这是一个真实的 bug：当插件没有 `extra_form_content` 时，Tag 编辑页会在页面上多出一个 `"{}"` 字符串。
-
-**3. 插件模板的变量作用域差异**
+**4. 插件模板的变量作用域差异**
 
 插件模板通过 `template.render(**template_args)` 渲染，可以访问 template_args 中的所有变量：
 - Watch 编辑页：28 个变量可用
