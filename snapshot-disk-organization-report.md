@@ -36,12 +36,18 @@ changedetection.io 将每个监控目标（Watch）的快照数据以 **文件�
 │   ├── last-screenshot.png       # 最近一次正常截图
 │   ├── last-error-screenshot.png # 最近一次错误截图
 │   ├── last-fetched.br           # 过滤前的原始文本（brotli 压缩）
-│   ├── last-checksum.txt         # 上次校验和（用于快速比对跳过）
+│   ├── last-checksum.txt         # 上次原始内容校验和（processor 直接读写，用于快速跳过）
+│   ├── last-error.txt            # 最近一次错误文本
+│   ├── change-summary-{from}-to-{to}-{hash}.txt  # LLM 变更摘要缓存
+│   ├── report-{uuid}.csv         # 历史正则抽取报表
 │   ├── favicon.ico               # 站点图标
 │   ├── elements.deflate          # XPath/视觉选择器数据（zlib 压缩）
+│   ├── elements-error.deflate    # XPath/视觉选择器错误数据
+│   ├── visual_comparison_data.json  # 图像对比历史数据（processor 直接读）
 │   ├── step_before-*.jpeg        # 浏览器步骤截图
-│   ├── text_json_diff.json       # 处理器专属配置（可选）
-│   └── image_ssim_diff.json      # 处理器专属配置（可选）
+│   ├── cropped_image_template.png  # 模板匹配裁剪图（processor 直接读写，可选）
+│   ├── text_json_diff.json       # 处理器专属配置（processor 直接读写，可选）
+│   └── image_ssim_diff.json      # 处理器专属配置（processor 直接读写，可选）
 │
 ├── {watch-uuid-2}/
 │   └── ...
@@ -528,16 +534,128 @@ def get_from_version_based_on_last_viewed(self):
 
 ---
 
-## 7. Watch 层 vs Processor 层的职责边界
+## 7. Watch 层 vs Processor 层的存储职责边界（修正版）
 
-这是架构设计的核心，两层职责严格分离：
+> **⚠️ 修正说明**：之前的结论"Processor 层不直接读写磁盘文件"不准确。顺着代码追踪发现，Processor 层（尤其是基类）有多处直接 `open()` / `os.remove()` 的磁盘操作。本节重新梳理准确的职责边界。
 
-| 层面 | 核心职责 | 典型方法/属性 |
-|------|----------|---------------|
-| **Watch 层**<br>`model/Watch.py` | **数据存储与检索**<br>配置持久化<br>快照读写<br>索引管理<br>属性计算<br>安全校验 | `save_history_blob()`<br>`get_history_snapshot()`<br>`save_last_fetched_html()`<br>`save_screenshot()`<br>`history` 属性<br>`get_from_version_based_on_last_viewed`<br>`newest_history_key` |
-| **Processor 层**<br>`processors/*/` | **内容处理与渲染**<br>内容抓取（fetcher）<br>过滤/提取/转换<br>变更检测（checksum）<br>UI 渲染（render）<br>资源提供（get_asset） | `perform_site_check()`<br>`run_changedetection()`<br>`_apply_diff_filtering()`<br>`render()` (difference/preview)<br>`get_asset()` |
+### 7.1 两层职责总览
 
-**调用关系图：**
+| 层面 | 核心职责 | 是否直接读写磁盘 | 典型方法/属性 |
+|------|----------|------------------|---------------|
+| **Watch 层**<br>`model/Watch.py` | **核心数据存储与检索**<br>配置持久化<br>历史快照读写<br>索引管理<br>属性计算<br>安全校验 | 是（主存储层，所有核心数据） | `save_history_blob()`<br>`get_history_snapshot()`<br>`save_last_fetched_html()`<br>`save_screenshot()`<br>`save_last_text_fetched_before_filters()`<br>`history` 属性<br>`get_from_version_based_on_last_viewed`<br>`newest_history_key` |
+| **Processor 层**<br>`processors/*/` | **内容处理与渲染**<br>内容抓取<br>过滤/提取/转换<br>变更检测（checksum）<br>UI 渲染<br>资源提供 | 是（辅助存储层，仅处理器专属优化文件） | `perform_site_check()`<br>`run_changedetection()`<br>`update_last_raw_content_checksum()`<br>`read_extra_watch_config()`<br>`update_extra_watch_config()`<br>`render()`<br>`get_asset()` |
+
+### 7.2 Watch 层统一持久化的核心数据
+
+以下数据**始终由 Watch 层负责写入**，Processor 层即使要使用，也通过调用 Watch 层方法获取或写入：
+
+| 数据类别 | 具体文件 | 写入方法 | 说明 |
+|----------|----------|----------|------|
+| Watch 配置 | `watch.json` | `_save_to_disk()` | 由 `EntityPersistenceMixin` 统一管理 |
+| 历史快照索引 | `history.txt` / `history-{processor}.txt` | `save_history_blob()` 内部追加 | 每个处理器有独立索引 |
+| 历史快照文件 | `{snapshot_id}.txt.br` / `.txt` / `.jpeg` | `save_history_blob()` | 带版本、有索引、受裁剪限制 |
+| 原始 HTML 缓存 | `{timestamp}.html.br` | `save_last_fetched_html()` | 仅保留最近 2 份 |
+| 过滤前原始文本 | `last-fetched.br` | `save_last_text_fetched_before_filters()` | 由 Processor 层**调用时机**，但写入方法是 Watch 层的 |
+| 最新截图 | `last-screenshot.png` / `last-error-screenshot.png` | `save_screenshot()` | 无版本，覆盖写 |
+| XPath/视觉选择器数据 | `elements.deflate` / `elements-error.deflate` | `save_xpath_data()` | zlib 压缩存储 |
+| LLM 变更摘要缓存 | `change-summary-{from}-to-{to}-{hash}.txt` | `save_llm_diff_summary()` | 按版本对缓存 |
+| 历史正则抽取报表 | `report-{uuid}.csv` | 由 `store.py` 写入 | 报表导出功能 |
+| 错误文本 | `last-error.txt` | 由 `store.py` / `worker.py` 写入 | 最近一次错误信息 |
+| 站点图标 | `favicon.ico` | 由 `worker.py` 写入 | 网站 favicon |
+
+### 7.3 Processor 层直接读写磁盘的完整例外清单
+
+以下是 Processor 层**直接 open()/os.remove() 磁盘文件**的所有情况，按重要性排序：
+
+#### ① `last-checksum.txt` — checksum 快速跳过机制（基类）
+
+**代码位置**：[processors/base.py:46-98](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/base.py#L46-L98)
+
+**操作**：读 + 写
+
+```python
+# base.py __init__ 时即读取
+def read_last_raw_content_checksum(self):
+    checksum_file = os.path.join(self.datastore.data_path, self.watch['uuid'], 'last-checksum.txt')
+    with open(checksum_file, 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
+# 处理完成后写入
+def update_last_raw_content_checksum(self, checksum):
+    checksum_file = os.path.join(self.datastore.data_path, self.watch['uuid'], 'last-checksum.txt')
+    with open(checksum_file, 'w', encoding='utf-8') as f:
+        f.write(checksum)
+```
+
+**作用**：保存原始 HTML 的 MD5 校验和。下次抓取如果内容相同，直接跳过过滤/提取步骤，大幅提升性能。
+
+---
+
+#### ② `{processor_name}.json` — 处理器专属配置（基类）
+
+**代码位置**：[processors/base.py:275-350](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/base.py#L275-L350)
+
+**操作**：读 + 写（支持 merge）
+
+```python
+def read_extra_watch_config(self, filename):
+    """Read processor-specific config JSON from watch data dir."""
+    config_file = os.path.join(self.datastore.data_path, self.watch['uuid'], filename)
+    with open(config_file, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def update_extra_watch_config(self, filename, config, merge=False):
+    """Write processor-specific config JSON to watch data dir."""
+    config_file = os.path.join(self.datastore.data_path, self.watch['uuid'], filename)
+    with open(config_file, 'w', encoding='utf-8') as f:
+        json.dump(merged_config, f, indent=2)
+```
+
+**实际使用的文件**：
+- `text_json_diff.json` — 文本处理器专属配置（如 ignore text、CSS/JSON 选择器等）
+- `image_ssim_diff.json` — 图像处理器专属配置（如对比区域、阈值等）
+
+---
+
+#### ③ `visual_comparison_data.json` — 图像对比历史数据（image_ssim_diff）
+
+**代码位置**：[processors/image_ssim_diff/difference.py:417-423](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/image_ssim_diff/difference.py#L417-L423)
+
+**操作**：只读
+
+**作用**：Diff 页面的"变化趋势图"数据，记录每次检测的相似度分数历史。
+
+---
+
+#### ④ `cropped_image_template.png` — 模板匹配裁剪图（image_ssim_diff）
+
+**代码位置**：[processors/image_ssim_diff/edit_hook.py:85-96](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/image_ssim_diff/edit_hook.py#L85-L96)
+
+**操作**：读 + 写 + 删除（`os.remove()`）
+
+**作用**：布局变化时追踪内容的模板匹配图（需 `ENABLE_TEMPLATE_TRACKING=True`）。
+
+---
+
+#### ⑤ 直接读取 `{timestamp}.html.br` — 过滤器预览（text_json_diff）
+
+**代码位置**：[processors/text_json_diff/__init__.py:78-80](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/text_json_diff/__init__.py#L78-L80)
+
+**操作**：只读
+
+**作用**：过滤器预览功能（`prepare_filter_preview()`）直接读取原始 HTML 缓存文件，用于实时测试过滤器效果。
+
+---
+
+#### ⑥ 直接读取 `elements.deflate` — XPath 坐标数据（image_ssim_diff）
+
+**代码位置**：[processors/image_ssim_diff/difference.py:227-232](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/image_ssim_diff/difference.py#L227-L232)
+
+**操作**：只读（`gzip.open()`）
+
+**作用**：Diff 页面绘制裁剪区域时，直接读取 XPath 元素坐标数据。
+
+### 7.4 修正版调用关系图
 
 ```
 Worker 层 (worker.py)
@@ -545,26 +663,40 @@ Worker 层 (worker.py)
 Processor 层 (processors/text_json_diff/processor.py)
   ├─ perform_site_check()  → 抓取内容
   ├─ run_changedetection() → 过滤、提取、计算 checksum、检测变更
-  │   └─ _apply_diff_filtering() → 写入 last-fetched.br（唯一写入点！）
+  │   ├─ ✅ 直接读 last-checksum.txt（基类，快速跳过）
+  │   ├─ ✅ 直接写 last-checksum.txt（基类，更新校验和）
+  │   ├─ ✅ 直接读/写 {processor_name}.json（基类，专属配置）
+  │   └─ 调用 watch.save_last_text_fetched_before_filters() → 写入 last-fetched.br
+  │      （写入方法是 Watch 层的，但调用时机由 Processor 控制）
   └─ 返回 (changed_detected, update_obj, contents)
   ↓ 返回结果
 Worker 层
   ├─ watch.save_screenshot() → Watch 层：存截图
-  ├─ watch.save_history_blob() → Watch 层：存快照
+  ├─ watch.save_history_blob() → Watch 层：存快照 + 更新索引
   └─ watch.save_last_fetched_html() → Watch 层：存原始 HTML
 
 UI 层 (blueprint/ui/preview.py, diff.py)
   ↓ 委托
 Processor 层 (processors/*/preview.py, difference.py)
   ├─ render() → 渲染 HTML
+  │   ├─ ✅ 直接读 visual_comparison_data.json（图像对比趋势）
+  │   ├─ ✅ 直接读 elements.deflate（XPath 坐标）
+  │   └─ ✅ 直接读 {timestamp}.html.br（过滤器预览）
   └─ get_asset() → 提供二进制资源
       └─ watch.get_history_snapshot() → Watch 层：读快照
 ```
 
-**关键原则：**
-- Processor 层 **不直接读写磁盘文件**，所有持久化操作都通过 Watch 层的方法完成
-- Watch 层 **不处理业务逻辑**（如过滤器、diff 计算、渲染），只负责数据存取
-- `last-fetched.br` 是唯一的例外：Processor 层主动调用 Watch 层方法写入，但写入时机由 Processor 层控制
+> ✅ = Processor 层直接 I/O 的节点
+
+### 7.5 修正后的职责边界四原则
+
+1. **Watch 层是"主存储层"**：所有核心业务数据（配置、快照、索引、截图、HTML 缓存、过滤前文本、XPath 数据、LLM 摘要）都通过 Watch 层封装方法读写，保证路径校验、原子写入等安全性。
+
+2. **Processor 层是"辅助存储层"**：直接读写的文件都局限于**处理器专属的优化数据和配置**——`last-checksum.txt`（性能优化）、`{processor_name}.json`（独立配置）、以及图像处理器专用的辅助文件（趋势数据、模板图）。
+
+3. **Processor 层预览渲染时直接读 Watch 层文件**：为了避免额外的封装开销，Processor 在渲染预览、生成差异图时，会直接读取 Watch 层已写入的文件（`.html.br`、`elements.deflate`），但**不会修改这些文件**。
+
+4. **Watch 层不处理业务逻辑**：过滤器、diff 计算、checksum 跳过判断、UI 渲染等业务逻辑始终由 Processor 层完成。数据存取和业务处理的分层仍然清晰，只是 Processor 层有少量直接 I/O 的性能优化例外。
 
 ---
 
@@ -636,6 +768,10 @@ URL 查询参数 ?version=1700000120
 
 ## 11. 关键安全机制
 
-1. **路径穿越防护**：`history` 属性读取索引时，使用 `os.path.basename()` 剥离路径，`os.path.realpath()` 解析符号链接，确保快照文件在 `data_dir` 内。
-2. **原子写入**：所有快照写入使用 `_write_atomic()`（临时文件 + `os.replace()`），避免半写状态。
+1. **路径穿越防护（Watch 层）**：`history` 属性读取索引时，使用 `os.path.basename()` 剥离路径，`os.path.realpath()` 解析符号链接，确保快照文件在 `data_dir` 内。
+2. **原子写入（Watch 层）**：所有快照写入使用 `_write_atomic()`（临时文件 + `os.replace()`），避免半写状态。
 3. **API 快照返回**：即使请求 `?html=true`，也以 `text/plain; charset=utf-8` 返回（防止 XSS），并设置 `X-Content-Type-Options: nosniff`。
+4. **Processor 层直接读写的安全注意**：Processor 层直接读写磁盘时（如 `last-checksum.txt`、`{processor_name}.json`），**未做 Watch 层那样严格的路径穿越校验**，但：
+   - 文件名由代码硬编码（如 `'last-checksum.txt'`），不接受用户输入作为文件名
+   - 目录路径通过 `watch.data_dir` 获取，由 Watch 层保证在合法范围内
+   - `update_extra_watch_config()` 的 `filename` 参数由上层调用方（UI 保存逻辑、`save_processor_config()`）传入固定值
