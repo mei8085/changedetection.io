@@ -16,16 +16,17 @@ changedetection.io 将每个监控目标（Watch）的快照数据以 **文件�
 
 其中 `datastore_path` 默认为 `/datastore`（可在启动时覆盖），`watch_uuid` 是 Watch 创建时生成的 UUID v4。
 
-目录内的典型文件布局如下：
+### 2.1 完整目录布局
 
 ```
 /datastore/
-├── changedetection.json          # 全局配置 + 所有 watch 的元数据索引
+├── changedetection.json          # 全局设置（应用级配置，不含单 Watch 配置）
 ├── proxies.json                  # 代理配置
 ├── headers.txt                   # 全局自定义请求头
 │
 ├── {watch-uuid-1}/               # Watch 数据目录
-│   ├── watch.json                # Watch 配置（URL、过滤器、通知等）
+│   ├── watch.json                # 单个 Watch 的完整配置（URL、过滤器、通知等）
+│   ├── tag.json                  # 若此目录是 Tag，则为 Tag 配置
 │   ├── history.txt               # 文本快照历史索引（默认 processor）
 │   ├── history-image_ssim_diff.txt  # 图像处理器专用历史索引
 │   ├── {snapshot_id}.txt         # 纯文本快照（未压缩）
@@ -46,7 +47,28 @@ changedetection.io 将每个监控目标（Watch）的快照数据以 **文件�
 │   └── ...
 ```
 
-**关键文件说明：**
+### 2.2 容易混淆点之一：设置信息 vs 单个监控项的存储位置
+
+这是最容易混淆的点。全局设置和单个 Watch 配置存储在 **完全不同的文件** 中：
+
+| 类别 | 存储位置 | 写入逻辑 |
+|------|----------|----------|
+| **全局设置** | `{datastore_path}/changedetection.json` | 由 [FileSavingDataStore._save_settings()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/store/file_saving_datastore.py#L472-L481) → [save_json_atomic()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/store/file_saving_datastore.py#L36-L176) 原子写入 |
+| **单个 Watch 配置** | `{datastore_path}/{watch_uuid}/watch.json` | 由 [EntityPersistenceMixin._save_to_disk()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/persistence.py#L52-L84) → [save_watch_atomic()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/store/file_saving_datastore.py#L200-L208) 原子写入 |
+| **单个 Tag 配置** | `{datastore_path}/{tag_uuid}/tag.json` | 同样由 [save_entity_atomic()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/store/file_saving_datastore.py#L178-L198) 写入 |
+
+**加载顺序**（[store/__init__.py:169-188](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/store/__init__.py#L169-L188)）：
+
+```
+1. 加载 changedetection.json → 获取全局设置（应用配置、密码、令牌等）
+2. 扫描 {datastore_path}/*/watch.json → 加载所有 Watch
+3. 扫描 {datastore_path}/*/tag.json → 加载所有 Tag
+4. 合并 Tag → 覆盖 changedetection.json 中的 legacy tags
+```
+
+**关键点：** `changedetection.json` 中 **不包含** 任何 Watch 的配置数据。它只存全局级别的设置（如 `settings.application`、`settings.headers`、`settings.requests`）。所有 Watch/Tag 都分散在各自 UUID 目录下的 `watch.json`/`tag.json` 中。
+
+### 2.3 关键文件说明
 
 | 文件 | 作用 |
 |------|------|
@@ -69,19 +91,43 @@ Worker 检测到变更
   → watch.save_screenshot()         # 保存截图到 last-screenshot.png
   → watch.save_history_blob()       # 保存快照文本/二进制
   → watch.save_last_fetched_html()  # 保存原始 HTML 缓存
+  → watch.save_last_text_fetched_before_filters()  # 保存过滤前的原始文本
 ```
 
-核心调用（[worker.py:526-528](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/worker.py#L526-L528)）：
+### 3.2 容易混淆点之二：原始抓取内容 vs 历史快照是不是同一套文件
+
+**答案：完全不是同一套文件。** 抓取后实际上会产生 **三类独立的文件**，各自有不同的用途和保留策略：
+
+| 类别 | 文件 | 保留策略 | 用途 | 写入方法 |
+|------|------|----------|------|----------|
+| **历史快照** | `{snapshot_id}.txt.br` / `.txt` / `.jpeg` | 保留多份，受 `history_snapshot_max_length` 限制 | 用于版本间 Diff、历史回溯 | [save_history_blob()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L653-L729) |
+| **原始 HTML 缓存** | `{timestamp}.html.br` | 仅保留最近 **2 份**，超出自动删除 | 用于 API `?html=true` 请求返回原始页面 | [save_last_fetched_html()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1227-L1232) |
+| **过滤前原始文本** | `last-fetched.br` | 仅保留 **最新 1 份**，覆盖写 | 用于调试过滤器、查看"过滤前"内容 | [save_last_text_fetched_before_filters()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1222-L1225) |
+| **最新截图** | `last-screenshot.png` | 仅保留 **最新 1 份**，覆盖写 | 用于 UI "当前截图"标签页 | [save_screenshot()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1192-L1204) |
+
+**读取时的回退逻辑：**
+
+[get_last_fetched_text_before_filters()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1207-L1220) 在 `last-fetched.br` 不存在时，会回退读取最新的历史快照：
 
 ```python
-watch.save_history_blob(
-    contents=contents,
-    timestamp=int(fetch_start_time),        # Unix 时间戳（秒）
-    snapshot_id=update_obj.get('previous_md5', 'none')  # MD5 或 'none'
-)
+def get_last_fetched_text_before_filters(self):
+    filepath = os.path.join(self.data_dir, 'last-fetched.br')
+    if not os.path.isfile(filepath) or os.path.getsize(filepath) == 0:
+        # 如果没有过滤前的原始内容，就回退到最新快照
+        dates = list(self.history.keys())
+        if len(dates):
+            return self.get_history_snapshot(timestamp=dates[-1])
+        return ''
+    # 否则解压返回 last-fetched.br
+    with open(filepath, 'rb') as f:
+        return brotli.decompress(f.read()).decode('utf-8')
 ```
 
-### 3.2 `save_history_blob()` 写入逻辑
+**原始 HTML 的保留策略：**
+
+[_prune_last_fetched_html_snapshots()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1246-L1257) 每次保存新 HTML 后，会遍历历史时间戳，**只保留最近 2 份** `{timestamp}.html.br` 文件，其余删除。
+
+### 3.3 `save_history_blob()` 写入逻辑
 
 方法定义于 [Watch.py:653-729](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L653-L729)，按内容类型分流：
 
@@ -117,7 +163,7 @@ with open(index_fname, 'a', encoding='utf-8') as f:
 
 **历史裁剪：** 若 `history_snapshot_max_length` 被设置（Watch 级 > 全局级），超出上限的旧快照文件会被删除，索引文件被重写。
 
-### 3.3 `history.txt` 索引文件格式
+### 3.4 `history.txt` 索引文件格式
 
 ```
 1700000000,abc123.txt.br
@@ -127,7 +173,7 @@ with open(index_fname, 'a', encoding='utf-8') as f:
 
 每行格式为 `{timestamp},{filename}`，`timestamp` 是 Unix 秒级时间戳，`filename` 是快照文件的 **纯文件名**（不含路径）。
 
-### 3.4 截图存储
+### 3.5 截图存储
 
 截图通过 [Watch.save_screenshot()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1192-L1204) 保存：
 
@@ -266,7 +312,97 @@ get_history_snapshot(timestamp=None, filepath=None)
     └─ 执行文本 diff → 渲染 diff.html 模板
 ```
 
-### 6.3 Processor Asset 路由（二进制资源流式返回）
+### 6.3 容易混淆点之三：不同入口取版本时的默认规则和关键字分支
+
+不同入口取版本时，**默认规则和关键字分支差异很大**，这是最容易踩坑的地方。以下是各入口的详细规则对比：
+
+| 入口 | 代码位置 | 版本参数 | 默认值规则 | 特殊关键字 |
+|------|----------|----------|------------|------------|
+| **Preview 页面** | [preview.py:74-80](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/blueprint/ui/preview.py#L74-L80) | `version` | `versions[-1]`（最新） | 无特殊关键字 |
+| **Diff 页面 (text_json_diff)** | [difference.py:138-143](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/text_json_diff/difference.py#L138-L143) | `from_version`, `to_version` | `from` = `get_from_version_based_on_last_viewed`<br>`to` = `dates[-1]`（最新） | 无特殊关键字 |
+| **Diff Asset (image_ssim_diff)** | [difference.py:54-61](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/image_ssim_diff/difference.py#L54-L61) | `from_version`, `to_version` | `from` = `versions[-2]`<br>`to` = `versions[-1]` | 无效版本自动回退到默认 |
+| **API 单快照** | [Watch.py:272-273](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/api/Watch.py#L272-L273) | `timestamp` | 必须显式指定 | `timestamp='latest'` → 映射到最新 |
+| **Preview Asset (image)** | [preview.py:?] | `version` | 需显式指定 | 无效版本返回 None |
+
+#### 6.3.1 Diff 页面的 `last_viewed` 智能计算（最关键的隐藏规则）
+
+这是最隐蔽、最容易混淆的逻辑。当用户首次进入 Diff 页面且未指定 `from_version` 时，系统不会简单地取 `versions[-2]`，而是通过 [get_from_version_based_on_last_viewed](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L527-L551) 进行智能计算：
+
+```python
+@property
+def get_from_version_based_on_last_viewed(self):
+    keys = list(self.history.keys())
+    if not keys:
+        return None
+    if len(keys) == 1:
+        return keys[0]
+
+    last_viewed = int(self.get('last_viewed'))
+    sorted_keys = sorted(keys, key=lambda x: int(x))
+    sorted_keys.reverse()  # 从新到旧排序
+
+    # 规则1: 上次查看时间 >= 最新快照时间 → 返回倒数第二新
+    if last_viewed >= int(sorted_keys[0]):
+        return sorted_keys[1]
+    
+    # 规则2: 上次查看时间在两个快照之间 → 返回较旧的那个
+    for newer, older in list(zip(sorted_keys[0:], sorted_keys[1:])):
+        if last_viewed < int(newer) and last_viewed >= int(older):
+            return older
+
+    # 规则3: 上次查看时间 < 最早快照时间 → 返回最早的
+    return sorted_keys[-1]
+```
+
+**`last_viewed` 字段的更新时机：**
+- 当用户打开 Diff 页面时，[datastore.set_last_viewed()](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/text_json_diff/difference.py#L165) 被调用，写入当前时间戳到 `watch['last_viewed']`
+- `last_viewed` 保存在 `watch.json` 中，重启后仍然有效
+
+**一个典型场景：**
+```
+1. 00:00 用户打开 Diff 页面 → set_last_viewed(00:00)
+2. 00:05 检测到变更，生成快照1
+3. 00:10 检测到变更，生成快照2
+4. 00:15 用户再次打开 Diff 页面（未指定 from_version）
+   → last_viewed=00:00，介于 快照0(00:00前) 和 快照1(00:05) 之间
+   → from_version = 快照0（上次查看时的版本）
+   → to_version   = 快照2（最新）
+   → 用户看到：快照0 → 快照2 的完整差异
+```
+
+#### 6.3.2 API 入口的 `latest` 关键字
+
+API 接口 `/api/v1/watch/<uuid>/history/<timestamp>` 支持特殊关键字 `timestamp='latest'`，在 [Watch.py:272-273](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/api/Watch.py#L272-L273) 中处理：
+
+```python
+if timestamp == 'latest':
+    timestamp = list(watch.history.keys())[-1]
+```
+
+#### 6.3.3 Diff Asset 路由的版本回退
+
+在 [image_ssim_diff/difference.py:54-61](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/processors/image_ssim_diff/difference.py#L54-L61) 中，如果请求的 `from_version` 或 `to_version` 不存在，会自动回退到默认值：
+
+```python
+from_version = request.args.get('from_version', versions[-2] if len(versions) >= 2 else versions[0])
+to_version = request.args.get('to_version', versions[-1])
+
+if from_version not in versions:
+    from_version = versions[-2] if len(versions) >= 2 else versions[0]
+if to_version not in versions:
+    to_version = versions[-1]
+```
+
+#### 6.3.4 `uuid='first'` 快捷入口
+
+Preview 和 Diff 路由都支持 `uuid='first'` 作为快捷方式，自动跳转到第一个 Watch：
+
+```python
+if uuid == 'first':
+    uuid = list(datastore.data['watching'].keys()).pop()
+```
+
+### 6.4 Processor Asset 路由（二进制资源流式返回）
 
 **URL:** `/preview/<uuid>/processor-asset/<asset_name>` 或 `/diff/<uuid>/processor-asset/<asset_name>`
 
@@ -294,7 +430,7 @@ get_history_snapshot(timestamp=None, filepath=None)
 └─ 返回 (binary_data, content_type, cache_control) → Flask Response
 ```
 
-### 6.4 截图静态路由
+### 6.5 截图静态路由
 
 **URL:** `/static/screenshot/{uuid}`
 
@@ -354,7 +490,17 @@ URL 查询参数 ?version=1700000120
 
 ---
 
-## 8. Processor 插件体系对快照的影响
+## 8. 三个容易混淆点的澄清总结
+
+| 问题 | 答案 | 关键代码 |
+|------|------|----------|
+| **设置信息和单个监控项分别落到哪里？** | 全局设置 → `changedetection.json`<br>Watch 配置 → `{uuid}/watch.json`<br>Tag 配置 → `{uuid}/tag.json`<br>三者是完全独立的文件 | [file_saving_datastore.py:200-208](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/store/file_saving_datastore.py#L200-L208) |
+| **原始抓取内容与历史快照是不是同一套文件？** | 不是。有三类独立文件：<br>① 历史快照（多份）<br>② 原始 HTML（仅最近 2 份）<br>③ 过滤前原始文本（仅最新 1 份） | [Watch.py:1207-1225](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L1207-L1225) |
+| **不同入口取版本时有什么默认规则？** | Diff 页面有 `last_viewed` 智能计算<br>API 支持 `'latest'` 关键字<br>Diff Asset 有版本回退逻辑<br>Preview 默认取最新 | [Watch.py:527-551](file:///d:/fz/0601-1/solo-dogfeeding/code/35-changedetection.io/changedetectionio/model/Watch.py#L527-L551) |
+
+---
+
+## 9. Processor 插件体系对快照的影响
 
 不同处理器类型会产生不同的快照格式和索引：
 
@@ -367,7 +513,7 @@ URL 查询参数 ?version=1700000120
 
 ---
 
-## 9. 关键安全机制
+## 10. 关键安全机制
 
 1. **路径穿越防护**：`history` 属性读取索引时，使用 `os.path.basename()` 剥离路径，`os.path.realpath()` 解析符号链接，确保快照文件在 `data_dir` 内。
 2. **原子写入**：所有快照写入使用 `_write_atomic()`（临时文件 + `os.replace()`），避免半写状态。
