@@ -361,3 +361,199 @@ context = await browser.new_context(
 4. **Jinja2 渲染时机**：headers 和 body 的 Jinja2 渲染发生在 `call_browser()` 中，而非表单提交时。这意味着模板中的动态值（如 `{{ now }}`）每次检查时都会重新求值，但表单验证仅检查模板语法是否合法。
 
 5. **重定向丢失 method/body**：requests fetcher 在跟随重定向时统一使用 GET，不传递原始的 method 和 body，这可能导致 POST 请求在 302 重定向后变为 GET。
+
+---
+
+## 附录：四大 Fetcher 后端的注入机制深度对比
+
+### A.1 后端选择机制
+
+四个 fetcher 共享同一个注册名 `html_webdriver`，在运行时根据环境变量选择实际实现：
+
+[content_fetchers/__init__.py#L93-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/__init__.py#L93-L105)：
+
+```python
+use_playwright_as_chrome_fetcher = os.getenv('PLAYWRIGHT_DRIVER_URL', False)
+if use_playwright_as_chrome_fetcher:
+    if not strtobool(os.getenv('FAST_PUPPETEER_CHROME_FETCHER', 'False')):
+        from .playwright import fetcher as html_webdriver      # Playwright
+    else:
+        from .puppeteer import fetcher as html_webdriver        # Puppeteer (pyppeteer-ng)
+else:
+    from .webdriver_selenium import fetcher as html_webdriver   # Selenium
+```
+
+`html_requests` 始终独立可用。因此用户面对的选择只有两个：plaintext（requests）和 Chrome（Playwright/Puppeteer/Selenium 三选一）。
+
+### A.2 字段注入支持度总览
+
+| 字段 | html_requests | Playwright | Puppeteer | Selenium |
+|------|:---:|:---:|:---:|:---:|
+| `request_headers` | ✅ 完整支持 | ✅ `extra_http_headers` | ✅ `setExtraHTTPHeaders` | ❌ **完全忽略** |
+| `request_method` | ✅ 直接传入 | ❌ 未使用 | ❌ 未使用 | ❌ 未使用 |
+| `request_body` | ✅ 编码后传入 | ❌ 未使用 | ❌ 未使用 | ❌ 未使用 |
+| `User-Agent` 特殊处理 | 无（headers 原样传入） | ✅ `manage_user_agent()` 提取后单独设为 `user_agent` | ✅ `setUserAgent()` + 从 headers 中 pop 出 UA | ❌ 无处理 |
+
+### A.3 html_requests —— HTTP 协议级注入
+
+[content_fetchers/requests.py#L96-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/requests.py#L96-L105)
+
+```python
+r = session.request(
+    method=request_method,
+    data=request_body.encode('utf-8') if type(request_body) is str else request_body,
+    url=url,
+    headers=request_headers,
+    ...
+)
+```
+
+**机制**：直接通过 Python `requests` 库的 API 参数注入。`requests` 是 HTTP 客户端库，每个请求都是独立的 HTTP 事务，可以精确控制 method / headers / body 的每一个细节。
+
+**设计取舍**：这是唯一一个"全字段"后端，因为 `requests` 库本身提供了一等公民的 method/data/headers 参数，没有任何协议层限制。程序只需把 `call_browser()` 组装好的参数原样传递即可。
+
+**重定向行为**：跟随 302 时只传 headers，method 退化为 GET，body 丢弃。这是 HTTP 语义决定的——大多数浏览器和 HTTP 客户端对 302 的处理也是如此。
+
+### A.4 Playwright —— 浏览器上下文级注入
+
+[content_fetchers/playwright.py#L285-L293](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/playwright.py#L285-L293)
+
+```python
+context = await browser.new_context(
+    extra_http_headers=request_headers,                        # ← 全部 headers
+    user_agent=manage_user_agent(headers=request_headers),     # ← UA 单独提取
+    ...
+)
+page = await context.new_page()
+response = await browsersteps_interface.action_goto_url(value=url)  # 仅导航
+```
+
+**机制**：Playwright 的架构是"浏览器上下文 → 页面 → 导航"。自定义 headers 在 `new_context()` 时作为 `extra_http_headers` 注入，此后该上下文下的所有页面请求（包括子资源）都会自动携带这些 headers。UA 则通过 `manage_user_agent()` 从 headers 中提取后作为独立参数 `user_agent` 设置。
+
+**为什么不支持 method / body**：
+
+Playwright 的导航原语是 `page.goto(url)`——这等价于用户在浏览器地址栏输入 URL 按回车，本质是一个 **GET 导航**。Playwright 的 `page.goto()` API 没有提供 `method` 或 `postData` 参数。如果需要发送 POST 请求，理论上需要通过 `page.evaluate()` 在浏览器内执行 `fetch()` API，但 changedetection.io 没有实现这种方式。
+
+**设计取舍**：
+
+1. **为什么用 `extra_http_headers` 而非 CDP 拦截**：Playwright 官方推荐的方式就是 `extra_http_headers`，它通过 CDP（Chrome DevTools Protocol）的 `Network.setExtraHTTPHeaders` 命令实现，在浏览器进程的 Network 层注入，对页面 JS 不可见，不会触发 CORS 预检。
+2. **为什么 UA 要单独处理**：浏览器的 User-Agent 不属于 HTTP headers 的范畴——它由 Chromium 的 `user_agent` 客户端配置项控制。如果仅在 `extra_http_headers` 里设置 UA，浏览器的 JS 上下文（`navigator.userAgent`）不会改变。因此需要两步：从 headers 字典中提取 UA → 分别设置到 `user_agent` 参数。
+
+### A.5 Puppeteer (pyppeteer-ng) —— 页面级注入
+
+[content_fetchers/puppeteer.py#L339-L352](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/puppeteer.py#L339-L352)
+
+```python
+# UA: 先从 headers 中 pop 出来，再通过 setUserAgent 设置
+user_agent = None
+if request_headers and request_headers.get('User-Agent'):
+    user_agent = request_headers.pop('User-Agent').strip()
+    await self.page.setUserAgent(user_agent)
+
+if not user_agent:
+    await self.page.setUserAgent(manage_user_agent(headers=request_headers, current_ua=await self.page.evaluate('navigator.userAgent')))
+
+# 其他 headers: 通过 setExtraHTTPHeaders 注入
+await self.page.setBypassCSP(True)
+if request_headers:
+    await self.page.setExtraHTTPHeaders(request_headers)
+```
+
+**机制**：与 Playwright 类似但粒度不同。Puppeteer 在 **page 级别**（而非 context 级别）注入 headers。
+
+**与 Playwright 的关键差异**：
+
+| 维度 | Playwright | Puppeteer |
+|------|------------|-----------|
+| headers 注入层级 | `browser.new_context()` — Context 级 | `page.setExtraHTTPHeaders()` — Page 级 |
+| UA 设置方式 | `new_context(user_agent=...)` 构造参数 | `page.setUserAgent()` 方法调用 |
+| UA 是否从 headers 中移除 | 否（`CaseInsensitiveDict` 中 UA 仍在，但 Playwright 内部处理不重复发送） | **是**——`request_headers.pop('User-Agent')` 显式移除后再 `setExtraHTTPHeaders` |
+| 底层 CDP 命令 | 相同：`Network.setExtraHTTPHeaders` | 相同：`Network.setExtraHTTPHeaders` |
+
+**为什么 Puppeteer 要 pop UA 而 Playwright 不用**：Playwright 的 `new_context(user_agent=..., extra_http_headers=...)` 在内部会协调两者——当 `user_agent` 参数设置后，`extra_http_headers` 中的 `User-Agent` 会被自动忽略或去重。而 pyppeteer-ng 的 `setExtraHTTPHeaders` 会原样把传入的字典设为额外 headers，如果 UA 同时存在于 `setUserAgent()` 和 `setExtraHTTPHeaders()` 中，会导致重复发送或 Chrome 报 `ERR_INVALID_ARGUMENT` 错误（Chrome DevTools Protocol 不允许通过 `setExtraHTTPHeaders` 设置某些受保护的 headers，包括 User-Agent）。
+
+**为什么不支持 method / body**：与 Playwright 完全相同的理由——`page.goto(url)` 是 GET 导航，没有 method/postData 参数。
+
+### A.6 Selenium WebDriver —— 完全无注入
+
+[content_fetchers/webdriver_selenium.py#L63-L151](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L63-L151)
+
+```python
+async def run(self, ..., request_body=None, request_headers=None, request_method=None, ...):
+
+    def _run_sync():
+        # request_body, request_method unused for now, until some magic in the future happens.
+        options = ChromeOptions()
+        # ... proxy 配置 ...
+        driver = RemoteWebDriver(command_executor=remote_connection, options=options)
+        driver.get(url)           # ← 仅导航，无 headers / method / body
+        # ...
+        self.content = driver.page_source
+        self.headers = {}          # ← 响应 headers 也不可用！
+```
+
+**机制**：Selenium 是四个后端中注入能力最弱的——`request_headers`、`request_method`、`request_body` 三个参数虽然出现在函数签名中，但在 `_run_sync()` 函数体内**完全未使用**。源码注释明确承认这一点（L83）：
+
+> `# request_body, request_method unused for now, until some magic in the future happens.`
+
+**为什么 headers 也无法注入**：Selenium WebDriver 协议的 `driver.get(url)` 命令（对应 W3C WebDriver 规范的 `Navigate To`）不支持自定义 HTTP headers。这与 Playwright/Puppeteer 通过 CDP 的 `Network.setExtraHTTPHeaders` 绕过限制的方式不同——Selenium WebDriver 是 W3C 标准协议，没有等价的 CDP 通道。
+
+**理论上可行的替代方案及为什么没用**：
+
+| 方案 | 原理 | 为什么未采用 |
+|------|------|-------------|
+| Selenium Wire | 拦截并修改浏览器发出的 HTTP 请求 | 源码注释（L98-99）明确指出 `selenium-wire` 与 `pyppeteer-ng` 存在依赖冲突（websocket 库版本不兼容） |
+| CDP 直接调用 | 通过 `driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', ...)` | W3C 兼容模式的 RemoteWebDriver 不暴露 CDP 命令接口；只有 `ChromeDriver` 本地实例才支持 |
+| Chrome 扩展注入 | 编写 Chrome 扩展在 `onBeforeSendHeaders` 中修改请求头 | 复杂度过高，且需要维护扩展代码 |
+| `page.addInitScript()` / JS `fetch()` | 在页面中注入 JS 执行 fetch 请求 | Selenium 的 JS 注入时机在页面加载之后，无法修改首次导航的请求头 |
+
+**响应 headers 也不可用**：Selenium 无法获取 HTTP 响应头，代码中 `self.headers = {}` 写死了空字典。对比 Playwright 通过 `response.all_headers()` 获取、Puppeteer 通过 `response.headers` 获取。
+
+**status_code 也是硬编码**：`self.status_code = 200`（L143），Selenium 无法获取真实的 HTTP 状态码。注释中也承认这是一个 TODO。
+
+### A.7 为什么四个后端差距这么大——根本原因分析
+
+差距的根源不在 changedetection.io 的代码设计，而在**底层驱动协议的能力边界**：
+
+```
+能力从弱到强：
+
+Selenium (W3C WebDriver)          ← 标准协议，只有 "导航到 URL" 的能力
+    ↓
+Puppeteer (CDP over pyppeteer-ng) ← 非标准 CDP，可注入 headers / UA，但 method/body 仍不行
+    ↓
+Playwright (CDP over Playwright)  ← 同样 CDP，但封装更完善，context 级 header 注入
+    ↓
+requests (Python HTTP 客户端)      ← 完全控制 HTTP 事务的每个字节
+```
+
+**W3C WebDriver 协议的根本限制**：Selenium 实现的是 W3C WebDriver 规范，该规范只定义了 `Navigate To`（`driver.get(url)`）这一导航命令，没有任何机制可以：
+- 在导航请求中附加自定义 headers
+- 改变导航请求的 HTTP 方法
+- 在导航请求中附加请求体
+
+这是规范层面的缺失，不是实现缺陷。
+
+**CDP 协议的额外能力**：Playwright 和 Puppeteer 都通过 Chrome DevTools Protocol (CDP) 与浏览器通信。CDP 的 `Network.setExtraHTTPHeaders` 命令可以在 Network 层拦截并修改所有请求的 headers，从而绕过 W3C WebDriver 的限制。但 CDP 同样没有提供"以 POST 方式导航到 URL 并携带请求体"的命令——CDP 的 `Page.navigate` 只接受 URL，CDP 的 `Fetch.enable` 虽然可以拦截和修改请求，但需要配合复杂的请求拦截模式使用，changedetection.io 未实现。
+
+**Python requests 库的完全控制**：作为 HTTP 客户端而非浏览器驱动，`requests` 库直接发送 HTTP 请求，不涉及任何浏览器进程，因此对 method / headers / body 拥有完全的控制权。代价是无法执行 JavaScript、无法渲染 SPA 页面。
+
+**changedetection.io 的设计取舍总结**：
+
+1. **所有 fetcher 共享同一个 `run()` 签名**（定义在 [base.py#L122-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/base.py#L122-L134)），`request_headers`、`request_body`、`request_method` 始终作为参数传入——即使某些 fetcher 不使用它们。这是"宽接口"设计，保证了 `call_browser()` 无需感知后端差异。
+
+2. **静默丢弃而非报错**：不支持 method / body 的后端选择了"静默忽略"策略。从工程角度这是合理的——用户在 Edit 页面配置 method=POST + body 时，系统无法在保存时验证"你的 fetcher 后端是否支持 POST"，因为 fetcher 后端可以随时切换。但在运行时抛异常又会导致检查失败。权衡之下，静默丢弃是最安全的策略，尽管用户体验上有隐患。
+
+3. **Selenium 是遗留后端**：从 [__init__.py#L93-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/__init__.py#L93-L105) 可以看出，当 `PLAYWRIGHT_DRIVER_URL` 环境变量存在时优先使用 Playwright，Selenium 仅在没有任何 Playwright/Puppeteer 配置时作为 fallback。现代部署几乎都会设置 `PLAYWRIGHT_DRIVER_URL`，Selenium 实际上是遗留方案。
+
+### A.8 后端能力差异对用户的影响
+
+| 用户操作 | html_requests | Playwright/Puppeteer | Selenium |
+|----------|:---:|:---:|:---:|
+| 设置自定义请求头（如 `Authorization`） | ✅ 正常生效 | ✅ 正常生效 | ❌ 静默丢弃 |
+| 设置 User-Agent | ✅ 作为普通 header 传入 | ✅ 单独提取后设为浏览器 UA | ❌ 静默丢弃 |
+| 用 POST + body 监测 API | ✅ 正常生效 | ❌ method 退化为 GET，body 丢弃 | ❌ method 退化为 GET，body 丢弃 |
+| 用 PUT/PATCH/DELETE 调用 API | ✅ 正常生效 | ❌ 退化为 GET | ❌ 退化为 GET |
+| 通过 headers.txt 添加运维级 header | ✅ 正常生效 | ✅ 正常生效 | ❌ 静默丢弃 |
+
+**核心结论**：如果用户需要自定义 method / body，**必须使用 `html_requests` 后端**。浏览器类后端（Playwright/Puppeteer/Selenium）在架构上无法支持非 GET 的首次导航请求。如果用户需要自定义 headers 且使用浏览器后端，只能选择 Playwright 或 Puppeteer（Selenium 连 headers 都不支持）。
