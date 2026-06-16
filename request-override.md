@@ -364,6 +364,254 @@ context = await browser.new_context(
 
 ---
 
+## 附录 D：Jinja2 渲染管线的安全设计、失败模式与 br 强制剥离
+
+### D.1 渲染管线在注入链中的位置
+
+在 headers/body 合并完成后、传入 fetcher 之前，所有 header 的 value 和 body 都经过一轮 Jinja2 渲染。完整调用链：
+
+[processors/base.py#L199-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/processors/base.py#L199-L223)
+
+```python
+from changedetectionio.jinja2_custom import render as jinja_render
+
+# ... headers 合并 ...
+
+# ⑤ 强制剥离 Accept-Encoding 中的 br
+if 'Accept-Encoding' in request_headers and "br" in request_headers['Accept-Encoding']:
+    request_headers['Accept-Encoding'] = request_headers['Accept-Encoding'].replace(', br', '')
+
+# ⑥ 所有 header value 做 Jinja2 渲染
+for header_name in request_headers:
+    request_headers.update({header_name: jinja_render(template_str=request_headers.get(header_name))})
+
+# body 同样渲染
+request_body = self.watch.get('body')
+if request_body:
+    request_body = jinja_render(template_str=self.watch.get('body'))
+```
+
+关键点：
+1. **br 剥离在 Jinja2 渲染之前**——即使用户通过 Jinja2 模板动态生成 `Accept-Encoding: br`，也**不会**被剥离（因为 br 检查发生在渲染之前）
+2. **渲染没有 try/except**——任何一个 header 的渲染失败（`TemplateSyntaxError`、`UndefinedError`、`SecurityError` 等）都会导致整个 `call_browser()` 抛出异常，抓取直接失败
+3. **每个 header value 独立渲染**——一个 header 渲染失败，后续所有 header 和 body 都不会被渲染，也不会传入 fetcher
+
+### D.2 沙箱环境的 SSTI/RCE 防护
+
+渲染入口 [jinja2_custom/safe_jinja.py#render()](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/jinja2_custom/safe_jinja.py#L49-L52)：
+
+```python
+def render(template_str, **args: t.Any) -> str:
+    jinja2_env = create_jinja_env()
+    output = jinja2_env.from_string(template_str).render(args)
+    return output[:JINJA2_MAX_RETURN_PAYLOAD_SIZE]
+```
+
+核心安全机制：`ImmutableSandboxedEnvironment`
+
+[create_jinja_env()](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/jinja2_custom/safe_jinja.py#L18-L44)：
+
+```python
+def create_jinja_env(extensions=None, **kwargs) -> jinja2.sandbox.ImmutableSandboxedEnvironment:
+    jinja2_env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+        extensions=extensions,  # 默认只加载 TimeExtension
+        **kwargs
+    )
+    jinja2_env.default_timezone = os.getenv('TZ', 'UTC').strip()
+    jinja2_env.filters['regex_replace'] = regex_replace
+    return jinja2_env
+```
+
+#### `ImmutableSandboxedEnvironment` vs 普通 Environment 的差异
+
+Jinja2 的 `SandboxedEnvironment`（及其不可变子类）提供了多层防护：
+
+| 防护维度 | 行为 |
+|---------|------|
+| **属性访问限制** | 模板只能访问通过 `globals`、`filters`、`tests` 显式注册的对象属性。访问 Python 内置属性（如 `__class__`、`__subclasses__`、`__mro__`）会抛出 `SecurityError` |
+| **方法调用限制** | 只能调用被沙箱明确标记为安全的方法。对象的 `__init__`、`__del__`、`_private_methods` 都不可调用 |
+| **环境不可变** | `ImmutableSandboxedEnvironment` 在创建后不能修改 `globals`、`filters` 等配置，防止模板代码通过副作用修改环境 |
+| **无文件系统访问** | 沙箱环境禁用了文件系统加载器（这里使用 `from_string()` 直接解析字符串，不涉及文件） |
+
+#### 显式暴露给模板的能力
+
+整个沙箱环境只暴露了**最小能力集**：
+
+| 暴露项 | 来源 | 说明 |
+|-------|------|------|
+| Jinja2 内置语法 | 沙箱默认 | `{{ }}` 变量、`{% %}` 控制流、过滤器等 |
+| `{% now %}` 标签 | `TimeExtension` | 时间渲染，基于 `arrow.now()`，支持时区和偏移量。不暴露 `arrow` 对象本身，只暴露格式化后的字符串 |
+| `regex_replace` 过滤器 | `plugins/regex.py` | 正则替换，自身带 ReDoS 防护（见 D.5） |
+
+**用户无法通过模板访问**：
+- Python 内置对象（`os`、`sys`、`subprocess` 等）
+- Flask 请求上下文（`g`、`request`、`session`）
+- `arrow` 库对象（只能通过 `{% now %}` 标签间接使用）
+- 任何未在 `globals` 中注册的函数或类
+
+这堵住了经典 Jinja2 SSTI → RCE 的攻击链：
+```
+{{ ''.__class__.__mro__[1].__subclasses__() }}  →  SecurityError
+```
+因为 `''.__class__` 在沙箱环境中访问被拒绝。
+
+#### TimeExtension 的安全边界
+
+[TimeExtension](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/jinja2_custom/extensions/TimeExtension.py#L89-L221) 是唯一的自定义 Jinja2 扩展：
+
+```python
+tags = {'now'}   # 只暴露 {% now %} 标签
+
+def _datetime(self, timezone, operator, offset, datetime_format):
+    d = arrow.now(timezone)
+    shift_params = {}
+    for param in offset.split(','):
+        interval, value = param.split('=')
+        shift_params[interval.strip()] = float(operator + value.strip())
+    ...
+    d = d.shift(**shift_params)
+    return d.strftime(datetime_format)
+```
+
+安全设计：
+1. `arrow.now(timezone)`：timezone 是字符串参数，arrow 库内部会校验时区名合法性，不执行任意代码
+2. `d.shift(**shift_params)`：`shift_params` 的 key 经过 `split('=')` 来自用户输入，但 `arrow.shift()` 只接受预定义参数名（years/months/weeks/days/hours/minutes/seconds/microseconds/weekday），未知参数名会被 arrow 忽略而非执行
+3. `d.strftime(datetime_format)`：strftime 是纯格式化操作，不涉及代码执行
+
+### D.3 静默截断——最大返回 payload 限制
+
+[safe_jinja.py#L13](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/jinja2_custom/safe_jinja.py#L13) 和 [L52](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/jinja2_custom/safe_jinja.py#L52)：
+
+```python
+JINJA2_MAX_RETURN_PAYLOAD_SIZE = 1024 * int(os.getenv("JINJA2_MAX_RETURN_PAYLOAD_SIZE_KB", 1024 * 10))
+# ...
+return output[:JINJA2_MAX_RETURN_PAYLOAD_SIZE]
+```
+
+默认上限 **10,485,760 字节（10 MB）**，可通过环境变量 `JINJA2_MAX_RETURN_PAYLOAD_SIZE_KB` 调节（单位 KB）。
+
+**设计动机**：
+1. **防止模板放大攻击**：攻击者可以构造嵌套循环模板，使渲染输出呈指数级增长（如 `{% for i in range(1000000) %}...{% endfor %}`），耗尽服务器内存和带宽
+2. **截断是静默的**：`output[:N]` 不抛异常、不记录日志，用户和运维都不知道渲染结果被截断。对于 header value 而言这通常不是问题（header 长度本就受 HTTP 协议限制，一般不超过 8KB），但对于 body 可能产生不完整的请求体
+
+**潜在问题**：截断发生在 UTF-8 字符串切片位置，如果刚好切在多字节字符（中文、emoji）中间，可能产生无效 UTF-8。但在 header 场景中，HTTP header value 通常应为 ASCII，影响不大。
+
+### D.4 渲染失败模式——异常会让整个抓取 fail
+
+`call_browser()` 中的渲染循环**没有任何异常处理**：
+
+```python
+for header_name in request_headers:
+    request_headers.update({header_name: jinja_render(template_str=request_headers.get(header_name))})
+```
+
+如果**任何一个** header 的 value 包含语法错误的 Jinja2 模板（如 `{{ ` 不闭合），`jinja_render()` 会抛出 `TemplateSyntaxError`，该异常直接向上冒泡导致：
+1. 整个 `call_browser()` 终止
+2. 本次抓取任务失败，错误信息被记录到 watch 的 `last_error` 字段
+3. 后续调度会正常重试，但用户如果不看错误日志，可能不知道是某个 header 的模板写错了
+
+**可能触发异常的场景**：
+
+| 异常类型 | 触发条件 | 来源 |
+|---------|---------|------|
+| `TemplateSyntaxError` | 模板语法错误（如 `{{` 不闭合、`{% if %}` 缺 `{% endif %}`） | 用户输入 |
+| `UndefinedError` | 引用了未定义变量（如 `{{ nonexistent }}`）——但 headers/body 渲染时没有传任何变量进 `args`，所以除了 `{% now %}` 标签外，所有 `{{ var }}` 都会报 UndefinedError | 用户输入 |
+| `SecurityError` | 访问了沙箱禁止的属性（如 `{{ ''.__class__ }}`） | 攻击尝试 |
+| `ModuleNotFoundError` | 自定义扩展依赖缺失（TimeExtension 需要 arrow） | 部署问题 |
+| `Exception` | TimeExtension 解析 timezone/offset 失败（如 `{% now 'InvalidTimezone' %}`） | 用户输入 |
+
+**与表单验证的关系**：Edit 表单保存时会对 URL、body、headers 做 Jinja2 验证（[forms.py#L912-L952](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/forms.py#L912-L952)），会捕获 `TemplateSyntaxError`、`UndefinedError`、`SecurityError` 并拒绝保存。但存在几个 gap：
+1. headers.txt 文件中的 header 不经过表单验证——如果运维在文件里写了坏模板，运行时才会炸
+2. `settings.headers`（全局设置页配置的 headers）可能不经过同样的验证路径
+3. 表单验证时传入了 `NotificationContextData` 作为变量占位，但实际渲染 headers/body 时**没有传任何变量**——所以表单验证通过的 `{{ some_token }}` 在运行时会因 UndefinedError 失败（注意：Jinja2 默认 `Undefined` 在被渲染时会输出空字符串而不是报错，只有对 undefined 值调用方法/属性时才抛 UndefinedError）
+
+### D.5 regex_replace 过滤器的 ReDoS 防护
+
+[plugins/regex.py](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/jinja2_custom/plugins/regex.py) 虽然与 headers 注入路径没有直接调用关系（headers 渲染不使用 `regex_replace`），但它是沙箱暴露的能力之一，值得关注：
+
+```python
+MAX_INPUT_SIZE = 1024 * 1024 * 10   # 10 MB
+MAX_PATTERN_LENGTH = 500
+REGEX_TIMEOUT_SECONDS = 10
+
+# 危险模式检测
+dangerous_patterns = [
+    r'\([^)]*\+[^)]*\)\+',  # (x+)+
+    r'\([^)]*\*[^)]*\)\+',  # (x*)+
+    r'\([^)]*\+[^)]*\)\*',  # (x+)*
+    r'\([^)]*\*[^)]*\)\*',  # (x*)*
+]
+
+# SIGALRM 超时（仅 Unix）
+if hasattr(signal, 'SIGALRM'):
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(REGEX_TIMEOUT_SECONDS)
+```
+
+防护措施：
+1. 输入大小限制（10 MB）——防止处理超大文本
+2. 正则长度限制（500 字符）——防止超长正则
+3. 危险模式检测——静态扫描嵌套量词（Catastrophic Backtracking 的常见模式）
+4. SIGALRM 超时——兜底方案，10 秒强制终止正则运算（但 Windows 上 `signal.SIGALRM` 不存在，所以 Windows 部署没有这层保护）
+
+### D.6 Accept-Encoding 中 br 强制剥离的设计动机
+
+[processors/base.py#L210-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/processors/base.py#L210-L214)：
+
+```python
+# https://github.com/psf/requests/issues/4525
+# Requests doesnt yet support brotli encoding, so don't put 'br' here, be totally sure that the user cannot
+# do this by accident.
+if 'Accept-Encoding' in request_headers and "br" in request_headers['Accept-Encoding']:
+    request_headers['Accept-Encoding'] = request_headers['Accept-Encoding'].replace(', br', '')
+```
+
+注释直接引用了 `psf/requests#4525`。这是 Python `requests` 库的一个已知限制：
+
+#### 为什么 requests 不支持 Brotli？
+
+1. **历史原因**：Brotli（`br`）压缩算法由 Google 在 2015 年发布，但 Python `requests` 库的自动解压依赖 `urllib3`，而 `urllib3` 在很长一段时间内只支持 gzip 和 deflate。截至 2024 年，`urllib3` 的 2.x 版本原生支持了 Brotli（如果安装了 `brotli` 或 `brotlicffi` 包），但 `requests` 是否实际启用取决于具体版本。
+2. **可选依赖**：即使 `urllib3` 支持，Brotli 解码需要额外安装 `brotli` C 扩展包，不是所有部署都会装。如果服务器返回 `Content-Encoding: br` 而客户端没有 Brotli 解码器，响应体无法被正确解压，`response.text` 会得到乱码的二进制数据。
+
+#### changedetection.io 为什么要**主动剥离**？
+
+changedetection.io 的核心逻辑是比较页面内容变化。如果请求头里带了 `Accept-Encoding: br`，支持 Brotli 的服务器会返回 Brotli 压缩的响应。如果 requests/urllib3 不能正确解压，会导致：
+1. `response.text` 是乱码（原始二进制被当作文本解码）
+2. 每次抓取内容都"变化"（因为乱码不稳定），产生海量误报
+3. 或者 `requests` 抛出 `ContentDecodingError` 导致抓取失败
+
+用户可能在自定义 headers 中不小心加了 `br`（比如从浏览器 DevTools 拷贝请求头时），剥离操作是防御性编程。
+
+#### br 剥离的实现缺陷
+
+代码用的是 `.replace(', br', '')`，这要求 `br` 前面必须恰好是 `, `。以下合法写法都不会被匹配到：
+- `Accept-Encoding: br`（br 在最前面，前面没有 `, `）
+- `Accept-Encoding: gzip,br`（逗号后没有空格）
+- `Accept-Encoding: gzip , br`（逗号前有空格）
+- `Accept-Encoding: BR`（大写——但 `CaseInsensitiveDict` 只处理 header name 的大小写，header value 原样保留）
+- 通过 Jinja2 模板动态生成（因为 br 检查在 Jinja2 渲染之前）
+
+正确的做法应该是用 `re.split(r'\s*,\s*', ...)` 拆分编码列表，过滤掉 `br`（大小写不敏感）后再重新拼接。目前这个实现只能挡住"从浏览器拷贝的标准格式"。
+
+### D.7 headers/body 渲染与其他渲染路径的差异
+
+changedetection.io 中有多个场景使用 Jinja2 渲染，不同场景的配置和防护不同：
+
+| 场景 | 入口函数 | 沙箱 | 变量上下文 | 最大返回值 | 异常捕获 |
+|------|---------|:---:|-----------|:---:|:---:|
+| **headers value** | `jinja_render(template_str=value)` | ✅ ImmutableSandboxedEnvironment | 无（空 kwargs） | ✅ 10MB 截断 | ❌ 直接抛出 |
+| **request body** | `jinja_render(template_str=self.watch.get('body'))` | ✅ 同上 | 无 | ✅ 同上 | ❌ 直接抛出 |
+| **watch URL** | 同上 | ✅ 同上 | 无 | ✅ 同上 | ✅ 表单层 try/except |
+| **通知消息** | `jinja_render(template_str=..., **context_data)` | ✅ 同上 | 完整通知 tokens（`{{ url }}`、`{{ diff }}` 等） | ✅ 同上 | ✅ 通知层 try/except |
+| **代理 URL** | 同上 | ✅ 同上 | 完整 context | ✅ 同上 | ✅ 表单层验证 |
+
+**headers/body 是唯一不捕获异常的渲染路径**，也是唯一不传入任何模板变量的路径。这意味着：
+- 用户不能在 header value 里用 `{{ url }}`、`{{ watch.title }}` 等通知系统的 token——虽然表单验证时用了 `NotificationContextData` 做占位，但运行时实际没有传这些变量
+- 但 `{% now %}` 标签仍然可用——它是 Jinja2 扩展，不依赖外部变量
+- 简单的 `{{ variable }}` 对 Undefined 值渲染为空字符串（不报错），但 `{{ variable.some_attr }}` 会抛 UndefinedError（整个抓取失败）
+
+---
+
 ## 附录：四大 Fetcher 后端的注入机制深度对比
 
 ### A.1 后端选择机制
