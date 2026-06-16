@@ -521,3 +521,426 @@ def data(self):
 ### 7.4 Pydantic 仅用于 LLM
 
 `LLMSettings` 是唯一使用 Pydantic 的模型，具有 `extra='forbid'` 的严格验证。其余所有配置（Watch、App、Tag）仍为 dict 继承，缺乏运行时类型检查。
+
+---
+
+## 8. 暗线一：os.getenv 调用点穷尽分类
+
+排除测试目录，仓库内共约 **70 处** `os.getenv()` 调用（不含 `os.environ` 赋值/判断），按介入时机与覆盖能力分为五类。
+
+### 8.1 A 类 — 模块导入时求值，值被冻结（进程生命周期不可变）
+
+此类 `getenv()` 出现在模块顶层或类属性定义中，Python 在 import 时求值一次，之后不再重新读取环境变量。
+
+| 环境变量 | 代码位置 | 语义 |
+|----------|----------|------|
+| `DEFAULT_SETTINGS_REQUESTS_TIMEOUT` | [App.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/App.py#L32) `base_config` 类属性 | 嵌入默认值，可被 JSON 覆盖 |
+| `DEFAULT_SETTINGS_REQUESTS_WORKERS` | [App.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/App.py#L33) | 同上 |
+| `DEFAULT_SETTINGS_HEADERS_USERAGENT` | [App.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/App.py#L35) | 同上 |
+| `DEFAULT_FETCH_BACKEND` | [App.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/App.py#L46) | 同上 |
+| `FETCH_WORKERS` | [worker_pool.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/worker_pool.py#L30) `_max_executor_workers` | 线程池大小，启动后不可缩 |
+| `FORCE_FSYNC_DATA_IS_CRITICAL` | [file_saving_datastore.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/file_saving_datastore.py#L30) | 控制 fsync，启动后固定 |
+| `FILTER_FAILURE_NOTIFICATION_SEND_DEFAULT` | [model/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/__init__.py#L198) | Watch 默认值 |
+| `BROTLI_COMPRESS_SIZE_THRESHOLD` (`SNAPSHOT_BROTLI_COMPRESSION_THRESHOLD`) | [Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L44) | Brotli 压缩阈值 |
+| `MINIMUM_SECONDS_RECHECK_TIME` | [Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L51) 模块级变量 | 同时在 ticker 内运行时读取 |
+| `SCREENSHOT_MAX_HEIGHT` | [content_fetchers/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/__init__.py#L19) | 截图最大高度 |
+| `SCREENSHOT_CHUNK_HEIGHT` | [content_fetchers/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/__init__.py#L26) | 拼接阈值 |
+| `OPENCV_SUBPROCESS_TIMEOUT` | [image_ssim_diff/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/image_ssim_diff/__init__.py#L26) | OpenCV 子进程超时 |
+| `OPENCV_BLUR_SIGMA` | [image_ssim_diff/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/image_ssim_diff/__init__.py#L39) | 模糊 sigma |
+| `MAX_DIFF_HEIGHT/WIDTH` | [image_ssim_diff/difference.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/image_ssim_diff/difference.py#L23-L24) | 差异图最大尺寸 |
+| `ENABLE_TEMPLATE_TRACKING` | [image_ssim_diff/edit_hook.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/image_ssim_diff/edit_hook.py#L18) | 模板匹配开关 |
+| `JINJA2_MAX_RETURN_PAYLOAD_SIZE_KB` | [safe_jinja.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/jinja2_custom/safe_jinja.py#L13) | Jinja2 渲染上限 |
+| `LLM_TIMEOUT` | [llm/client.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/llm/client.py#L17) `DEFAULT_TIMEOUT` | HTTP 客户端超时 |
+
+**重启依赖**：修改这些环境变量后**必须重启进程**才能生效。部分（A 类嵌入默认值者）可在重启后被 JSON `update()` 覆盖，其余（线程池大小、fsync 等）完全由环境变量独占。
+
+### 8.2 B 类 — 启动时一次性读取，值被缓存于局部变量
+
+| 环境变量 | 代码位置 | 缓存方式 |
+|----------|----------|----------|
+| `LISTEN_HOST` / `PORT` | [\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/__init__.py#L204-L205) `main()` | 赋值给 `host`/`port` 局部变量 |
+| `LOGGER_LEVEL` | `main()` | 赋值后 `logger.level` 设定 |
+| `FLASK_SERVER_NAME` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L118-L119) | 赋值给 `app.config['SERVER_NAME']` |
+| `FLASK_ENABLE_COMPRESSION` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L100) | 条件判断后初始化 Flask-Compress |
+| `SOCKETIO_MODE` | [socket_server.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/realtime/socket_server.py#L236) | 传给 SocketIO 构造参数 |
+| `SOCKETIO_CORS_ORIGINS` | [socket_server.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/realtime/socket_server.py#L260) | CORS 配置 |
+| `SOCKETIO_LOGGING` | [socket_server.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/realtime/socket_server.py#L265-L266) | logger 参数 |
+| `NOTIFICATION_WORKERS` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1007) | 创建 N 个线程后不可变 |
+| `DISABLE_VERSION_CHECK` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1019) | 条件判断，不创建线程 |
+| `WORKER_MAX_JOBS` / `WORKER_MAX_RUNTIME` | [worker.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/worker.py#L67-L68) | Worker 重启策略参数 |
+| `BLOCK_SIMPLEHOSTS` | [forms.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/forms.py#L64) | 表单验证逻辑 |
+
+**重启依赖**：必须重启。`SOCKETIO_*` 和 `NOTIFICATION_WORKERS` 在 App 构造期间消费后无法动态修改。
+
+### 8.3 C 类 — 运行时每次使用时实时读取
+
+这是**唯一不需要重启就能生效**的类别，但也意味着每次调用都有 `os.getenv()` 的微开销。
+
+| 环境变量 | 代码位置 | 读取频率 |
+|----------|----------|----------|
+| `FETCH_WORKERS` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L996) start_workers, [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L923) health check, [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1131) ticker 60s check | 每 60s + 启动时 |
+| `MINIMUM_SECONDS_RECHECK_TIME` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1117) ticker | 每轮 ticker 循环 |
+| `SALTED_PASS` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L442) 密码校验, [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L533) has_password, [socket_server.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/realtime/socket_server.py#L320), [difference.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/text_json_diff/difference.py#L162), [extract.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/extract.py#L48) | 每次认证/通知 |
+| `BASE_URL` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L590-L591) data 属性 | 每次访问 `datastore.data` |
+| `HIDE_REFERER` | flask_app.py 请求中间件 | 每次请求 |
+| `USE_X_SETTINGS` | flask_app.py 请求中间件 | 每次请求 |
+| `ENABLE_NO_PROXY_OPTION` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L850) | 每次 get_proxy_list / 请求 |
+| `PAGE_WATCH_LIMIT` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L739) | 每次 add_watch |
+| `LLM_MODEL/KEY/BASE` | [evaluator.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/llm/evaluator.py#L245-L250) get_llm_config() | 每次 LLM 调用 |
+| `LLM_MAX_INPUT_CHARS` | [evaluator.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/llm/evaluator.py#L62) | 每次 LLM 输入截断 |
+| `LLM_TOKEN_BUDGET_MONTH` | [evaluator.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/llm/evaluator.py#L306) | 每次预算检查 |
+| `LLM_FEATURES_DISABLED` | [evaluator.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/llm/evaluator.py#L44) | 每次 LLM 功能判断 |
+| `TZ` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1204) ticker, [safe_jinja.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/jinja2_custom/safe_jinja.py#L38), [TimeExtension.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/jinja2_custom/extensions/TimeExtension.py#L108) | 每次调度/Jinja2 渲染 |
+| `PDF_TO_HTML_TOOL` | [text_json_diff/processor.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/text_json_diff/processor.py#L295) | 每次处理 PDF |
+| `DISABLED_PROCESSORS` | [processors/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/__init__.py#L205) | `@lru_cache` 保护，实际只求值一次* |
+| `HISTORY_SNAPSHOT_FILE_ALLOW_OUTSIDE_WATCH_DATADIR` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L989), [Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L568) | 每次快照读写 |
+| `ALLOW_IANA_RESTRICTED_ADDRESSES` | [validate_url.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/validate_url.py#L148), [base.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/base.py#L105), [requests.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/requests.py#L86), [custom_handlers.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/notification/apprise_plugin/custom_handlers.py#L204) | 每次校验/抓取/通知 |
+| `ALLOW_FILE_URI` | [validate_url.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/validate_url.py#L201), [base.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/base.py#L125), [requests.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/requests.py#L82) | 每次校验/抓取 |
+| `SAFE_PROTOCOL_REGEX` | [validate_url.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/validate_url.py#L238) | 每次校验 |
+| `JQ_ALLOW_RISKY_EXPRESSIONS` | [html_tools.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/html_tools.py#L47) | 每次执行 jq |
+| `XPATH_BLOCKED_FUNCTIONS` | [html_tools.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/html_tools.py#L104) | 每次执行 xpath |
+| `DISABLE_BROTLI_TEXT_SNAPSHOT` | [Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L658) | 每次快照存储 |
+
+\* `DISABLED_PROCESSORS` 被 `@lru_cache` 包裹，运行期间只求值一次，修改后需重启。
+
+### 8.4 D 类 — 抓取器专属，模块导入时决策
+
+| 环境变量 | 代码位置 | 影响 |
+|----------|----------|------|
+| `PLAYWRIGHT_DRIVER_URL` | [content_fetchers/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/__init__.py#L93) | 决定导入 Playwright 还是 Selenium |
+| `FAST_PUPPETEER_CHROME_FETCHER` | [content_fetchers/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/__init__.py#L96) | 决定 Playwright 还是 Puppeteer |
+| `WEBDRIVER_URL` | [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L9-L38) | Selenium 连接地址 |
+| `CHROME_OPTIONS` | [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L90) | Chrome 启动参数 |
+| `WEBDRIVER_CONNECTION_TIMEOUT` | [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L111) | 连接超时 |
+| `WEBDRIVER_PAGELOAD_TIMEOUT` | [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L123) | 页面加载超时 |
+| `WEBDRIVER_DELAY_BEFORE_CONTENT_READY` | [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L135), [playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py#L334), [puppeteer.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/puppeteer.py#L276) | 内容就绪等待 |
+| `SCREENSHOT_QUALITY` | [screenshot_handler.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/screenshot_handler.py#L82), [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L175), [playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py#L68), [puppeteer.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/puppeteer.py#L50) | 截图 JPEG 质量 |
+| `SCREENSHOT_MAX_HEIGHT` | [playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py#L387), [puppeteer.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/puppeteer.py#L476) | 每次截图时读取 |
+| `PLAYWRIGHT_BROWSER_TYPE` | [playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py#L155-L186) | 浏览器类型 |
+| `PLAYWRIGHT_SERVICE_WORKERS` | [playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py#L291) | Service Worker 策略 |
+| `PUPPETEER_MAX_PROCESSING_TIMEOUT_SECONDS` | [puppeteer.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/puppeteer.py#L519) | Puppeteer 超时 |
+| `HTTP_PROXY` / `HTTPS_PROXY` | [base.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/base.py#L61-L62) | 系统代理 |
+| `REMOVE_REQUESTS_OLD_SCREENSHOTS` | [requests.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/requests.py#L251) | 清理旧截图 |
+| `REQUESTS_RETRY_MAX_COUNT` | [requests.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/requests.py#L68) | 重试次数 |
+| `webdriver_proxy*` 系列 (7 个) | [webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py#L48-L54) | Selenium 代理配置 |
+| `playwright_proxy_*` | [playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py#L199) | Playwright 代理配置 |
+
+### 8.5 E 类 — CI/CD 与调试专用
+
+| 环境变量 | 代码位置 | 用途 |
+|----------|----------|------|
+| `TESTING_SHUTDOWN_AFTER_DATASTORE_LOAD` | [\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/__init__.py#L391) main() | 加载 DataStore 后立即退出 |
+| `GITHUB_REF` | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1019) | 检测 CI 环境，跳过版本检查 |
+| `PYTEST_CURRENT_TEST` | 多处 | 检测 pytest 环境 |
+
+---
+
+## 9. 暗线二：\_rehydrate_tags 强制 restock\_diff 的完整链路
+
+### 9.1 两条独立路径，同归一个硬编码
+
+Tag 被加载到内存有两条路径，**两条路径都强制设置 `processor = 'restock_diff'`**：
+
+#### 路径 A：\_load\_tags() — 从独立 tag.json 文件加载
+
+[store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L417-L426)：
+
+```python
+def rehydrate_tag(uuid, entity_dict):
+    """Rehydrate tag as Tag object with forced restock_diff processor."""
+    entity_dict['uuid'] = uuid
+    entity_dict['processor'] = 'restock_diff'  # Force processor for override functionality
+    return Tag.model(
+        datastore_path=self.datastore_path,
+        __datastore=self.__data,
+        default=entity_dict
+    )
+```
+
+#### 路径 B：\_rehydrate\_tags() — 从 settings 中残留的 Tag 数据加载
+
+[store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L140-L148)：
+
+```python
+for uuid, tag in self.__data['settings']['application']['tags'].items():
+    tag['processor'] = 'restock_diff'          # Force processor
+    self.__data['settings']['application']['tags'][uuid] = Tag.model(
+        datastore_path=self.datastore_path,
+        __datastore=self.__data,
+        default=tag
+    )
+```
+
+### 9.2 为什么强制 restock\_diff？
+
+根因在于 **Tag 的 override 机制目前仅在 `restock_diff` 处理器中被实现**。Tag 模型继承自 `watch_base`，理论上 Tag 可以设置任意 processor，但代码中 Tag override 的消费方只有一个——[processors/restock\_diff/processor.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/restock_diff/processor.py) 的 `run_changedetection()` 方法。
+
+强制 `processor = 'restock_diff'` 是一个**技术债务（technical debt）**的显式标注。注释原文是：
+
+```
+Force processor for override functionality
+```
+
+Tag 模型文档 [Tag.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Tag.py#L1-L21) 也明确承认了这一点：
+
+```
+ARCHITECTURE NOTE: Configuration Override Hierarchy
+...
+Current implementation requires manual checking in processors:
+    for tag_uuid in watch.get('tags'):
+        tag = datastore['settings']['application']['tags'][tag_uuid]
+        if tag.get('overrides_watch'):
+            restock_settings = tag.get('restock_settings', {})
+            break
+
+With Pydantic, this would be automatic via chain resolution:
+    Watch → Tag (first with overrides_watch) → Global
+```
+
+### 9.3 强制的副作用
+
+1. **UI 层**：Tag 的编辑页面不会显示 processor 选择器（因为已经被硬编码），用户无法在 UI 上修改
+2. **API 层**：通过 API 创建 Tag 时可以传入 `processor_config_restock_diff`，这个键会被正确存储到 `{uuid}/restock_diff.json`
+3. **持久化层**：`_save_to_disk()` 和 `_build_settings_data()` 不保存 `processor` 到 tag.json（因为每次加载都会重新强制设置），所以 JSON 文件中**不会持久化** `processor` 字段
+4. **processor\_config\_xxx 分离**：[Watch.\_get\_commit\_data()](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L1064-L1093) 排除 `processor_config_*` 键，这些键由各处理器自行管理自己的 JSON 文件（如 `restock_diff.json`），Tag 同理
+
+### 9.4 完整数据流
+
+```
+启动 → _load_tags() 从 tag.json 读取 dict
+     → rehydrate_tag() 强制 processor='restock_diff'
+     → Tag.model(default=dict) 构造 Tag 对象
+     → self.__data['settings']['application']['tags'].update(tags)
+
+启动 → _rehydrate_tags() 遍历 settings 中残留的 tag dict
+     → 强制 processor='restock_diff'
+     → Tag.model(default=dict) 构造 Tag 对象
+     → 替换 __data 中的对应条目
+
+运行时 → restock_diff processor 检查 watch.get('tags')
+     → 找到 tag → 检查 tag.get('overrides_watch')
+     → True → 使用 tag 的 restock_settings 覆盖 watch 设置
+```
+
+---
+
+## 10. 暗线三：JSON 与环境变量的读取节奏与重启依赖
+
+### 10.1 JSON 的读取节奏
+
+| 时机 | 操作 | 频率 |
+|------|------|------|
+| 启动 | `_load_state()` 全量读取 | 一次 |
+| 每次 Watch.commit() | 写入 `{uuid}/watch.json` | 即时写入（fire-and-forget） |
+| 每次 Tag.commit() | 写入 `{uuid}/tag.json` | 即时写入 |
+| 每次 `update_watch()` | 写入 watch.json | 即时写入 |
+| 每次 settings 变更 | 写入 `changedetection.json` | 即时写入 |
+| 运行中 | **不再读取** JSON 文件 | — |
+
+**关键洞察**：JSON 文件是**只写（write-through）缓存**。启动时一次性读入内存，之后所有读写都在内存中的 `__data` dict 上操作，变更后立即写回磁盘。运行期间**不会**重新从磁盘读取 JSON 文件。
+
+这意味着：**运行期间直接修改磁盘上的 JSON 文件不会影响运行中的实例**——必须重启进程才能加载修改。
+
+### 10.2 环境变量的读取节奏
+
+| 节奏类型 | 环境变量 | 需要重启？ |
+|----------|----------|-----------|
+| 模块导入时一次性 | A 类全部（8.1 节） | ✅ 必须 |
+| 启动时一次性 | B 类全部（8.2 节） | ✅ 必须 |
+| 运行时每次读取 | C 类全部（8.3 节） | ❌ 修改即生效* |
+
+\* 严格来说，修改进程的环境变量需要通过 `/proc/PID/environ` 或 OS 特定机制，Docker/K8s 中需要重建容器。但**代码层面**不需要重启。
+
+### 10.3 修改配置后的生效矩阵
+
+| 配置来源 | 修改方式 | 运行中实例是否感知 | 需要操作 |
+|----------|----------|-------------------|----------|
+| JSON 文件（磁盘） | 直接编辑文件 | ❌ 不感知 | 重启进程 |
+| JSON 文件（通过 UI/API） | UI/API → 内存 → 磁盘 | ✅ 即时 | 无 |
+| 环境变量 A 类 | 修改进程 ENV | ❌ 不感知（已求值并缓存） | 重启进程 |
+| 环境变量 B 类 | 修改进程 ENV | ❌ 不感知（已求值并缓存） | 重启进程 |
+| 环境变量 C 类 | 修改进程 ENV | ✅ 下次读取时感知 | 无（但需修改运行进程的 ENV） |
+| 环境变量 D 类 | 修改进程 ENV | ❌ 不感知（模块已导入） | 重启进程 |
+
+### 10.4 特殊案例：FETCH\_WORKERS 的双重节奏
+
+`FETCH_WORKERS` 同时出现在 A 类和 C 类中：
+
+- **A 类**：[worker_pool.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/worker_pool.py#L30) 模块顶层 `_max_executor_workers = int(os.getenv("FETCH_WORKERS", "10"))` — 控制线程池大小，**不可运行时缩容**
+- **C 类**：[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L996) `n_workers = int(os.getenv("FETCH_WORKERS", ...))` — 每次启动/健康检查时读取 — 控制 Worker 数量，**可运行时扩容**
+
+这导致一个微妙行为：如果 `FETCH_WORKERS` 从 10 改为 20，ticker 的健康检查会发现 Worker 不足并启动新的（C 类生效），但线程池的 `max_workers` 仍然是 10（A 类不生效），直到重启。
+
+---
+
+## 11. 暗线四：datastore 锁在读写路径上的保护边界
+
+### 11.1 锁的定义
+
+[store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py) `ChangeDetectionStore` 的 `self.lock = threading.Lock()` 是一个**互斥锁**，保护 `__data` dict 不被并发修改导致数据不一致。
+
+### 11.2 写路径上的锁（显式保护）
+
+| 方法 | 代码位置 | 锁范围 | 说明 |
+|------|----------|--------|------|
+| `update_watch()` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L549) | `with self.lock:` 包裹 dict update | 防止并发修改同一 Watch |
+| `delete()` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L610) | `with self.lock:` 包裹删除操作 | 防止删除与遍历冲突 |
+| `clone()` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L654) | `with self.lock:` 包裹 dict() 浅拷贝 | 拷贝期间防止原数据被修改 |
+| `add_tag()` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L961) | `with self.lock:` 包裹 Tag 创建 | 防止 UUID 冲突 |
+| `add_notification_url()` | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L1092) | `with self.lock:` 包裹列表追加 | 防止重复追加 |
+| `api/Watch` API | [api/Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Watch.py#L78) | `with self.datastore.lock:` | API 写入保护 |
+| `watch_base._get_commit_data()` | [model/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/__init__.py#L617) | `with lock:` → `dict(self)` → 外部 deepcopy | 快照期间防并发修改 |
+| `Watch._get_commit_data()` | [Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L1075) | 同上 | 排除 `processor_config_*` 和 `__*` |
+
+### 11.3 读路径上的锁（缺失保护）
+
+**关键发现**：`datastore.data` 属性（读操作）**没有加锁**：
+
+```python
+@property
+def data(self):
+    d = self.__data
+    d['settings']['application']['active_base_url'] = active_base_url.strip('" ')
+    return d
+```
+
+这意味着：
+1. 返回的是 `__data` 的**引用**而非拷贝
+2. 调用方获得引用后，如果另一个线程在 `with self.lock:` 中修改了 `__data`，调用方可能看到半修改状态
+3. `active_base_url` 的写入是对 `__data` 的**副作用修改**，没有任何锁保护
+
+### 11.4 不加锁的读路径清单
+
+| 读取方式 | 代码位置 | 风险 |
+|----------|----------|------|
+| `datastore.data` 属性 | 全局 | 返回引用，无锁，可能看到半修改状态 |
+| `datastore.data['watching']` 遍历 | ticker_thread | 可能遇到 `RuntimeError: dictionary changed size` |
+| `datastore.data['settings']` 直接读 | 多处 | 读取嵌套 dict 的标量值，风险较低 |
+| `watch['last_checked']` 等 | ticker, worker | 单键读，Python GIL 保护，实际安全 |
+
+### 11.5 ticker 的 dict 遍历容错
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1158-L1170) 的 ticker 线程**不使用锁**遍历 `datastore.data['watching']`，而是用 try/except 处理并发修改异常：
+
+```python
+while True:
+    try:
+        for k in sorted(datastore.data['watching'].items(), ...):
+            watch_uuid_list.append(k[0])
+    except RuntimeError as e:
+        time.sleep(0.1)
+        watch_uuid_list = []
+    else:
+        break
+```
+
+这是一种**乐观并发**策略：假设冲突概率低，遇冲突则重试。
+
+### 11.6 锁的粒度问题
+
+当前锁是**单一大锁**，所有写操作串行化。这意味着：
+- `update_watch(uuid_A, ...)` 和 `update_watch(uuid_B, ...)` 不能并行
+- 即使两个 Watch 完全独立，也必须排队
+- `_get_commit_data()` 中 `with lock:` → `dict(self)` → 外部 `deepcopy()` 的设计是**正确的**：锁只保护浅拷贝（快照），耗时的 deepcopy 在锁外执行
+
+### 11.7 锁保护边界总结
+
+```
+┌─────────────────────────────────────────────────────┐
+│  加锁保护（串行化）                                  │
+│  ├── update_watch() — dict.update()                 │
+│  ├── delete() — dict 删除 + 信号                    │
+│  ├── clone() — dict() 浅拷贝                        │
+│  ├── add_tag() — Tag 创建                           │
+│  ├── add_notification_url() — 列表追加               │
+│  ├── API 写入                                        │
+│  └── _get_commit_data() — dict(self) 浅拷贝         │
+│       (deepcopy 在锁外)                              │
+├─────────────────────────────────────────────────────┤
+│  不加锁（乐观并发 / GIL 保护）                       │
+│  ├── datastore.data 属性 — 返回引用                  │
+│  ├── ticker 遍历 watching — try/except RuntimeError  │
+│  ├── 单键标量读取 — GIL 原子性                      │
+│  └── active_base_url 副作用写入 — 无保护            │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 12. 暗线五：main 中 datastore → app → worker → ticker 依赖链的根因
+
+### 12.1 依赖链图
+
+```
+main()
+ │
+ ├─ 1. ChangeDetectionStore(datastore_path)     ← 配置真相来源
+ │     ├── 加载 JSON → 内存 __data
+ │     ├── 运行 schema 迁移
+ │     └── 反序列化为 Watch/Tag 对象
+ │
+ ├─ 2. changedetection_app(app_config, datastore)  ← 需要 datastore
+ │     ├── app.config['DATASTORE'] = datastore
+ │     ├── 注册所有 Flask 路由/蓝图
+ │     │
+ │     ├─ 2a. worker_pool.start_workers(n_workers, update_q, notification_q, app, datastore)
+ │     │       ↑ 需要 app（Flask app context）、datastore（读 Watch 配置）、
+ │     │         update_q（在 flask_app.py 模块级创建）
+ │     │
+ │     └─ 2b. threading.Thread(ticker_thread_check_time_launch_checks)
+ │             ↑ 需要 datastore（遍历 Watch）、worker_pool（获取运行 UUID）、
+ │               update_q（入队）、app.config.exit（优雅退出）
+ │
+ └─ 3. socketio.run(app, host, port)              ← 需要 app
+```
+
+### 12.2 根因分析：为什么是这个顺序？
+
+#### 为什么 DataStore 必须先于 App？
+
+1. **App 构造函数需要 datastore**：[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py) `changedetection_app(app_config, datastore)` 第一个操作就是 `app.config['DATASTORE'] = datastore`
+2. **Worker 数量取决于 datastore**：`n_workers = int(os.getenv("FETCH_WORKERS", datastore.data['settings']['requests']['workers']))` — 需要读取 datastore 中的 workers 配置
+3. **信号处理器需要 datastore**：[\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/__init__.py#L98-L104) `sigshutdown_handler()` 直接设置 `datastore.stop_thread = True`
+
+#### 为什么 App 必须先于 Worker？
+
+1. **Worker 需要 Flask app context**：[worker.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/worker.py#L78) 中 Worker 在 `app.app_context()` 内执行处理器和通知
+2. **update_q 是 flask_app 模块级变量**：[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py) 模块导入时创建 `update_q`，Worker 和 Ticker 都依赖它
+3. **notification_q 同理**
+
+#### 为什么 Worker 必须先于 Ticker？
+
+1. **Ticker 入队需要 Worker 消费**：Ticker 将到期 Watch 放入 `update_q`，Worker 从队列取出执行。如果 Ticker 先于 Worker 启动，队列中的项目无人消费
+2. **Ticker 需要 `running_uuids`**：`running_uuids = worker_pool.get_running_uuids()` — 判断 Watch 是否正在被处理，避免重复入队。Worker 池必须已存在才能返回有效结果
+3. **Worker 健康检查由 Ticker 触发**：[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1130-L1143) ticker 每 60s 调用 `worker_pool.check_worker_health()`，如果 Worker 数量不足则启动新的
+
+#### 为什么 HTTP 服务最后启动？
+
+1. **请求处理依赖所有子系统就绪**：Flask 路由处理器需要 datastore 可读、Worker 可调度、通知可发送
+2. **Socket.IO 依赖 Worker 池**：实时更新需要 Worker 处理完成后通过信号通知前端
+3. **信号处理器依赖所有组件**：`sigshutdown_handler()` 需要能正确关闭 Worker 池、队列、Socket.IO
+
+### 12.3 循环依赖的破解
+
+存在一个**天然循环**：
+
+```
+Worker 需要 app (Flask app context)
+App 构造函数启动 Worker
+```
+
+破解方式：Worker 接收 `app` 引用，但**不在构造时使用 app context**。app context 仅在 Worker 的实际执行阶段（`app.app_context()` 上下文管理器）才被获取。这确保了在 App 构造完成前，Worker 不会尝试使用尚未就绪的 Flask context。
+
+同样，[\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/__init__.py#L91-L92) 的模块全局 `app = None` / `datastore = None` 在 `main()` 中被赋值，供信号处理器使用。信号处理器在 App 完全构造后才被注册。
+
+### 12.4 batch\_mode 的依赖简写
+
+当 `batch_mode=True` 时，ticker 和 notification_runner **不会被启动**。这是因为 batch 模式下：
+1. 所有 Watch 通过 CLI `-u` 参数添加后一次性入队
+2. Worker 池处理完队列后进程退出
+3. 不需要定时调度（ticker），也不需要持续的通知监听
+
+```
+batch_mode=True:  datastore → app → workers → 处理队列 → 退出
+batch_mode=False: datastore → app → workers → ticker + notification_runner → HTTP 服务
+```
