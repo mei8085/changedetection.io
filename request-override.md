@@ -708,7 +708,7 @@ Fetch 前 is_url_private_or_parser_confused  ← 第二道门：fetch-time DNS �
 
 每个文件都经过同一个解析函数 `parse_headers_from_text_file()` 读取（逐行解析 `Key: Value` 格式），如果文件不存在则静默跳过。每个文件的解析错误只记录日志，不影响其他文件。
 
-### C.2 Tag 级文件名的精确生成规则
+### C.2 Tag 级文件名的精确生成规则（经 Python 3.14 实证验证）
 
 Tag 级 headers.txt 的文件名不是简单的 `tag-title.txt`，而是经过严格清洗的。代码 L926：
 
@@ -721,59 +721,115 @@ fname = "headers-" + re.sub(r'[\W_]', '', tag.get('title')).lower().strip() + ".
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | `tag.get('title')` | 取 tag 的显示名称 |
-| 2 | `re.sub(r'[\W_]', '', …)` | **移除所有非字母数字字符和下划线** |
-| 3 | `.lower()` | 转为小写 |
-| 4 | `.strip()` | 去除首尾空白（通常已空，但防御性处理） |
+| 2 | `re.sub(r'[\W_]', '', …)` | 用正则删除匹配字符 |
+| 3 | `.lower()` | 转为小写（Unicode-aware） |
+| 4 | `.strip()` | 去除首尾空白（通常已空，防御性处理） |
 | 5 | 拼接 `"headers-" + 结果 + ".txt"` | 最终文件名 |
 
-正则 `[\W_]` 的含义：
-- `\W`：匹配所有非单词字符（即不是 `[a-zA-Z0-9_]` 的字符），包括空格、标点、符号、中文、emoji 等
-- `_`：因为 `\W` **不匹配下划线**（下划线属于单词字符），所以显式加上 `_` 一并移除
-- 最终效果：**只保留纯 ASCII 字母和数字**，其他一切字符全部删除
+#### 正则 `[\W_]` 在 Python 3 Unicode 模式下的精确语义
 
-### C.3 Tag 名称到文件名的映射示例
+这是最容易被误解的部分。Python 3 中 `re` 模块**默认启用 Unicode 模式**（即 `re.UNICODE` 是隐含标志），`\w` 和 `\W` 的定义范围远大于 ASCII：
 
-| Tag 显示名称 | 清洗过程 | 最终文件名 |
-|-------------|----------|-----------|
-| `Production` | `Production` → `production` | `headers-production.txt` |
-| `My API Key` | `My API Key` → `MyAPIKey` → `myapikey` | `headers-myapikey.txt` |
-| `Dev & Test!` | `Dev & Test!` → `DevTest` → `devtest` | `headers-devtest.txt` |
-| `api_v2` | `api_v2` → `apiv2`（下划线被移除） | `headers-apiv2.txt` |
-| `生产环境` | `生产环境` → ``（中文全部被移除）→ ``（空字符串）→ `headers-.txt` | `headers-.txt` ⚠️ |
-| `Auth-Token: Bearer` | `Auth-Token: Bearer` → `AuthTokenBearer` → `authtokenbearer` | `headers-authtokenbearer.txt` |
-| `😀 emoji tag` | `😀 emoji tag` → `emojitag` → `emojitag` | `headers-emojitag.txt` |
-| `  Trim Me  ` | `  Trim Me  ` → `TrimMe` → `trimme` | `headers-trimme.txt` |
+- **`\w`** = 所有 Unicode Letter（中/日/韩/西里尔/拉丁字母等） + 所有 Unicode Digit（阿拉伯数字、阿拉伯文数字等） + 下划线 `_`
+- **`\W`** = **`\w` 的补集**，即：空格、制表符、换行、标点符号、货币符号、数学符号、emoji、零宽字符、连接符等
+- **`[\W_]`** = `\W` **加上显式的下划线**。因为 `\W` 是 `\w` 的补集，而 `\w` 包含下划线，所以 `\W` **不**匹配下划线——必须手动把 `_` 加进字符类。
+
+**最终保留的字符**（即 **不**匹配 `[\W_]` 的字符）：
+
+| 字符类别 | 是否保留 | 举例 |
+|----------|:---:|------|
+| ASCII 字母 `[a-zA-Z]` | ✅ 保留 | `A` `z` |
+| ASCII 数字 `[0-9]` | ✅ 保留 | `0` `9` |
+| 下划线 `_` | ❌ **删除**（显式加在正则里） | `_` |
+| 中文（CJK 汉字） | ✅ **保留**（属于 Unicode Letter） | `生` `产` `环` `境` |
+| 日文假名/汉字 | ✅ **保留**（属于 Unicode Letter） | `テ` `ス` `ト` |
+| 韩文谚文 | ✅ **保留**（属于 Unicode Letter） | `테` `스` `트` |
+| 西里尔字母 | ✅ **保留**（属于 Unicode Letter） | `П` `р` `и` |
+| 带重音的拉丁字母 | ✅ **保留**（属于 Unicode Letter） | `é` `ü` `ñ` `ß` |
+| Unicode 数字（非 ASCII） | ✅ **保留**（属于 Unicode Digit） | `١` `٢`（阿拉伯文数字） |
+| 空格 ` `、制表符 `\t`、换行 `\n` | ❌ 删除 | |
+| ASCII 标点 `!@#$%^&*()-=+[]{};:'",.<>?/\\\|` | ❌ 删除 | |
+| 全角标点 `，。！？：；「」` | ❌ 删除 | `，` `！` |
+| 货币符号 | ❌ 删除 | `$` `€` `£` `¥` |
+| 数学符号 | ❌ 删除 | `+` `=` `×` `÷` |
+| Emoji | ❌ **删除**（不属于 Unicode Letter/Digit） | `😀` `🎉` `🔥` |
+| 零宽字符 | ❌ 删除 | U+200B U+200C |
+| 各种连字符/破折号 | ❌ 删除 | `-` `–` `—` |
+
+**一句话概括**：`[\W_]` 删除下划线以及**所有不属于 Unicode 字母/数字**的字符。中文、日文、韩文、西里尔文、阿拉伯文数字等非 ASCII 字母/数字都会被**保留**。
+
+### C.3 Tag 名称到文件名的映射示例（经 Python 3.14 实证验证）
+
+| Tag 显示名称 | 每步清洗过程 | 最终文件名 |
+|-------------|-------------|-----------|
+| `Production` | `Production` → `Production` → `production` | `headers-production.txt` |
+| `My API Key` | `My API Key` → 删空格 → `MyAPIKey` → `myapikey` | `headers-myapikey.txt` |
+| `Dev & Test!` | `Dev & Test!` → 删 `&` `!` ` ` → `DevTest` → `devtest` | `headers-devtest.txt` |
+| `api_v2` | `api_v2` → 删下划线 → `apiv2` → `apiv2` | `headers-apiv2.txt` |
+| `生产环境` | `生产环境` → **保留中文** → `生产环境` → `生产环境` | `headers-生产环境.txt` ✅ |
+| `测试环境` | `测试环境` → 保留中文 → `测试环境` → `测试环境` | `headers-测试环境.txt` ✅ |
+| `Auth-Token: Bearer` | `Auth-Token: Bearer` → 删 `-` `:` ` ` → `AuthTokenBearer` → `authtokenbearer` | `headers-authtokenbearer.txt` |
+| `😀 emoji tag` | `😀 emoji tag` → 删 emoji 和空格 → `emojitag` → `emojitag` | `headers-emojitag.txt` |
+| `  Trim Me  ` | `  Trim Me  ` → 删空格 → `TrimMe` → `trimme` | `headers-trimme.txt` |
+| `テスト環境`（日文） | `テスト環境` → 保留日文 → `テスト環境` → `テスト環境` | `headers-テスト環境.txt` ✅ |
+| `테스트환경`（韩文） | `테스트환경` → 保留韩文 → `테스트환경` → `테스트환경` | `headers-테스트환경.txt` ✅ |
+| `Привет мир`（西里尔） | `Привет мир` → 删空格 → `Приветмир` → `приветмир` | `headers-приветмир.txt` ✅ |
+| `über naïve`（拉丁重音） | `über naïve` → 删空格 → `übernaïve` → `übernaïve` | `headers-übernaïve.txt` ✅ |
+| `café-résumé` | `café-résumé` → 删 `-` → `caférésumé` → `caférésumé` | `headers-caférésumé.txt` ✅ |
+| `生产环境API-v2!测试😀` | `生产环境API-v2!测试😀` → 删 `-` `!` emoji → `生产环境APIv2测试` → `生产环境apiv2测试` | `headers-生产环境apiv2测试.txt` ✅ |
+| `$100€50£25` | `$100€50£25` → 删货币符号 → `1005025` → `1005025` | `headers-1005025.txt` |
+| `[foo]{bar}(baz)` | `[foo]{bar}(baz)` → 删括号 → `foobarbaz` → `foobarbaz` | `headers-foobarbaz.txt` |
+| `😀😁😂`（纯 emoji） | `😀😁😂` → 全删 → `` → `` → `headers-.txt` | `headers-.txt` ⚠️ |
 
 ### C.4 需要注意的命名陷阱
 
-**陷阱 1：纯非 ASCII Tag 名会生成 `headers-.txt`**
+**陷阱 1：纯 emoji/纯符号 Tag 名会生成 `headers-.txt`**
 
-如果 Tag 名完全由中文、日文、emoji 等非 ASCII 字符组成，清洗后会得到空字符串，最终文件名为 `headers-.txt`。这意味着：
+如果 Tag 名**完全由 emoji 或非字母数字符号**组成（如 `😀😁😂`、`$€£¥`），正则会把所有字符全部删除，得到空字符串，最终文件名是 `headers-.txt`。
 
-- 多个纯中文 Tag（如"生产环境"和"测试环境"）会**共享同一个 `headers-.txt` 文件**，互相覆盖
-- 如果不小心创建了名为 `-` 的 Tag，它也会映射到同一个 `headers-.txt`
+- **不会**出现纯中文 Tag 生成 `headers-.txt` 的情况——中文属于 Unicode Letter，会被完整保留
+- 多个纯 emoji Tag（如 `😀` 和 `🎉`）会**共享同一个 `headers-.txt` 文件**，互相覆盖
 
 **陷阱 2：仅大小写不同的 Tag 名会冲突**
 
-清洗时会 `.lower()`，所以 Tag `API` 和 `api` 和 `Api` 都会生成 `headers-api.txt`，指向同一个文件。
+清洗时会 `.lower()`（Unicode -aware），所以：
+- Tag `API`、`api`、`Api` → 都生成 `headers-api.txt`
+- Tag `Привет`、`привет` → 都生成 `headers-привет.txt`
 
-**陷阱 3：标点和空格被完全移除导致意外合并**
+**陷阱 3：标点、空格、下划线被完全移除导致意外合并**
 
-- Tag `user auth` 和 `user-auth` 和 `user_auth` 和 `UserAuth` 都会生成 `headers-userauth.txt`
-- Tag `api-v2` 和 `apiv2` 都会生成 `headers-apiv2.txt`
+以下所有 Tag 都会生成同一个文件 `headers-userauth.txt`：
+- `user auth`（空格被删）
+- `user-auth`（连字符被删）
+- `user_auth`（下划线被删）
+- `UserAuth`（直接 `.lower()`）
 
-**陷阱 4：同 watch 的多 tag 合并顺序不确定**
+类似地，`api-v2` 和 `apiv2` 都生成 `headers-apiv2.txt`。
+
+**陷阱 4：多 Tag 合并顺序不确定**
 
 如果一个 watch 被同时打上 `tagA` 和 `tagB`，代码通过 `tags.items()` 遍历 tag 字典（Python 3.7+ 字典保持插入顺序）。如果两个 tag 的 headers.txt 中有同名 header，**后插入的 tag 的值会覆盖先插入的 tag**。而 tag 的插入顺序由创建顺序决定，用户无法在 UI 中控制。
+
+**陷阱 5：非 ASCII 文件名的跨平台兼容性**
+
+中文、日文、西里尔字母等会被完整保留在文件名中。这在大多数现代操作系统上没问题，但需要注意：
+- Windows 传统 FAT32 不支持 Unicode 文件名（但 NTFS 支持）
+- 通过非 Unicode FTP/SMB 协议传输时文件名可能乱码
+- 某些 shell 脚本如果假设文件名是纯 ASCII 可能出错
+
+这与 `[\W_]` 正则最初意图"生成纯 ASCII 安全文件名"的预期完全相反——该正则在 Python 3 Unicode 模式下并**不能**保证输出是纯 ASCII。
 
 ### C.5 全局 / Watch 级 / Tag 级的路径解析
 
 ```
 datastore/
 ├── headers.txt                              ← 全局（优先级 1）
-├── headers-production.txt                   ← Tag "Production"（优先级 3）
+├── headers-production.txt                   ← Tag "Production"
 ├── headers-myapikey.txt                     ← Tag "My API Key"
-├── headers-.txt                             ← 纯中文/非 ASCII Tag（⚠️ 所有中文 tag 共享）
+├── headers-生产环境.txt                       ← Tag "生产环境" ✅（中文被保留）
+├── headers-测试环境.txt                       ← Tag "测试环境" ✅（中文被保留）
+├── headers-テスト.txt                         ← Tag "テスト" ✅（日文被保留）
+├── headers-.txt                             ← 纯 emoji/纯符号 Tag（⚠️ 共享）
 ├── 1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d/
 │   ├── watch.json                           ← Watch 元数据
 │   └── headers.txt                          ← Watch 级（优先级 2）
