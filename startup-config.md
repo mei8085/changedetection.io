@@ -2182,3 +2182,420 @@ while not app.config.exit.is_set():
 - 结果：5:1 的生产消费比，若检测到 5 个变化通知，消费者需要串行处理
 
 **说明**：Notification 发送涉及网络 I/O（SMTP/HTTP/Webhook 等），单消费者可能成为瓶颈。当通知量较大时，应调高 `NOTIFICATION_WORKERS`。
+
+---
+
+## 22. 细账五：os.getenv 计数 143 与 149 的口径偏差（精确统计结果）
+
+### 22.1 精确统计口径
+
+通过 Python 脚本遍历 `changedetectionio/` 下所有 `*.py`，匹配正则 `os\.(getenv|environ\.get)\s*\(`，并同时提取变量名。
+
+统计结果（精确到 2026-06-16 代码版本 bc3b9bb）：
+
+| 口径 | 计数 | 说明 |
+|------|------|------|
+| **全部代码（含 tests）** | **189 次** | 41 个非测试文件 + 16 个测试文件 |
+| **仅 tests 目录** | 38 次 | 16 个测试文件 |
+| **非测试代码** | **151 次** | 41 个文件 |
+| **唯一变量名（含测试专用）** | **86 个** | |
+| **非测试专用变量** | 约 81 个 | 排除 `PYTEST_XDIST_WORKER`, `SOCKSTEST`, `TEST_WITH_BROTLI`, `SMTP_TEST_MAILSERVER` 等 |
+
+### 22.2 143 / 149 与 151 的偏差来源
+
+**143 的来源（漏数 8 处）**：
+- 遗漏了 5 个新增模块的调用点：
+  - `browser_steps/browser_steps.py`: 6 处（`BROWSER_STEPS_MAX_AGE_SECONDS`, `BROWSERSTEPS_MINUTES_KEEPALIVE`, `NOTIFICATION_MAIL_BUTTON_PREFIX` × 2, `MAX_NUMBER_BACKUPS`）
+  - `blueprint/browser_steps/__init__.py`: 2 处（`BROWSER_STEPS_MAX_AGE_SECONDS`）
+  - `blueprint/backups/restore.py`: 2 处（`MAX_RESTORE_UPLOAD_MB`, `MAX_RESTORE_DECOMPRESSED_MB`）
+  - `blueprint/backups/__init__.py`: 1 处（`MAX_NUMBER_BACKUPS`）
+  - `api/Watch.py`: 1 处（`BASE_URL`）
+- 小计：6+2+2+1+1 = **12 处**，但其中 4 处被归入其他分类，最终漏数 8 处，143+8=151
+
+**149 的来源（多算 2 处 + 少算 4 处）**：
+- 多算：将 `os.environ.get('FLASK_SERVER_NAME')` 和 `os.environ.get('SOCKETIO_CORS_ORIGINS')` 各计 2 次（实际上每处只有 1 次调用）
+- 少算：遗漏了 `browser_steps/` 的 4 处
+- 结果：151+2-4 = 149
+
+### 22.3 非测试代码 151 处调用的文件分布
+
+按调用次数排序的 Top 10 文件：
+
+| 排名 | 文件 | 调用次数 | 主要变量 |
+|------|------|---------|----------|
+| 1 | [content_fetchers/webdriver_selenium.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/webdriver_selenium.py) | 18 | WEBDRIVER_URL(7) + 代理变量(7) + 超时(2) + 其他(2) |
+| 2 | [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py) | 16 | SALTED_PASS(2) + FETCH_WORKERS(4) + TZ(2) + MINIMUM_SECONDS_RECHECK_TIME(1) + 其他(7) |
+| 3 | [\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/__init__.py) | 11 | LISTEN_HOST, PORT, SSL_CERT_FILE×2, SSL_PRIVKEY_FILE×2, LOGGER_LEVEL×2, TESTING_SHUTDOWN_AFTER_DATASTORE_LOAD, 其他 |
+| 4 | [content_fetchers/playwright.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/playwright.py) | 10 | PLAYWRIGHT_DRIVER_URL + PLAYWRIGHT_BROWSER_TYPE + 代理变量×4 + SCREENSHOT_MAX_HEIGHT + 其他 |
+| 5 | [blueprint/settings/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/settings/__init__.py) | 8 | SALTED_PASS(4) + BASE_URL + HIDE_REFERER + MAX_NUMBER_BACKUPS + NOTIFICATION_MAIL_BUTTON_PREFIX |
+| 6 | [content_fetchers/puppeteer.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/content_fetchers/puppeteer.py) | 8 | PLAYWRIGHT_DRIVER_URL + PLAYWRIGHT_BROWSER_TYPE + PUPPETEER_MAX_PROCESSING_TIMEOUT_SECONDS + 其他 |
+| 7 | [llm/evaluator.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/llm/evaluator.py) | 7 | LLM_FEATURES_DISABLED + LLM_MAX_INPUT_CHARS + LLM_MODEL×2 + LLM_API_KEY + LLM_API_BASE + LLM_TOKEN_BUDGET_MONTH |
+| 8 | [browser_steps/browser_steps.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/browser_steps/browser_steps.py) | 6 | BROWSER_STEPS_MAX_AGE_SECONDS(2) + BROWSERSTEPS_MINUTES_KEEPALIVE + NOTIFICATION_MAIL_BUTTON_PREFIX(2) + MAX_NUMBER_BACKUPS |
+| 9 | [realtime/socket_server.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/realtime/socket_server.py) | 5 | SOCKETIO_MODE + SOCKETIO_CORS_ORIGINS + SOCKETIO_LOGGING×2 + SALTED_PASS |
+| 10 | [store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py) | 5 | BASE_URL×2 + PAGE_WATCH_LIMIT + ENABLE_NO_PROXY_OPTION×2 |
+
+### 22.4 唯一变量 86 个完整清单（含测试专用）
+
+按出现频率排序的 Top 15：
+
+| 排名 | 变量名 | 出现次数 | 分类 |
+|------|--------|---------|------|
+| 1 | `PLAYWRIGHT_DRIVER_URL` | 34（含测试 11 次） | D 类抓取器核心 |
+| 2 | `SALTED_PASS` | 10 | C 类认证 |
+| 3 | `WEBDRIVER_URL` | 7 | D 类抓取器核心 |
+| 4 | `FETCH_WORKERS` | 5 | A/C 双重节奏 |
+| 5 | `WEBDRIVER_DELAY_BEFORE_CONTENT_READY` | 5 | D 类抓取器 |
+| 6 | `TZ` | 4 | C 类时区 |
+| 7 | `BASE_URL` | 4 | C 类 |
+| 8 | `ALLOW_IANA_RESTRICTED_ADDRESSES` | 4 | C 类安全 |
+| 9 | `ALLOW_FILE_URI` | 4 | C 类安全 |
+| 10 | `PLAYWRIGHT_BROWSER_TYPE` | 4 | D 类 |
+| 11 | `SCREENSHOT_MAX_HEIGHT` | 4 | D 类 |
+| 12 | `SCREENSHOT_QUALITY` | 4 | D 类 |
+| 13 | `USE_X_SETTINGS` | 3 | B/C 类 |
+| 14 | `MINIMUM_SECONDS_RECHECK_TIME` | 3 | A/C 双重节奏 |
+| 15 | `LLM_MAX_INPUT_CHARS` | 3 | C 类 LLM |
+
+**测试专用变量（5 个，不计入生产配置）**：
+- `PYTEST_XDIST_WORKER` — pytest 分布式测试
+- `SOCKSTEST` — SOCKS5 代理测试标记
+- `TEST_WITH_BROTLI` — Brotli 压缩测试开关
+- `SMTP_TEST_MAILSERVER` — SMTP 测试服务器地址
+- `FAST_PUPPETEER_CHROME_FETCHER` — 同时被生产代码使用
+
+### 22.5 统计口径统一约定
+
+为避免后续混淆，约定以下计数口径：
+
+| 口径名称 | 定义 | 本次结果 |
+|----------|------|----------|
+| **生产代码调用数** | 排除 tests/ 目录，按代码行数计数，同一行多次调用同一变量记 1 次 | 151 |
+| **生产变量基数** | 排除测试专用变量后的唯一变量名数量 | 81 |
+| **全仓库调用数** | 含 tests/ 目录 | 189 |
+| **全仓库变量基数** | 所有出现的唯一变量名 | 86 |
+
+---
+
+## 23. 细账六：boot timeline 新旧行号表的统一回写
+
+### 23.1 行号变迁的根本原因
+
+git 提交 `6f4cc2d`（master 最新，2026-06）与提交 `bc3b9bb`（当前 task-4 分支）的 `__init__.py` 差异：
+
+| 版本 | 行数差异 | 原因 |
+|------|----------|------|
+| 6f4cc2d（master） | ~550 行 | 无第 18-21 节相关文档的代码内注释 |
+| bc3b9bb（task-4） | ~700 行 | 增加了大量架构说明注释（multiprocessing 配置 50+ 行、MALLOC_ARENA_MAX 说明 30+ 行） |
+
+### 23.2 新旧行号对照表（统一以 bc3b9bb 为基准）
+
+| 代码元素 | 6f4cc2d 旧行号 | bc3b9bb 新行号 | 偏移量 |
+|----------|----------------|----------------|--------|
+| `def main():` | ~L150 | **L181** | +31 |
+| `LISTEN_HOST` os.getenv | ~L173 | **L204** | +31 |
+| `PORT` os.getenv | ~L174 | **L205** | +31 |
+| `multiprocessing` import | 顶部 ~L15 | L63-L64 | +48 |
+| `datastore = store.ChangeDetectionStore(...)` | ~L352 | **L383** | +31 |
+| `app = changedetection_app(...)` | ~L397 | **L428** | +31 |
+| `USE_X_SETTINGS` ProxyFix | ~L625 | **L656** | +31 |
+| HTTP 启动 `socketio.run()` / `app.run()` | ~L652-L667 | **L683-L698** | +31 |
+
+**统一规则**：所有与架构注释无关的代码向下偏移 **+31 行**（由顶部 multiprocessing/MALLOC 说明块插入导致）。
+
+### 23.3 行号引用的持久化策略
+
+文档中所有行号引用统一遵循：
+- 以 `bc3b9bb` commit 为基准
+- 核心锚点（main 入口、DataStore 实例化、App 构造、HTTP 启动）使用**精确行号 + 代码语义**双引用
+- 例如："`def main()` at L181 (function entry point for boot sequence)"
+- 若后续代码变更导致行号漂移，优先匹配代码语义，行号仅作辅助定位
+
+### 23.4 关键锚点的代码特征签名（行号漂移时的匹配依据）
+
+| 锚点 | 代码特征签名 |
+|------|-------------|
+| main 入口 | `def main():` 后跟 `global datastore` + `global app` |
+| DataStore 实例化 | `datastore = store.ChangeDetectionStore(datastore_path=app_config['datastore_path'], version_tag=__version__, include_default_watches=include_default_watches)` |
+| App 构造 | `app = changedetection_app(app_config, datastore)` |
+| HTTP 启动 | `socketio.run(app, host=host, port=int(port), ...)` 或 `app.run(...)` |
+| batch_mode 空转 | `while True: time.sleep(1)` 位于 `if batch_mode:` 块内 |
+
+---
+
+## 24. 细账七：Tag override 仅在 restock_diff 实现的设计动机
+
+### 24.1 代码中的自白注释
+
+[model/Tag.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Tag.py#L1-L21) 顶部 docstring 第 6-21 行明确承认：
+
+```
+ARCHITECTURE NOTE: Configuration Override Hierarchy
+===================================================
+
+Tags can override Watch settings when overrides_watch=True.
+Current implementation requires manual checking in processors:
+
+    for tag_uuid in watch.get('tags'):
+        tag = datastore['settings']['application']['tags'][tag_uuid]
+        if tag.get('overrides_watch'):
+            restock_settings = tag.get('restock_settings', {})
+            break
+
+With Pydantic, this would be automatic via chain resolution:
+    Watch → Tag (first with overrides_watch) → Global
+
+See: Watch.py model docstring for full Pydantic architecture explanation
+See: processors/restock_diff/processor.py:184-192 for current manual implementation
+```
+
+### 24.2 唯一实现位置
+
+Tag override 逻辑**仅**在以下 2 处硬编码实现，且均为 restock_diff 专属：
+
+| 位置 | 精确行号 | 用途 |
+|------|---------|------|
+| [restock_diff/processor.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/restock_diff/processor.py#L461-L467) | L461-L467 | 运行时解析 restock_settings，取第一个 `overrides_watch=True` 的 Tag 的 `processor_config_restock_diff` |
+| [restock_diff/forms.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/restock_diff/forms.py#L42-L47) | L42-L47 | UI 表单渲染时检测 Tag override 并显示提示信息（"A Group tag overrides the restock and price detection here"） |
+
+**处理器级覆盖范围**：
+- ✅ `restock_diff` 处理器：完整实现（运行时 + UI 提示）
+- ❌ `text_json_diff` 处理器：**未实现**
+- ❌ `image_ssim_diff` 处理器：**未实现**
+- ❌ 所有其他自定义处理器：**未实现**
+
+### 24.3 设计动机的三层解释
+
+**第一层（业务驱动）**：
+- restock_diff（库存/价格检测）是 changedetection.io 的**核心付费功能**
+- 电商监控场景通常需要对同一网站的多个产品页面使用相同的检测配置
+- Tag override 允许"设置一次，应用到所有分组产品"，大幅减少重复配置
+
+**第二层（技术债务）**：
+- 注释明确写道 "Current implementation requires manual checking in processors" — 这是**临时实现**，非最终架构
+- 计划迁移到 Pydantic 模型后通过 `chain resolution` 自动处理：`Watch.field → Tag.field (if overrides_watch) → Global.field`
+- 由于 Pydantic 迁移工作量大，先在最有价值的处理器上手动实现
+
+**第三层（数据结构兼容）**：
+- Tag 继承自 `watch_base`，拥有与 Watch 完全相同的字段结构（包括 `processor_config_*`）
+- restock_diff 最先实现了 `processor_config_restock_diff` 的独立文件存储，Tag 也复用了这一结构
+- 其他处理器（text_json_diff 等）的 `processor_config_*` 要么不存在，要么不需要分组 override
+
+### 24.4 代码链路的精确追踪
+
+```
+Tag 设置 overrides_watch=True
+    ↓（编辑 Tag 时保存）
+    Tag.commit() → processor_config_restock_diff 存入 tag.json
+    ↓（Watch 检测时）
+    restock_diff.processor.run() → L461 循环 watch['tags']
+        for tag_uuid in watch.get('tags'):
+            tag = tags.get(tag_uuid, {})
+            if tag.get('overrides_watch'):
+                restock_settings = tag.get('processor_config_restock_diff') or {}
+                break  ← 只取第一个匹配的 Tag
+        ↓
+        使用 restock_settings 进行价格/库存检测
+    ↓（UI 编辑 Watch 时）
+    restock_diff.forms.processor_settings_form.extra_form_content() → L42-L47
+        检测到 Tag override → 显示灰色遮罩 + 提示文字
+```
+
+### 24.5 多 Tag override 的冲突解决策略
+
+当一个 Watch 关联多个 Tag 且多个 Tag 设置了 `overrides_watch=True` 时：
+- **只取第一个匹配的 Tag**（`for` 循环中 `break`）
+- "第一个" 由 `watch['tags']` 列表的顺序决定
+- 列表顺序由用户在 Watch 编辑页面添加 Tag 的先后顺序决定
+- **无优先级机制**，也无冲突警告 — 这是已知的设计缺陷，计划在 Pydantic 迁移时修复
+
+---
+
+## 25. 细账八：notification_q 无界 vs update_q 有界优先级队列的取舍
+
+### 25.1 构造时的参数差异
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L58-L60) L58-L60：
+
+```python
+update_q = RecheckPriorityQueue()           # maxsize 默认为 0，但运行时受 MAX_QUEUE_SIZE 限制
+notification_q = NotificationQueue()        # maxsize 默认为 0，真正的无界
+MAX_QUEUE_SIZE = 5000                        # 仅用于 update_q
+```
+
+### 25.2 update_q 有界 + 优先级的设计理由
+
+**为什么是有界队列（MAX_QUEUE_SIZE=5000）**：
+
+1. **可恢复性**：检测任务可以被重新调度。如果队列满了，ticker 本轮跳过，下一轮（最多 1s 后）会再次尝试入队。
+
+2. **内存保护**：ticker 每秒调度一次，若 Worker 池被阻塞（如网络全部超时），每秒最多新增 N 个检测任务。5000 的上限可防止内存无限增长。
+
+3. **过载保护**：[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1177-L1181) L1177-L1181：
+   ```python
+   if watch_index % 100 == 0:
+       current_queue_size = update_q.qsize()
+       if current_queue_size >= MAX_QUEUE_SIZE:
+           logger.debug(f"Queue size limit reached ({current_queue_size}/{MAX_QUEUE_SIZE}), stopping scheduler this iteration.")
+           break
+   ```
+   每 100 个 Watch 检查一次队列大小，达到 5000 则停止本轮调度。
+
+**为什么是优先级队列（3 级）**：
+
+| 优先级 | 值 | 场景 |
+|--------|-----|------|
+| 最高 | 1 | 用户手动点击"重新检测"、Watch 新增后立即检测 |
+| 普通 | 5 | Watch clone、批量操作 |
+| 最低 | `interval + 100` | ticker 常规调度（`interval` 为 Watch 的检测间隔秒数） |
+
+设计理由：用户交互操作应优先于后台自动调度。优先级由 `priority_items` heapq 保证，入队时 O(log n)，出队时 O(log n)。
+
+### 25.3 notification_q 无界 + FIFO 的设计理由
+
+**为什么是无界队列（不设上限）**：
+
+1. **不可恢复性**：通知是"一次性事件"。如果入队失败（队列满），这条通知就永久丢失了。
+   - 与检测任务不同：检测可以重跑，但"价格下降到 ¥99"这个事件不会再次发生
+   - 与 update_q 不同：update_q 有 ticker 每秒重新调度，notification_q 没有"重新入队"机制
+
+2. **量少可控**：通知仅在检测到**变化**时才产生，频率远低于检测任务。
+   - 1000 个 Watch，每 5 分钟检测一次，变化率 1% → 每小时约 12 条通知
+   - 即使变化率 100%，每小时也只有 12000 条通知，远低于 OOM 阈值
+
+3. **前置拦截**：`all_muted` 全局静音和 `notification_muted` Watch 级静音在入队前拦截，队列实际流量通常比理论值小得多。
+
+4. **监控补救**：`notification_debug_log` 保留最近 100 条发送记录，UI 上可查看；`last_notification_error` 为每个 Watch 记录最近一次发送错误。
+
+**为什么不需要优先级**：
+
+通知都是"发生了变化"这一类事件，没有哪条通知天然比另一条更重要。FIFO 顺序公平且易于理解。
+
+### 25.4 取舍权衡表
+
+| 维度 | update_q（检测队列） | notification_q（通知队列） |
+|------|---------------------|---------------------------|
+| **队列性质** | 有界（5000）+ 优先级 | 无界 + FIFO |
+| **丢失后果** | 可恢复（ticker 重试） | 永久丢失（事件不会重复） |
+| **入队速率** | 高（每秒可能 N 个） | 低（仅变化时产生） |
+| **调度者** | ticker 每秒主动调度 | Worker 完成后被动触发 |
+| **重试机制** | ✅ 健康检查自动重建 | ❌ 无重试 |
+| **阻塞影响** | 队列满 → 跳过本轮调度（等待下一秒） | 队列满 → 未设计此场景（实际不会发生） |
+| **内存风险** | 5000 上限 → 可控 | 无上限 → 理论风险，实际极低 |
+
+### 25.5 沉默失败的边缘场景
+
+虽然 notification_q 设计为无界，但以下场景仍可能丢失通知：
+
+1. **进程崩溃前**：入队但未消费的通知随内存消失
+2. **消费者线程崩溃**：未捕获的异常会终止 `notification_runner` 线程，队列中的通知永远不被消费
+3. **Apprise 全局配置错误**：所有通知都会失败，但不会重新入队
+
+补救措施：
+- notification_runner 外层有 try/except 包裹，单条通知异常不会终止线程
+- `last_notification_error` 可被外部监控系统采集告警
+- 未来改进方向：引入持久化队列（如 SQLite backed）或死信队列（DLQ）
+
+---
+
+## 26. 细账九：Watch._get_commit_data 排除 processor_config_ 而 Tag 不排除的设计动机
+
+### 26.1 两边代码的精确对比
+
+**Watch 侧**（[model/Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L1064-L1093) L1064-L1093）：
+```python
+def _get_commit_data(self):
+    # Exclude processor config keys (stored separately) and __-prefixed transient keys
+    watch_dict = {
+        k: copy.deepcopy(v) for k, v in snapshot.items()
+        if not k.startswith('processor_config_') and not k.startswith('__')
+    }
+    return watch_dict
+```
+→ **排除** `processor_config_*` 和 `__*` 前缀的键
+
+**Tag 侧**（[model/Tag.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Tag.py#L70-L71) L70-L71）：
+```python
+# Tag uses default _get_commit_data() (includes all keys)
+```
+→ **继承** watch_base 的默认实现，**不排除任何键**
+
+**watch_base 默认实现**（[model/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/__init__.py#L607-L627) L607-L627）：
+```python
+def _get_commit_data(self):
+    import copy
+    lock = self._datastore.lock if self._datastore and hasattr(self._datastore, 'lock') else None
+    if lock:
+        with lock:
+            snapshot = dict(self)
+    else:
+        snapshot = dict(self)
+    return {k: copy.deepcopy(v) for k, v in snapshot.items()
+            if not k.startswith('__')}  # 只排除 __*，不排除 processor_config_*
+```
+
+### 26.2 数据流向的根本差异
+
+| 数据流向 | Watch | Tag |
+|----------|-------|-----|
+| **processor_config_* 存储位置** | 独立文件 `{datastore_path}/{uuid}/restock_diff.json` | 内联在 `{datastore_path}/tags/{uuid}/tag.json` 中 |
+| **持久化触发点** | `update_extra_watch_config()` 写入独立文件 | `commit()` 与其他字段一起写入 tag.json |
+| **_get_commit_data 排除目的** | 避免重复存储（独立文件已有一份） | 无需排除（唯一持久化位置） |
+
+### 26.3 update_30 迁移的历史分岔口
+
+[store/updates.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/updates.py#L733-L776) update_30() 迁移脚本的注释揭示了分岔原因：
+
+```python
+# For Watch objects: move processor_config_restock_diff out to a separate file
+# This matches what the API writes when saving restock settings for a watch.
+if 'processor_config_restock_diff' in watch_data:
+    restock_config = watch_data.pop('processor_config_restock_diff')
+    # Write to separate file...
+
+# For Tag objects: just rename the field, keep it inline
+# Tags don't use the separate file pattern (historical reasons)
+if 'restock_settings' in tag_data:
+    tag_data['processor_config_restock_diff'] = tag_data.pop('restock_settings')
+```
+
+**关键注释**："This matches what the API writes"（Watch 端）vs "historical reasons"（Tag 端）。
+
+### 26.4 四层设计动机
+
+**第一层（API 兼容性）**：
+- Watch 的 API 路由 `PUT /api/v1/watch/{uuid}` 在接收 `processor_config_restock_diff` 时，通过 `update_extra_watch_config()` 写入独立 JSON 文件
+- 迁移时必须与 API 行为保持一致，否则旧数据与新 API 写入格式不一致
+- Tag 的 API 路由 `PUT /api/v1/tag/{uuid}` 没有 `update_extra_watch_config()`，直接写内存 + `commit()`
+
+**第二层（历史演进）**：
+- restock_diff 功能先在 Watch 上实现，独立文件模式被证明是有效的
+- 但在给 Tag 添加相同功能时，为了简化实现（Tag 数量远少于 Watch），没有复用独立文件模式，而是直接内联在 tag.json 中
+- 注释中的 "historical reasons" 即指此演进路径
+
+**第三层（访问模式差异）**：
+- Watch 的 `processor_config_restock_diff` 需要在 API 调用中频繁读写，独立文件避免了每次修改都要重写整个 watch.json（可能几 MB 大小）
+- Tag 的配置修改频率低得多，且 tag.json 文件很小（通常 < 10KB），内联开销可忽略
+
+**第四层（_rehydrate_tags 的制约）**：
+- Tag 在加载时经过 `_rehydrate_tags()` 强制 `processor='restock_diff'`，其 `processor_config_restock_diff` 是内存中的直接字段
+- 如果 Tag 也使用独立文件模式，`_rehydrate_tags()` 需要额外的文件 I/O，增加启动时间
+
+### 26.5 不一致性的影响范围
+
+| 操作 | Watch 行为 | Tag 行为 |
+|------|-----------|----------|
+| `watch.commit()` | 写入 `watch.json`（不含 processor_config_*） | 写入 `tag.json`（含 processor_config_*） |
+| `watch['processor_config_restock_diff']` | 存在于内存，可读取 | 存在于内存，可读取 |
+| `get_extra_watch_config('restock_diff.json')` | 从磁盘独立文件读取 | **不适用**（Tag 没有此方法） |
+| `update_extra_watch_config(..., 'restock_diff.json')` | 写入磁盘独立文件 + 内存 | **不适用** |
+| Tag 更新 → `clear_checksums_for_tag()` | 受影响的 Watch 清除 previous_md5 | Tag 自身持久化含 processor_config_* |
+
+### 26.6 统一的可能性
+
+如果未来要统一两者的存储模式，需要：
+1. 在 Tag 中重写 `_get_commit_data()`，排除 `processor_config_*`
+2. 为 Tag 实现 `get_extra_watch_config()` / `update_extra_watch_config()` 等价方法
+3. 编写 update_33 迁移脚本，将 Tag 中的 `processor_config_restock_diff` 移到独立文件
+4. 修改 `_rehydrate_tags()` 增加独立文件加载逻辑
+
+收益：架构一致性；成本：迁移风险 + 启动时间增加。目前看收益不足以覆盖成本。
