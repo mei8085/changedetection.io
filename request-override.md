@@ -557,3 +557,257 @@ requests (Python HTTP 客户端)      ← 完全控制 HTTP 事务的每个字�
 | 通过 headers.txt 添加运维级 header | ✅ 正常生效 | ✅ 正常生效 | ❌ 静默丢弃 |
 
 **核心结论**：如果用户需要自定义 method / body，**必须使用 `html_requests` 后端**。浏览器类后端（Playwright/Puppeteer/Selenium）在架构上无法支持非 GET 的首次导航请求。如果用户需要自定义 headers 且使用浏览器后端，只能选择 Playwright 或 Puppeteer（Selenium 连 headers 都不支持）。
+
+---
+
+## 附录 B：requests fetcher 重定向链逐跳保护的设计动机
+
+### B.1 代码位置
+
+[content_fetchers/requests.py#L93-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/content_fetchers/requests.py#L93-L127)
+
+```python
+# 初始请求
+if is_url_private_or_parser_confused(url):
+    raise Exception(f"Fetch blocked: ...")
+
+r = session.request(..., allow_redirects=False)   # ← 禁用 requests 库自带的重定向
+
+# 手动跟随重定向，逐跳校验
+current_url = url
+for _ in range(10):
+    if not r.is_redirect:
+        break
+    location = r.headers.get('Location', '')
+    redirect_url = urljoin(current_url, location)
+    if not allow_iana_restricted:
+        if is_url_private_or_parser_confused(redirect_url):
+            raise Exception(f"Redirect blocked: ...")
+    current_url = redirect_url
+    r = session.request('GET', redirect_url,   # ← 重定向统一用 GET，丢 body
+                        headers=request_headers,
+                        ...,
+                        allow_redirects=False)
+else:
+    raise Exception("Too many redirects")
+```
+
+代码注释在 L107-108 已经点出了动机：
+
+> "Manually follow redirects so each hop's resolved IP can be validated, preventing SSRF via an open redirect on a public host."
+
+但注释背后的攻击场景和为什么要双重校验（初始 URL + 每一跳 redirect）需要展开分析。
+
+### B.2 第一层防护：初始 URL 的 SSRF 检查
+
+[is_url_private_or_parser_confused()](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/validate_url.py#L112-L126)
+
+```python
+def is_url_private_or_parser_confused(url):
+    if '\\' in url:
+        return True          # 反斜杠 —— 解析器差异攻击向量
+    for hostname in extract_url_hostnames(url):
+        if is_private_hostname(hostname):
+            return True      # 任一解析器认为是私有 IP → 阻断
+    return False
+```
+
+这一层在初始请求发出前校验用户输入的 URL，防止：
+
+1. **直接 SSRF**：用户输入 `http://127.0.0.1:8080/admin`，试图让服务器请求自己的内网服务。
+2. **反斜杠解析器差异攻击（GHSA-rph4-96w6-q594）**：形如 `http://INTERNAL:8888\@PUBLIC/` 的 URL，Python 标准库 `urlparse` 会解析出 hostname 为 `PUBLIC`（认为 `@PUBLIC` 是路径的一部分），但 `urllib3/requests` 实际连接时会连接到 `INTERNAL`。如果只信任 urlparse 的结果，攻击者可以绕过 SSRF 检查访问内网。
+3. **DNS Rebinding（TOCTOU 攻击）**：用户提交的域名在表单验证时解析为公共 IP，但在实际请求时 DNS 返回私有 IP。注意 [is_private_hostname()](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/validate_url.py#L61-L80) 的注释明确说它**不使用 LRU 缓存**，每次调用都重新 DNS 解析——这是专门为 fetch-time 设计的，在请求发出前最后一刻做 DNS 解析，降低 DNS 重绑定的时间窗口。
+
+### B.3 第二层防护：逐跳重定向校验
+
+这是最容易被忽略的一层。为什么不直接用 `allow_redirects=True` 让 requests 库自动跟随？因为：
+
+**攻击场景：开放重定向作为跳板**
+
+```
+用户输入:   https://trusted-public-site.com/redirect?target=http://169.254.169.254/latest/meta-data/
+               ↓ (通过初始 SSRF 检查 — trusted-public-site.com 是公共 IP)
+第 1 跳:     302 Location: http://169.254.169.254/latest/meta-data/
+               ↓ (如果 requests 自动跟随，就会直接请求 EC2 元数据服务，泄露 IAM 凭证)
+第 2 跳:     200 (敏感数据)
+```
+
+`trusted-public-site.com` 是合法公共网站，但存在一个开放重定向漏洞（如 `/redirect?target=...`）。初始检查只校验了第 1 跳的 URL（公共 IP，放行），如果 requests 自动跟随，**后续跳完全不受校验**，最终请求会打到内网服务。
+
+逐跳校验确保**重定向链中的每一个 Location** 都重新经过 SSRF 检查，即使攻击者通过合法公共站点跳板也无法到达私有网络。
+
+### B.4 为什么是 `range(10)` 跳数上限？
+
+Python `requests` 库默认的 `max_redirects` 也是 **30**（在 `requests/adapters.py` 中 `DEFAULT_RETRIES` 相关配置）。changedetection.io 收紧到 **10 跳**，原因：
+
+1. **防止重定向循环 DoS**：恶意站点可以构造 A→B→A→B→... 的循环重定向，如果没有跳数上限，worker 线程会被永久卡住，导致整个调度队列阻塞。
+2. **合理业务边界**：合法网站几乎不会超过 5 跳重定向（通常是 http→https → www 规范化 → 单点登录回调 → 最终页面）。10 跳对所有合法场景都足够。
+3. **比 requests 默认更严格**：30 跳的循环会消耗显著的网络 I/O 时间，10 跳在安全性和可用性之间取平衡。
+
+### B.5 为什么重定向要退化为 GET、丢 body？
+
+代码 L120：`r = session.request('GET', redirect_url, ...)`
+
+这符合 RFC 7231（HTTP/1.1 语义）的建议：
+- 301/302/303：客户端**可以**将 POST 改为 GET（303 明确要求改为 GET）
+- 307/308：**必须**保持原 method
+
+changedetection.io 没有区分 301/302/303/307/308，统一用 GET。这是务实的选择：
+- changedetection.io 的主要场景是 GET 请求（抓取网页内容），method 保持不是高优先级需求
+- 如果传递 body，可能泄露 POST body 给第三方重定向目标（安全隐患）
+- 实现简单，不需要维护额外的状态判断
+
+### B.6 SSRF 防护链路总览
+
+```
+用户提交 URL
+    │
+    ▼
+表单验证 is_safe_valid_url()               ← 第一道门：URL 格式 + 协议 + DNS 预检（可缓存）
+    │
+    ▼
+Fetch 前 is_url_private_or_parser_confused  ← 第二道门：fetch-time DNS 重新解析 + 双解析器校验
+    │
+    ▼
+发起 HTTP 请求 (allow_redirects=False)
+    │
+    ▼
+收到 3xx 响应
+    │
+    ▼
+每一跳 is_url_private_or_parser_confused    ← 第三道门：逐跳重定向校验，防止开放重定向跳板
+    │（最多 10 跳）
+    ▼
+非 3xx 响应 → 处理内容
+```
+
+### B.7 可绕过点与局限
+
+1. **DNS Rebinding 的时间窗口**：`is_url_private_or_parser_confused` 在 `session.request()` **之前**做 DNS 解析，而 `requests` 内部会再次做 DNS 解析。两次解析之间仍有一个毫秒级的时间窗口，攻击者如果能精确控制 DNS TTL，可以在两次解析之间切换 IP。这是所有 DNS 级 SSRF 防护的固有缺陷，除非使用自定义 DNS 解析器并缓存结果。
+
+2. **HTTP → HTTPS 重定向后的证书问题**：代码中 `verify=False` 禁用了证书校验，这降低了中间人攻击的防护，但在重定向场景中主要是为了避免自签名证书导致抓取失败，与 SSRF 防护无关。
+
+3. **代理绕过**：如果配置了 SOCKS/HTTP 代理，`is_url_private_or_parser_confused` 检查的是本地 DNS 解析结果，但实际请求通过代理发出——代理可能有不同的 DNS 解析（如代理位于内网）。不过这属于运维配置风险，非代码漏洞。
+
+---
+
+## 附录 C：三级 headers.txt 合并的完整命名规则
+
+### C.1 合并顺序与优先级
+
+[store/__init__.py#get_all_headers_in_textfile_for_watch()](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/store/__init__.py#L900-L934)
+
+合并顺序（后写入覆盖先写入，优先级从低到高）：
+
+| 优先级 | 级别 | 文件路径 | 作用范围 |
+|:---:|------|----------|----------|
+| 1 低 | 全局 | `{datastore_path}/headers.txt` | 所有 watch |
+| 2 中 | Watch 级 | `{watch.data_dir}/headers.txt` | 单个 watch（按 UUID） |
+| 3 高 | Tag 级 | `{datastore_path}/headers-{sanitized_tag}.txt` | 挂载了该 tag 的所有 watch |
+| 4 最高 | settings.headers | `datastore.data['settings']['headers']` | 通过 UI 设置页配置（见调用方顺序） |
+
+每个文件都经过同一个解析函数 `parse_headers_from_text_file()` 读取（逐行解析 `Key: Value` 格式），如果文件不存在则静默跳过。每个文件的解析错误只记录日志，不影响其他文件。
+
+### C.2 Tag 级文件名的精确生成规则
+
+Tag 级 headers.txt 的文件名不是简单的 `tag-title.txt`，而是经过严格清洗的。代码 L926：
+
+```python
+fname = "headers-" + re.sub(r'[\W_]', '', tag.get('title')).lower().strip() + ".txt"
+```
+
+分步拆解：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | `tag.get('title')` | 取 tag 的显示名称 |
+| 2 | `re.sub(r'[\W_]', '', …)` | **移除所有非字母数字字符和下划线** |
+| 3 | `.lower()` | 转为小写 |
+| 4 | `.strip()` | 去除首尾空白（通常已空，但防御性处理） |
+| 5 | 拼接 `"headers-" + 结果 + ".txt"` | 最终文件名 |
+
+正则 `[\W_]` 的含义：
+- `\W`：匹配所有非单词字符（即不是 `[a-zA-Z0-9_]` 的字符），包括空格、标点、符号、中文、emoji 等
+- `_`：因为 `\W` **不匹配下划线**（下划线属于单词字符），所以显式加上 `_` 一并移除
+- 最终效果：**只保留纯 ASCII 字母和数字**，其他一切字符全部删除
+
+### C.3 Tag 名称到文件名的映射示例
+
+| Tag 显示名称 | 清洗过程 | 最终文件名 |
+|-------------|----------|-----------|
+| `Production` | `Production` → `production` | `headers-production.txt` |
+| `My API Key` | `My API Key` → `MyAPIKey` → `myapikey` | `headers-myapikey.txt` |
+| `Dev & Test!` | `Dev & Test!` → `DevTest` → `devtest` | `headers-devtest.txt` |
+| `api_v2` | `api_v2` → `apiv2`（下划线被移除） | `headers-apiv2.txt` |
+| `生产环境` | `生产环境` → ``（中文全部被移除）→ ``（空字符串）→ `headers-.txt` | `headers-.txt` ⚠️ |
+| `Auth-Token: Bearer` | `Auth-Token: Bearer` → `AuthTokenBearer` → `authtokenbearer` | `headers-authtokenbearer.txt` |
+| `😀 emoji tag` | `😀 emoji tag` → `emojitag` → `emojitag` | `headers-emojitag.txt` |
+| `  Trim Me  ` | `  Trim Me  ` → `TrimMe` → `trimme` | `headers-trimme.txt` |
+
+### C.4 需要注意的命名陷阱
+
+**陷阱 1：纯非 ASCII Tag 名会生成 `headers-.txt`**
+
+如果 Tag 名完全由中文、日文、emoji 等非 ASCII 字符组成，清洗后会得到空字符串，最终文件名为 `headers-.txt`。这意味着：
+
+- 多个纯中文 Tag（如"生产环境"和"测试环境"）会**共享同一个 `headers-.txt` 文件**，互相覆盖
+- 如果不小心创建了名为 `-` 的 Tag，它也会映射到同一个 `headers-.txt`
+
+**陷阱 2：仅大小写不同的 Tag 名会冲突**
+
+清洗时会 `.lower()`，所以 Tag `API` 和 `api` 和 `Api` 都会生成 `headers-api.txt`，指向同一个文件。
+
+**陷阱 3：标点和空格被完全移除导致意外合并**
+
+- Tag `user auth` 和 `user-auth` 和 `user_auth` 和 `UserAuth` 都会生成 `headers-userauth.txt`
+- Tag `api-v2` 和 `apiv2` 都会生成 `headers-apiv2.txt`
+
+**陷阱 4：同 watch 的多 tag 合并顺序不确定**
+
+如果一个 watch 被同时打上 `tagA` 和 `tagB`，代码通过 `tags.items()` 遍历 tag 字典（Python 3.7+ 字典保持插入顺序）。如果两个 tag 的 headers.txt 中有同名 header，**后插入的 tag 的值会覆盖先插入的 tag**。而 tag 的插入顺序由创建顺序决定，用户无法在 UI 中控制。
+
+### C.5 全局 / Watch 级 / Tag 级的路径解析
+
+```
+datastore/
+├── headers.txt                              ← 全局（优先级 1）
+├── headers-production.txt                   ← Tag "Production"（优先级 3）
+├── headers-myapikey.txt                     ← Tag "My API Key"
+├── headers-.txt                             ← 纯中文/非 ASCII Tag（⚠️ 所有中文 tag 共享）
+├── 1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d/
+│   ├── watch.json                           ← Watch 元数据
+│   └── headers.txt                          ← Watch 级（优先级 2）
+└── 9f8e7d6c-5b4a-3928-1706-958473625140/
+    ├── watch.json
+    └── headers.txt
+```
+
+### C.6 解析函数 parse_headers_from_text_file() 的格式
+
+文件名虽然叫 `.txt`，但内容格式有严格要求。每个文件是逐行 `Key: Value` 格式，与 HTTP 请求头的文本格式一致：
+
+```
+# 以 # 开头的行是注释
+Authorization: Bearer my-secret-token
+X-Custom-Header: some value
+
+# 空行被忽略
+Accept: application/json
+```
+
+如果某一行没有冒号，该行会被忽略。Value 中可以包含冒号（如 `X-Forwarded-Proto: https` 没问题）。
+
+### C.7 与 settings.headers 的优先级关系
+
+需要特别注意：`get_all_headers_in_textfile_for_watch()` 是**纯文件级**合并，但在调用方 `call_browser()` 中（[processors/base.py#L206-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/3-changedetection.io/changedetectionio/processors/base.py#L206-L208)），完整的合并顺序是：
+
+```python
+request_headers.update(self.watch.get('headers', {}))                  # ① Watch dict 中的 headers
+request_headers.update(self.datastore.get_all_base_headers())          # ② settings.headers（UI 设置页）
+request_headers.update(self.datastore.get_all_headers_in_textfile_for_watch(uuid=...))  # ③ 三级文件
+```
+
+所以最终优先级（后覆盖前）：
+**Watch dict → settings.headers → 全局 headers.txt → Watch 级 headers.txt → Tag 级 headers.txt**
+
+文件级的优先级最高，tag 级是文件级中的最高——运维人员通过文件部署的 header 始终可以覆盖用户在 UI 中的任何配置。这是一种"运维控制"的设计取舍：允许运维团队在不改动数据库的情况下，通过文件系统强制注入安全头（如 `Authorization`、`X-Forwarded-*`），且用户无法绕过。
