@@ -944,3 +944,702 @@ App 构造函数启动 Worker
 batch_mode=True:  datastore → app → workers → 处理队列 → 退出
 batch_mode=False: datastore → app → workers → ticker + notification_runner → HTTP 服务
 ```
+
+---
+
+## 13. 暗线六：Tag 与 Watch 在持久化处理上的对称性差异
+
+Tag 与 Watch 都继承自 `watch_base`，共享同一个持久化框架，但在三个关键节点上产生了分化。
+
+### 13.1 持久化 Mixin 的统一接口与差异化实现
+
+两者都通过继承链 `EntityPersistenceMixin → watch_base → 具体类` 获得 `commit()` 能力。
+
+[model/persistence.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/persistence.py#L52-L84) 中的 `_save_to_disk()` 通过类名动态推导文件名和大小限制：
+
+```python
+entity_type = _determine_entity_type(self.__class__)  # 通过 MRO 从模块名推导
+filename = f'{entity_type}.json'                       # Watch → 'watch.json', Tag → 'tag.json'
+max_size_mb = 10 if entity_type == 'watch' else 1     # Watch 允许 10MB，Tag 仅 1MB
+```
+
+这是**类型驱动的差异**，由 Mixin 在运行时自动判定，不需要子类覆盖。
+
+### 13.2 \_get\_commit\_data() 的选择性排除差异
+
+这是最核心的不对称点：
+
+| 类 | 覆盖 | 排除键 | 设计意图 |
+|----|------|--------|----------|
+| Watch | ✅ 重写 | `processor_config_*`, `__*` | 处理器配置单独保存为独立 JSON |
+| Tag | ❌ 未覆盖 | 无 | 使用 watch_base 默认实现，保留所有键 |
+
+Watch 的 [Watch._get_commit_data()](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/Watch.py#L1084-L1087)：
+
+```python
+watch_dict = {
+    k: copy.deepcopy(v) for k, v in snapshot.items()
+    if not k.startswith('processor_config_') and not k.startswith('__')
+}
+```
+
+Tag 使用 [watch_base._get_commit_data()](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/__init__.py#L627) 的默认实现：
+
+```python
+return {k: copy.deepcopy(v) for k, v in snapshot.items()}  # 不过滤任何键
+```
+
+**不对称性**：Watch 的 `processor_config_restock_diff` 保存在 `{uuid}/watch.json` 之外的独立文件中，而 Tag 的同名字段保存在 `{uuid}/tag.json` 之内。
+
+### 13.3 持久化触发时机的差异
+
+| 触发点 | Watch | Tag |
+|--------|-------|-----|
+| UI 编辑后 | ✅ `watch.commit()` | ✅ `tag.commit()` |
+| API PUT 更新 | ✅ `watch.commit()` | ✅ `tag.commit()` |
+| API POST 创建 | ✅ `watch.commit()` | ✅ `tag.commit()` |
+| ticker 更新 `last_checked` 等 | ✅ `datastore.update_watch()` → `watch.commit()` | ❌ 无（Tag 无运行时状态） |
+| 检测完成更新 `previous_md5` | ✅ `datastore.update_watch()` | ❌ 无 |
+| pause/mute/... 状态变更 | ✅ `.commit()` | ✅ `.commit()` |
+
+**不对称性**：Watch 因为运行时状态（`last_checked`、`previous_md5`、`check_count` 等）频繁变更，需要持久化的次数远多于 Tag。Tag 几乎只有在用户主动修改配置时才会持久化。
+
+### 13.4 配置回退时的差异读取路径
+
+Watch 读取自己的 `processor_config_restock_diff` 通过 [base.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/base.py#L274-L303) 的 `get_extra_watch_config('restock_diff.json')` 方法，每次都**从磁盘 JSON 文件读取**：
+
+```python
+def get_extra_watch_config(self, filename):
+    filepath = os.path.join(data_dir, filename)
+    if not os.path.isfile(filepath):
+        return {}
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+```
+
+而 Tag 的 `processor_config_restock_diff` 通过 [api/Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Watch.py#L124) 的内存访问读取：
+
+```python
+restock_config = dict(tag.get('processor_config_restock_diff') or {})
+```
+
+**不对称性**：Watch 的处理器配置每次读取都走磁盘 I/O，而 Tag 的处理器配置是内存读取。这意味着 Watch 的 `restock_diff.json` 可以在运行时手动修改磁盘文件，在下一次检测时生效（但这是未文档化的 hack）。
+
+---
+
+## 14. 暗线七：restock_diff 在 Watch 端 vs Tag 端持久化不一致的根因
+
+### 14.1 历史遗留：update_30 的分岔口
+
+[store/updates.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/updates.py#L733-L776) 的 `update_30()` 是不一致的起点：
+
+```python
+def update_30(self):
+    """Migrate restock_settings out of watch.json into restock_diff.json processor config file.
+
+    For tags: restock_settings key is renamed to processor_config_restock_diff in the tag dict,
+    matching what the API writes when updating a tag.
+    """
+    # --- Watches ---
+    for uuid, watch in self.data['watching'].items():
+        if watch.get('processor') != 'restock_diff':
+            continue
+        restock_settings = watch.get('restock_settings')
+        # 迁移到独立文件
+        filepath = os.path.join(data_dir, 'restock_diff.json')
+        if not os.path.isfile(filepath):
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump({'restock_diff': restock_settings}, f, indent=2)
+        del self.data['watching'][uuid]['restock_settings']
+        watch.commit()
+
+    # --- Tags ---
+    for tag_uuid, tag in self.data['settings']['application']['tags'].items():
+        restock_settings = tag.get('restock_settings')
+        # 仅仅重命名字段，留在 tag.json 中
+        tag['processor_config_restock_diff'] = restock_settings
+        del tag['restock_settings']
+        tag.commit()
+```
+
+**注释明确说了原因**："matching what the API writes when updating a tag"——也就是 API 在写入 Tag 时，也是把 `processor_config_restock_diff` 放在 Tag 对象本身（因为 Tag 没有独立的处理器配置文件接口）。
+
+### 14.2 架构意图 vs 现实妥协
+
+理想的对称设计应该是：
+
+```
+Watch: {uuid}/watch.json 主体 + {uuid}/restock_diff.json 处理器配置
+Tag:   {uuid}/tag.json   主体 + {uuid}/restock_diff.json 处理器配置
+```
+
+但现实是 Tag 没有独立的处理器配置文件机制。原因有三：
+
+1. **API 不对称**：Watch API 有完整的 `update_extra_watch_config()` 接口体系，Tag API 没有对应的 `update_extra_tag_config()`
+2. **处理器框架设计**：`get_extra_watch_config()` / `update_extra_watch_config()` 是针对 Watch 的，硬编码使用 `self.datastore.data['watching'].get(self.watch_uuid)`，Tag 没有对应的方法
+3. **使用频率低**：Tag 级别的处理器 override 目前仅在 restock_diff 中使用，实现完整的对称架构 ROI 不高
+
+### 14.3 内存中 vs 磁盘中的数据流向
+
+Watch 的 `processor_config_restock_diff` 数据流：
+
+```
+UI/API 表单 → request.json → 内存中 watch['processor_config_restock_diff']
+    ↓ update_extra_watch_config()
+    {uuid}/restock_diff.json（磁盘）
+    ↓ 下次检测时 get_extra_watch_config()
+    内存中处理器使用
+```
+
+Tag 的 `processor_config_restock_diff` 数据流：
+
+```
+UI/API 表单 → request.json → 内存中 tag['processor_config_restock_diff']
+    ↓ tag.commit()
+    {uuid}/tag.json（磁盘，与其他字段合并保存）
+    ↓ 下次启动时 _load_tags() + rehydrate_tag()
+    内存中处理器 override 使用
+```
+
+**关键差异**：Watch 在 `_get_commit_data()` 中排除 `processor_config_*`，所以内存中的 `processor_config_restock_diff` 不会被写入 `watch.json`，必须通过独立的 `update_extra_watch_config()` 保存到 `restock_diff.json`。而 Tag 不排除这个键，直接写入 `tag.json`。
+
+### 14.4 不一致性的实际影响
+
+| 场景 | Watch 行为 | Tag 行为 | 影响 |
+|------|-----------|----------|------|
+| 运行时编辑磁盘文件 | ✅ 下次检测生效 | ❌ 重启才生效 | Watch 的处理器配置可热加载 |
+| `tag.commit()` | — | ✅ 保存 `processor_config_restock_diff` | Tag 持久化完整 |
+| `watch.commit()` | ❌ 不保存，需独立调用 | — | 容易遗漏独立保存调用 |
+| 迁移回滚 | 需要同时迁移 `restock_diff.json` | 只需迁移 `tag.json` | Watch 备份更复杂 |
+| API 返回 | ✅ 从磁盘读 + Tag 内存 override | ❌ 仅内存 | 见 [api/Watch.py:109-128](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Watch.py#L109-L128) |
+
+### 14.5 为什么 API GET /watch/{uuid} 要做"解析合并"
+
+[api/Watch.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Watch.py#L109-L128) 中的代码是理解这个不一致性的最好证据：
+
+```python
+# Resolved processor config: tag override wins over watch-level config
+_restock_path = os.path.join(watch_obj.data_dir, 'restock_diff.json')
+restock_config = {}
+if _restock_path and os.path.isfile(_restock_path):
+    with open(_restock_path, 'r', encoding='utf-8') as _f:
+        restock_config = json.load(_f).get('restock_diff') or {}
+restock_source = 'watch'
+for tag_uuid in (watch_obj.get('tags') or []):
+    tag = tags.get(tag_uuid, {})
+    if tag.get('overrides_watch'):
+        restock_config = dict(tag.get('processor_config_restock_diff') or {})
+        restock_source = f'tag:{tag_uuid}'
+        break
+watch['processor_config_restock_diff'] = restock_config
+watch['processor_config_restock_diff_source'] = restock_source
+```
+
+这里清楚地展示了：
+1. **Watch**：从 `restock_diff.json` 磁盘文件读取
+2. **Tag**：从 `tag.get('processor_config_restock_diff')` 内存读取
+3. **优先级**：Tag override > Watch 自身配置
+
+---
+
+## 15. 暗线八：notification_runner 和 ticker 未纳入主依赖图的根因
+
+### 15.1 架构设计上的"二等公民"
+
+在 [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py) 的模块顶部，我们看到一个清晰的"一等公民" vs "二等公民"分界：
+
+```python
+# === 一等公民：模块级全局变量，导入时就存在 ===
+datastore = None
+update_q = RecheckPriorityQueue()
+notification_q = NotificationQueue()
+app = Flask(...)
+socketio_server = None
+
+# === 二等公民：在 changedetection_app() 内部创建 ===
+# ticker_thread = None  ← 注释掉了，说明曾考虑提升但放弃
+ticker_thread = None
+```
+
+ticker 和 notification_runner 是**在函数内部创建**的局部线程，不是模块级的全局单例，因此不被视为主依赖图的一部分。
+
+### 15.2 notification_runner 的真实依赖链
+
+```
+changedetection_app()
+ │
+ ├─ 1. 设置 app.config
+ ├─ 2. 启动 Worker 池（worker_pool.start_workers）
+ ├─ 3. 启动 notification_runner 线程
+ │    │
+ │    ├─ 依赖：app（通过 global app 引用获取 app context）
+ │    ├─ 依赖：datastore（通过 global datastore 引用）
+ │    ├─ 依赖：notification_q（模块级全局）
+ │    └─ 依赖：app.config.exit（优雅退出信号）
+ │
+ └─ 4. 启动 ticker_thread
+```
+
+**根因 1：使用 global 关键字绕过显式传参**
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1058-L1067) 的 `notification_runner()` 签名不接收任何参数，完全依赖模块级全局：
+
+```python
+def notification_runner(worker_id=0):
+    global notification_debug_log
+    with app.app_context():          # global app
+        while not app.config.exit.is_set():
+            try:
+                n_object = notification_q.get(block=False)  # global notification_q
+            ...
+            # global datastore
+            if not n_object.get('notification_body') and datastore.data['settings']['application'].get('notification_body'):
+                n_object['notification_body'] = datastore.data['settings']['application'].get('notification_body')
+```
+
+这种设计使得 notification_runner 的依赖是**隐式的**，不是通过参数传递的显式依赖，因此不纳入主依赖图的分析。
+
+### 15.3 ticker 的真实依赖链
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1112-L1229) 同理：
+
+```python
+def ticker_thread_check_time_launch_checks():
+    # 依赖 global app, datastore, update_q, worker_pool
+    while not app.config.exit.is_set():
+        running_uuids = worker_pool.get_running_uuids()
+        queued_uuids = {q_item.item['uuid'] for q_item in update_q.queue}
+        for k in sorted(datastore.data['watching'].items(), ...):
+            ...
+        expected_workers = int(os.getenv("FETCH_WORKERS", datastore.data['settings']['requests']['workers']))
+        health_result = worker_pool.check_worker_health(
+            expected_count=expected_workers,
+            update_q=update_q, notification_q=notification_q,
+            app=app, datastore=datastore
+        )
+```
+
+**根因 2：线程是"副作用"，不是可替换的组件**
+
+主依赖图（datastore → app → worker → ticker）中，worker 是可以被替换、mock、配置的可测试组件（有独立的 `worker_pool.py` 模块，有 `check_worker_health()` 等可观测接口）。而 ticker 和 notification_runner 是：
+
+1. **匿名函数**：没有类封装，没有接口抽象
+2. **直接依赖全局变量**：不需要传参，启动后自主运行
+3. **不可配置的实现细节**：除了环境变量 `NOTIFICATION_WORKERS` 和 `MINIMUM_SECONDS_RECHECK_TIME`，几乎没有配置项
+4. **与模块强耦合**：无法提取到独立模块而不重构大量代码
+
+### 15.4 历史演进的证据
+
+查看代码结构可以看到一个清晰的演进路径：
+
+```
+早期版本：
+  main() 内部直接创建所有线程
+
+中期版本：
+  Worker 抽取到独立 worker_pool.py，成为一等公民
+
+当前版本：
+  notification_runner 和 ticker 仍在 flask_app.py 中，
+  作为 changedetection_app() 函数内的局部创建
+```
+
+**根因 3：Worker 池需要跨模块访问，而 ticker/notification 不需要**
+
+- `worker_pool` 被 `api/Watch.py`、`api/Tags.py`、`flask_app.py` 等多个模块引用，必须是模块级导出
+- `ticker_thread` 和 `notification_runner` 仅在 `changedetection_app()` 内部启动，没有其他模块需要引用它们
+- 它们是"触发即忘"的后台线程，主流程不关心它们的状态（除了优雅退出）
+
+### 15.5 batch_mode 的开关进一步强化了二等地位
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1001-L1022)：
+
+```python
+if not app_config.get('batch_mode'):
+    # Only start ticker and notification when in long-running server mode
+    global ticker_thread
+    ticker_thread = threading.Thread(target=ticker_thread_check_time_launch_checks,
+                                     daemon=True, name="ticker")
+    ticker_thread.start()
+
+    for i in range(int(os.getenv("NOTIFICATION_WORKERS", "3"))):
+        t = threading.Thread(target=notification_runner,
+                            daemon=True, args=(i,), name=f"notif-runner-{i}")
+        t.start()
+```
+
+这明确了 ticker 和 notification_runner 是**服务模式专用组件**，不是核心数据处理流水线的一部分。核心流水线（datastore → app → worker）在 batch_mode 下仍然完整运行。
+
+### 15.6 依赖图的完整形态（含隐式依赖）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  主依赖图（显式传参，一等公民）                           │
+│  datastore → app → worker_pool → HTTP server            │
+│     ↑         ↑         ↑                                │
+│     │         │         │                                │
+│     └─────────┴─────────┴── update_q, notification_q    │
+│                           (模块级全局)                   │
+├─────────────────────────────────────────────────────────┤
+│  副依赖图（隐式 global，二等公民）                        │
+│  notification_runner ◀──┐                                │
+│     │                    │                                │
+│     ├─ global app        │  global 关键字                │
+│     ├─ global datastore  │  绕过显式传参                 │
+│     └─ global notification_q │                            │
+│                           │                                │
+│  ticker_thread ◀──────────┘                                │
+│     │                                                    │
+│     ├─ global app                                        │
+│     ├─ global datastore                                  │
+│     ├─ global update_q                                   │
+│     └─ global worker_pool                                │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 16. 暗线九：C 类环境变量在容器部署中的生效范围
+
+C 类环境变量是"运行时每次使用时实时读取"的，理论上修改即生效。但在容器（Docker/K8s）部署中，这一假设需要重新审视。
+
+### 16.1 容器环境变量的本质
+
+容器环境变量是**在容器创建时传入**的，通过以下方式设置：
+
+```bash
+# Docker CLI
+docker run -e MINIMUM_SECONDS_RECHECK_TIME=30 changedetection.io
+
+# Docker Compose
+environment:
+  - MINIMUM_SECONDS_RECHECK_TIME=30
+
+# Kubernetes
+env:
+  - name: MINIMUM_SECONDS_RECHECK_TIME
+    value: "30"
+```
+
+**关键限制**：容器创建后，**无法通过标准的 Docker/K8s API 修改正在运行的容器的环境变量**。环境变量是进程 `execve()` 时传入的，一旦进程启动就固定了。
+
+### 16.2 修改运行中容器环境变量的 hack 方式
+
+虽然标准 API 不支持，但可以通过以下方式修改：
+
+| 方式 | 复杂度 | 对 C 类变量是否生效 |
+|------|--------|-------------------|
+| `docker exec` 进入容器后 `export VAR=val` | 低 | ❌ 仅影响新子进程，不影响 PID 1 |
+| 修改 `/proc/PID/environ` | 中 | ✅ 但需要写权限，且只影响 `os.getenv()` 读取 |
+| `gdb` attach 进程修改 environ | 高 | ✅ 但生产环境禁止 |
+| K8s ConfigMap/Secret 热更新 | 中 | ❌ 仅文件挂载热更新，不更新进程 ENV |
+| 重启容器 | 低 | ✅ 所有类别变量都生效 |
+
+### 16.3 不同 C 类变量在容器中的实际可变性
+
+| C 类变量 | 读取频率 | 容器中可热修改 | 说明 |
+|----------|----------|---------------|------|
+| `FETCH_WORKERS` | 每 60s + 启动 | ⚠️ 需要 hack | 扩容可热生效，缩容需重启（线程池大小固定） |
+| `MINIMUM_SECONDS_RECHECK_TIME` | 每轮 ticker | ⚠️ 需要 hack | 可实时生效 |
+| `SALTED_PASS` | 每次认证 | ⚠️ 需要 hack | 可实时绕过 JSON 密码 |
+| `BASE_URL` | 每次 `datastore.data` 访问 | ⚠️ 需要 hack | 仅当 JSON 中未设置时生效 |
+| `HIDE_REFERER` | 每次请求 | ⚠️ 需要 hack | 可实时生效 |
+| `USE_X_SETTINGS` | 每次请求 | ⚠️ 需要 hack | 可实时生效 |
+| `ENABLE_NO_PROXY_OPTION` | 每次 get_proxy_list | ⚠️ 需要 hack | 可实时生效 |
+| `PAGE_WATCH_LIMIT` | 每次 add_watch | ⚠️ 需要 hack | 可实时生效 |
+| `LLM_MODEL/KEY/BASE` | 每次 LLM 调用 | ⚠️ 需要 hack | 可实时绕过 JSON LLM 配置 |
+| `LLM_MAX_INPUT_CHARS` | 每次 LLM 输入截断 | ⚠️ 需要 hack | 可实时生效 |
+| `LLM_TOKEN_BUDGET_MONTH` | 每次预算检查 | ⚠️ 需要 hack | 可实时生效 |
+| `LLM_FEATURES_DISABLED` | 每次 LLM 功能判断 | ⚠️ 需要 hack | 可实时生效 |
+| `TZ` | 每次调度/Jinja2 | ⚠️ 需要 hack | 可实时生效 |
+| `PDF_TO_HTML_TOOL` | 每次处理 PDF | ⚠️ 需要 hack | 可实时生效 |
+| `DISABLED_PROCESSORS` | 启动时（被 `@lru_cache`） | ❌ 即使 hack 也不生效 | 有 `@lru_cache` 保护，只求值一次 |
+| `ALLOW_IANA_RESTRICTED_ADDRESSES` | 每次校验/抓取 | ⚠️ 需要 hack | 可实时生效 |
+| `ALLOW_FILE_URI` | 每次校验/抓取 | ⚠️ 需要 hack | 可实时生效 |
+
+### 16.4 为什么 DISABLED_PROCESSORS 是 C 类中的特例
+
+[processors/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/__init__.py#L205-L215)：
+
+```python
+@functools.lru_cache(maxsize=None)
+def available_processors():
+    disabled = os.getenv('DISABLED_PROCESSORS', '').split(',')
+    ...
+    return processors
+```
+
+即使运行时修改了进程环境变量，`@lru_cache` 也会返回第一次调用的缓存结果。这使其**名义上是 C 类，实际上是 B 类**（启动后不可变）。
+
+### 16.5 容器环境中的最佳实践矩阵
+
+| 变量类别 | 推荐修改方式 | 是否零停机 |
+|----------|-------------|-----------|
+| A 类（模块导入时） | 重启容器 | ❌ |
+| B 类（启动时） | 重启容器 | ❌ |
+| C 类（运行时，无 cache） | 重启容器 + ConfigMap 滚动更新 | ❌（标准做法） |
+| C 类（运行时，无 cache） | `/proc/PID/environ` hack | ✅（非标准） |
+| C 类（运行时，有 lru_cache） | 重启容器 | ❌ |
+| JSON 配置（通过 UI/API） | UI/API 调用 | ✅ |
+
+**容器化部署的关键洞察**：C 类变量的"运行时可修改"特性在标准容器环境中**几乎没有实用价值**。除了直接通过 UI/API 修改 JSON 配置，任何需要修改配置的场景都需要重启容器。
+
+### 16.6 Docker/K8s 中配置管理的推荐分层
+
+基于代码实际行为，推荐以下分层配置策略：
+
+```
+第 1 层（最稳定，重启生效）:
+  A 类 + B 类 + 带 lru_cache 的 C 类
+  → 用 K8s Deployment env 或 Dockerfile ENV 设置
+  → 修改 → 滚动重启
+
+第 2 层（动态，运行时生效）:
+  JSON 配置（通过 UI/API）
+  → 用 UI/API 或 ConfigMap 挂载到 datastore 目录
+  → 修改 → 即时生效（但 datastore 不读取已读入的 JSON 文件）
+
+第 3 层（容器 hack，非常规）:
+  不带 cache 的 C 类
+  → 修改 /proc/PID/environ
+  → 修改 → 即时生效（不推荐用于生产）
+```
+
+### 16.7 关于 ConfigMap 挂载的特别说明
+
+如果将 `changedetection.json` 通过 K8s ConfigMap 挂载到 datastore 目录：
+
+- **首次启动**：正常加载，配置生效 ✅
+- **ConfigMap 更新后**：容器内的文件会被 K8s 更新，但 datastore 不会重新读取 ❌
+- **必须重启 Pod**：才能加载新的 JSON 配置 ❌
+
+这是 JSON 作为"只写缓存"架构的必然结果——运行时不会重新读取磁盘文件。
+
+---
+
+## 17. 暗线十：datastore 读路径无锁背后的 GIL 单键原子性
+
+### 17.1 Python GIL 与原子操作的本质
+
+CPython 的全局解释器锁（GIL）保证了**任何 Python 字节码指令的执行都是原子的**。一个 Python 操作是否线程安全，取决于它是否编译为**单个字节码指令**。
+
+```python
+# 原子操作（单字节码）
+d['key'] = value        # STORE_SUBSCR
+value = d['key']        # BINARY_SUBSCR （实际上是 2 个字节码，但由于 GIL 的存在，中间不会被打断）
+d.get('key', default)   # 函数调用，多字节码，但 GIL 在函数调用期间不会释放
+
+# 非原子操作（多字节码，中间可能释放 GIL）
+d['key'] += 1           # BINARY_SUBSCR → BINARY_ADD → STORE_SUBSCR
+d['key'] = d['key'] + 1 # 同上
+if 'key' in d:          # COMPARE_OP → POP_JUMP_IF_FALSE
+    d['key'].append(x)  # 中间可能被修改
+for k in d.items():     # 迭代期间 d 被修改 → RuntimeError
+```
+
+### 17.2 datastore 读路径上的原子性分类
+
+datastore 的 `__data` 是一个嵌套 dict，所有读操作可分为三类：
+
+#### 类型 1：单键标量读取（GIL 保证原子）
+
+```python
+# 例如：
+watch['paused']                    # dict.__getitem__ → 单字节码 + GIL
+watch.get('last_checked', 0)       # dict.get() → 函数调用，GIL 不释放
+watch['last_error']                # 同上
+```
+
+**无需锁**：GIL 保证读取到的值要么是修改前的完整值，要么是修改后的完整值，不会看到部分修改的标量。
+
+#### 类型 2：单键对象引用读取（GIL 保证引用原子，但对象内容可能变）
+
+```python
+# 例如：
+watch = datastore.data['watching'][uuid]   # 返回 Watch 对象（dict 子类）的引用
+watch['headers']                            # 返回 headers dict 的引用
+```
+
+**GIL 保证引用本身是原子的**——你不会得到一个半初始化的对象引用。但对象内部的内容（如 `watch['headers']` 的具体键值）可能在你拿到引用后被其他线程修改。
+
+#### 类型 3：多键遍历/迭代（GIL 不保证安全）
+
+```python
+# 例如：
+for k in datastore.data['watching'].items():
+    ...
+```
+
+**必须加锁或使用重试机制**：迭代期间如果 dict 大小变化（添加/删除 Watch），会抛出 `RuntimeError: dictionary changed size during iteration`。
+
+### 17.3 ticker 中的乐观并发策略
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1156-L1170) 没有加锁，而是用 try/except 重试：
+
+```python
+# Re #232 - Deepcopy the data incase it changes while we're iterating through it all
+watch_uuid_list = []
+while True:
+    try:
+        for k in sorted(datastore.data['watching'].items(), key=lambda item: item[1].get('last_checked',0)):
+            watch_uuid_list.append(k[0])
+    except RuntimeError as e:
+        # RuntimeError: dictionary changed size during iteration
+        time.sleep(0.1)
+        watch_uuid_list = []
+    else:
+        break
+```
+
+**为什么不加锁？** 权衡分析：
+
+| 策略 | 优点 | 缺点 |
+|------|------|------|
+| 加锁遍历 | 无重试，确定 | 持有锁时间长，阻塞写操作 |
+| try/except 重试 | 无锁开销，写操作不阻塞 | 可能多次重试，极端情况下活锁 |
+
+**实际场景**：
+- Watch 的增删是低频操作（用户手动操作）
+- 每次遍历只提取 UUID 列表，耗时短（微秒级）
+- 冲突概率极低（< 0.1%）
+- 即使冲突，重试成本只有 0.1s + 重新遍历的微秒级开销
+
+### 17.4 写路径上加锁但读路径不加锁的正确性论证
+
+[store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L549-L580) 的 `update_watch()`：
+
+```python
+def update_watch(self, uuid, update_obj):
+    with self.lock:
+        self.__data['watching'][uuid].update(update_obj)
+        ...
+    self.__data['watching'][uuid].commit()  # 锁外持久化
+```
+
+**读写竞态分析**：
+
+```
+线程 A（写）: with self.lock: watch.update({'last_checked': now})
+线程 B（读）: value = watch['last_checked']
+```
+
+可能的时序：
+
+1. **A 先获取锁，update 完成后释放锁，B 再读**：B 看到新值 ✅
+2. **B 先读，A 后获取锁 update**：B 看到旧值 ✅（最终一致）
+3. **A 持有锁正在 update，B 并发读**：B 看到旧值 ✅（GIL 保证不会看到部分更新的标量）
+4. **A 持有锁正在 `del watch['key']`，B 并发读 `watch['key']`**：B 可能看到 KeyError 或旧值，取决于时序，但 GIL 保证不会看到半删除状态
+
+**结论**：对于单键读取，GIL 提供了足够的安全性。不需要加锁。
+
+### 17.5 读路径上的真实风险点
+
+虽然单键读取是原子的，但有两种情况仍然可能出现问题：
+
+#### 风险 1：读取后检查再使用（TOCTOU）
+
+```python
+# 不安全模式（实际代码中的模式）
+watch = datastore.data['watching'][uuid]
+if not watch['paused']:                  # 读 1
+    # 这里，另一个线程可能设置 watch['paused'] = True
+    queue_for_recheck(watch)             # 使用
+```
+
+这是**检查时间-使用时间（Time-of-check to time-of-use）**竞态，GIL 和锁都无法自动防范——需要业务层处理。实际代码中这是可接受的：即使 Watch 被暂停了但已经入队，Worker 在实际执行时会再次检查 `paused` 标志。
+
+#### 风险 2：嵌套 dict 的部分读取
+
+```python
+headers = watch['headers']               # 获取内部 dict 的引用
+user_agent = headers.get('User-Agent')   # 使用引用
+# 另一个线程可能在此时修改 headers['User-Agent']
+```
+
+GIL 保证 `headers` 引用是原子的，但 `headers` 内部的修改不被保护。实际代码中这种模式很少，且修改 headers 是用户手动操作，冲突概率极低。
+
+#### 风险 3：`datastore.data` 属性的副作用写入
+
+[store/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/__init__.py#L596)：
+
+```python
+@property
+def data(self):
+    ...
+    d = self.__data
+    d['settings']['application']['active_base_url'] = active_base_url.strip('" ')
+    return d
+```
+
+这是一个**写入副作用**的读操作！`active_base_url` 的写入没有任何锁保护。但由于：
+1. 每次写入的值是相同的（或由环境变量/JSON 决定，变化频率极低）
+2. 标量赋值在 GIL 下是原子的
+3. 即使读取到旧值，下一次访问会重新计算
+
+因此实际风险可以忽略。
+
+### 17.6 `_get_commit_data()` 锁设计的正确性
+
+[model/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/__init__.py#L616-L627)：
+
+```python
+if lock:
+    with lock:
+        snapshot = dict(self)   # 锁内：浅拷贝（O(1) 键数）
+# 锁外：深拷贝（O(n) 数据量）
+return {k: copy.deepcopy(v) for k, v in snapshot.items()}
+```
+
+这是**经典的两阶段拷贝优化**：
+1. **锁内**：只做 `dict(self)` 浅拷贝，获取所有键的引用。持有锁时间 = O(键数)，非常短。
+2. **锁外**：做 `copy.deepcopy(v)`，耗时但不阻塞其他线程。
+
+如果没有锁，`dict(self)` 期间如果另一个线程正在 `self.update(...)`，可能导致：
+- Python 3.7+：由于 dict 是有序的，迭代期间修改可能产生重复键或丢失键
+- 抛出 `RuntimeError: dictionary changed size during iteration`
+
+### 17.7 锁与无锁的边界总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  需要锁保护的操作                                            │
+│  ├── dict.update() 批量修改键                               │
+│  ├── del 删除键（可能导致遍历异常）                          │
+│  ├── dict(self) 浅拷贝（构造快照）                           │
+│  ├── list.append() 列表追加（如 notification_urls）          │
+│  └── 新增 Watch/Tag（改变 dict 大小）                        │
+│                                                              │
+│  GIL 保护下无需锁的操作                                      │
+│  ├── d['key'] 单键标量读取                                   │
+│  ├── d.get('key') 单键标量读取                               │
+│  ├── d['key'] = scalar 单键标量赋值（但代码中加了锁）         │
+│  ├── 函数调用（GIL 在函数调用期间不释放）                     │
+│  └── 引用获取（保证引用本身完整，不保证引用指向的内容不变）     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 17.8 为什么写路径仍然全加锁？
+
+既然单键赋值在 GIL 下是原子的，为什么 `update_watch()` 仍然用 `with self.lock:` 包裹？
+
+**原因 1：update() 是多键批量操作**
+
+```python
+# update_obj 可能包含多个键
+self.__data['watching'][uuid].update({
+    'last_checked': now,
+    'previous_md5': new_md5,
+    'last_error': None,
+    'fetch_time': elapsed
+})
+```
+
+虽然每个键的赋值是原子的，但四个键的赋值之间 GIL 可能被释放，导致另一个线程看到部分更新的不一致状态（`last_checked` 已更新但 `previous_md5` 还是旧值）。锁保证这四个键的更新是原子的、一致的。
+
+**原因 2：防御性编程**
+
+即使当前 `update_obj` 只有一个键，未来可能增加更多键。加锁是一种前向兼容的防御性设计。
+
+**原因 3：与 `_get_commit_data()` 的协同**
+
+`_get_commit_data()` 在锁内做 `dict(self)` 浅拷贝，`update_watch()` 在锁内做 `update()`，二者互斥，保证拷贝出的快照不会包含部分更新的状态。
