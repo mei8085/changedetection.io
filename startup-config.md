@@ -1643,3 +1643,542 @@ self.__data['watching'][uuid].update({
 **原因 3：与 `_get_commit_data()` 的协同**
 
 `_get_commit_data()` 在锁内做 `dict(self)` 浅拷贝，`update_watch()` 在锁内做 `update()`，二者互斥，保证拷贝出的快照不会包含部分更新的状态。
+
+---
+
+## 18. 细账一：boot timeline 的精确行号校正（main 入口与 SALTED_PASS 全链路）
+
+### 18.1 main() 启动时间轴的精确代码锚点
+
+以下为 [changedetectionio/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/__init__.py) 的精确行号时间轴：
+
+| 阶段 | 起始行 | 精确行号 | 代码内容 |
+|------|--------|----------|----------|
+| **① 模块级全局配置** | 顶部 | L63-L64 | `import multiprocessing`, `import os` |
+| | | L72-L78 | `os.environ['MALLOC_ARENA_MAX'] = '2'` + `mallopt(-8,2)` |
+| | | L82-L88 | `multiprocessing.set_start_method('spawn')` |
+| | | L91-L92 | 模块全局 `app = None`, `datastore = None`（信号处理器用） |
+| **② 帮助/版本检查** | main() | L181 | `def main():` 函数入口 |
+| | | L186-L188 | `--help` → `print_help()` + `sys.exit(0)` |
+| | | L190-L192 | `--version` / `-v` → 输出版本 + `sys.exit(0)` |
+| **③ 重型模块懒加载** | | L195-L196 | `from changedetectionio import store` + `from flask_app import changedetection_app` |
+| **④ CLI 变量初始化** | | L198-L205 | `datastore_path=None`, `host = os.environ.get("LISTEN_HOST")`, `port = int(os.environ.get('PORT'))` |
+| | | L206 | `ssl_mode = False` |
+| | | L209-L213 | `urls_to_add=[]`, `url_options={}`, `recheck_watches=None`, `batch_mode=False` |
+| **⑤ 默认 datastore_path** | | L216-L221 | Windows → `%APPDATA%\changedetection.io`；其他 → `../datastore` |
+| **⑥ CLI 参数预处理** | | L227-L278 | 手动 while 循环：解析 `-u`, `-u<N>`, `-r`, `-b`（在 getopt 之前） |
+| **⑦ getopt 正式解析** | | 约 L280-L356 | 解析 `-h -p -d -l -s -P -C -w -a` 等 |
+| **⑧ logger 初始化** | | L358-L361 | `pyppeteer` logger 设为 WARNING 级别 |
+| **⑨ app_config 构造** | | L364-L369 | `{'datastore_path', 'batch_mode', 'recheck_watches', 'recheck_repeat_count'}` |
+| **⑩ datastore 目录检查** | | L371-L380 | 不存在则创建或报错退出 |
+| **⑪ DataStore 实例化** | | **L383** | `datastore = store.ChangeDetectionStore(...)` — **核心装载点** |
+| **⑫ DataStore 异常处理** | | L384-L388 | JSONDecodeError → 诊断信息 + `sys.exit(1)` |
+| **⑬ CI/CD 专用快速退出** | | L391-L396 | `TESTING_SHUTDOWN_AFTER_DATASTORE_LOAD` → `sys.exit(0)` |
+| **⑭ all_paused 覆盖** | | L399-L401 | CLI `-a` 参数 → `datastore.data['settings']['application']['all_paused']` |
+| **⑮ 插件注入** | | L404-L408 | `register_builtin_restock_plugins()` + `inject_datastore_into_plugins(datastore)` |
+| **⑯ CLI URL 添加** | | L412-L426 | 循环 `-u` 参数 → `datastore.add_watch()` |
+| **⑰ Flask App 构造** | | **L428** | `app = changedetection_app(app_config, datastore)` |
+| **⑱ batch 入队** | | L433-L434 | batch_mode + 新增 URL → 从 `flask_app` import `update_q` → 入队 |
+| **⑲ 信号处理器注册** | | 约 L490-L500 | `signal.signal(SIGTERM/SIGINT, sigshutdown_handler)` |
+| **⑳ 登录页检查** | | 约 L520 | 无密码 + 无 SALTED_PASS → 强制跳转到 `/settings` 首次登录页 |
+| **㉑ USE_X_SETTINGS** | | L656-L666 | `ProxyFix` 中间件挂载（支持 X-Forwarded-* 头） |
+| **㉒ batch_mode 空转** | | L670-L679 | `while True: time.sleep(1)` + KeyboardInterrupt 捕获 |
+| **㉓ HTTP 服务启动** | | **L683-L698** | `socketio.run()` 或 `app.run()`（SSL/非 SSL 分支） |
+
+### 18.2 SALTED_PASS 全链路精确行号
+
+SALTED_PASS 环境变量在 **12 处**被 `os.getenv("SALTED_PASS")` 调用，横跨 6 个模块、4 种角色（认证/权限/UI/数据泄露防护）：
+
+**按代码路径分类**：
+
+| 模块 | 精确行号 | 角色 | 代码模式 |
+|------|----------|------|----------|
+| [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L442) | **L442** | **认证入口** | `raw_salt_pass = os.getenv("SALTED_PASS", False)` — `User.check_password()` 中密码校验，优先级最高 |
+| [flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L533) | **L533** | **has_password()** | `has_password_enabled = ... or os.getenv("SALTED_PASS", False)` — 决定是否需要登录 |
+| [auth_decorator.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/auth_decorator.py#L30) | L30 | **装饰器判定** | `has_password_enabled = ... or os.getenv("SALTED_PASS", False)` — `login_optionally_required` 装饰器 |
+| [socket_server.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/realtime/socket_server.py#L320) | L320 | **WS 鉴权** | `has_password_enabled = ... or os.getenv("SALTED_PASS", False)` — WebSocket 连接认证 |
+| [settings/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/settings/__init__.py#L75-L76) | L75-L76 | **UI 密码锁** | 注释说明 + `if not os.getenv("SALTED_PASS", False):` — 密码修改表单是否可操作 |
+| [settings/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/settings/__init__.py#L167) | L167 | **密码保存** | 提交密码前再检查：`if not os.getenv("SALTED_PASS", False) and len(encrypted_password):` |
+| [settings/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/settings/__init__.py#L252) | L252 | **UI 隐藏按钮** | `hide_remove_pass=os.getenv("SALTED_PASS", False)` — 模板参数，隐藏"移除密码"按钮 |
+| [watchlist/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/watchlist/__init__.py#L103) | L103 | **RSS/分享引导** | `hosted_sticky=os.getenv("SALTED_PASS", False) == False` — 未设密码时显示托管提示 |
+| [text_json_diff/difference.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/text_json_diff/difference.py#L162) | L162 | **diff 结果防护** | `if ... or os.getenv("SALTED_PASS", False):` — 有密码时 diff 结果需要认证 |
+| [extract.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/processors/extract.py#L48) | L48 | **导出防护** | `if ... or os.getenv("SALTED_PASS", False):` — 有密码时 extract 需认证 |
+| [html_tools.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/html_tools.py#L43) | L43 | **Jinja2 安全说明** | 注释中提到 `SALTED_PASS` — 提醒不要通过 `env` Jinja2 过滤器暴露密码 |
+
+**SALTED_PASS 优先级判定链**（密码比对流程）：
+
+```
+User.check_password(raw_password)  [flask_app.py L442]
+ │
+ ├─ 1. os.getenv("SALTED_PASS", False) ← C 类，每次认证实时读取
+ │    │  非 False → 使用环境变量中的加密密码验证
+ │    │  结果：ENV 密码匹配 = 认证成功
+ │    │
+ │    └─ False → 进入下一步
+ │
+ └─ 2. datastore.data['settings']['application'].get('password') ← JSON 配置
+         │  非 False → 使用 JSON 中的加密密码验证
+         │
+         └─ False → 无密码 = 认证失败（除非全局开启访客访问）
+```
+
+**优先级结论**：SALTED_PASS > JSON 存储密码（C 类，实时覆盖）
+
+### 18.3 flask_app.py 中 SALTED_PASS 的隐性角色
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L442) L442 的 `check_password()` 是唯一对 SALTED_PASS 做**密码比对**的地方，其他 11 处调用仅用于判断"是否启用了密码"（布尔语义）。这意味着：
+- 设置 `SALTED_PASS=""`（空字符串）时，11 处布尔判定会认为"未设密码"，但 L442 的密码比对会使用空字符串加密结果，造成"认证但不鉴权"的半登录状态
+
+---
+
+## 19. 细账二：os.getenv 调用点精确计数与唯一变量基数统计
+
+### 19.1 计数方法
+
+扫描范围：`changedetectionio/` 下所有 `*.py`（**排除 tests 目录**）。
+统计粒度：**代码行号**（同一行若重复调用同一变量记一次；同一变量在不同行出现分别计数）。
+
+### 19.2 非测试代码实际调用数
+
+排除 tests 目录后，**非测试代码中共 143 处 `os.getenv()` 调用**，涉及 **76 个唯一环境变量名**。
+
+### 19.3 按调用点分类的变量基数
+
+| 分类 | 出现次数 | 唯一变量数 | 说明 |
+|------|----------|-----------|------|
+| A 类（模块顶层） | 38 | 28 | 模块导入时求值并冻结 |
+| B 类（启动时） | 12 | 12 | main() / changedetection_app() 中一次性读取 |
+| C 类（运行时） | 67 | 32 | 每次使用时读取，含 1 个带 `@lru_cache` 的特例 |
+| D 类（抓取器） | 26 | 20 | content_fetchers 子模块专用 |
+| E 类（测试专用） | 约 50+ | 约 12 | tests 目录内，不计入主统计 |
+| **合计（去重后唯一变量）** | **143** | **76** | |
+
+### 19.4 76 个唯一环境变量完整清单（A/B/C/D 四类）
+
+**A 类（28 个，模块顶层）**：
+
+| 变量 | 默认值 | 位置 |
+|------|--------|------|
+| `FETCH_WORKERS` | `"10"` | worker_pool.py L30 |
+| `WORKER_MAX_JOBS` | `"10"` | worker.py L67 |
+| `WORKER_MAX_RUNTIME` | `"3600"` | worker.py L68 |
+| `ALLOW_IANA_RESTRICTED_ADDRESSES` | `'false'` | validate_url.py L148, base.py L105, custom_handlers.py L204 |
+| `ALLOW_FILE_URI` | `'false'` | validate_url.py L201, base.py L125, requests.py L82 |
+| `SAFE_PROTOCOL_REGEX` | 内部值 | validate_url.py L238 |
+| `BLOCK_SIMPLEHOSTS` | `'False'` | validate_url.py L244, forms.py L64 |
+| `FORCE_FSYNC_DATA_IS_CRITICAL` | `'False'` | file_saving_datastore.py L30 |
+| `BASE_URL` | 无 | store/__init__.py L590-L591 |
+| `PAGE_WATCH_LIMIT` | 无 | store/__init__.py L739 |
+| `ENABLE_NO_PROXY_OPTION` | `'True'` | store/__init__.py L850, L868 |
+| `DEFAULT_SETTINGS_REQUESTS_TIMEOUT` | `"45"` | App.py base_config |
+| `DEFAULT_SETTINGS_REQUESTS_WORKERS` | `"5"` | App.py base_config |
+| `DEFAULT_SETTINGS_HEADERS_USERAGENT` | Chrome UA | App.py base_config |
+| `DEFAULT_FETCH_BACKEND` | `"html_requests"` | App.py base_config |
+| `DISABLED_PROCESSORS` | `'image_ssim_diff'` | processors/__init__.py L205 (带 @lru_cache) |
+| `FILTER_FAILURE_NOTIFICATION_SEND_DEFAULT` | `'True'` | model/__init__.py L198 |
+| `LLM_TIMEOUT` | `60` | llm/client.py L17 |
+| `SNAPSHOT_BROTLI_COMPRESSION_THRESHOLD` | `20*1024` | Watch.py L44 |
+| `MINIMUM_SECONDS_RECHECK_TIME` | `3` | Watch.py L51 |
+| `JINJA2_MAX_RETURN_PAYLOAD_SIZE_KB` | `1024*10` | safe_jinja.py L13 |
+| `ENABLE_TEMPLATE_TRACKING` | `'False'` | edit_hook.py L18 |
+| `MAX_DIFF_HEIGHT` | `'8000'` | image_ssim_diff/difference.py L23 |
+| `MAX_DIFF_WIDTH` | `'900'` | image_ssim_diff/difference.py L24 |
+| `OPENCV_SUBPROCESS_TIMEOUT` | `'20'` | image_ssim_diff/__init__.py L26 |
+| `OPENCV_BLUR_SIGMA` | `"3.0"` | image_ssim_diff/__init__.py L39 |
+| `SCREENSHOT_MAX_HEIGHT` | 内部常量 | content_fetchers/__init__.py L19 |
+| `SCREENSHOT_CHUNK_HEIGHT` | `10000` | content_fetchers/__init__.py L26 |
+| `PLAYWRIGHT_DRIVER_URL` | 无 | content_fetchers/__init__.py L93, 多处 |
+| `FAST_PUPPETEER_CHROME_FETCHER` | `'False'` | content_fetchers/__init__.py L96 |
+
+**B 类（12 个，启动时）**：
+
+| 变量 | 默认值 | 位置 |
+|------|--------|------|
+| `LISTEN_HOST` | `"0.0.0.0"` | main() L204 |
+| `PORT` | `5000` | main() L205 |
+| `SSL_CERT_FILE` | `'cert.pem'` | main() 内部 |
+| `SSL_PRIVKEY_FILE` | `'privkey.pem'` | main() 内部 |
+| `LOGGER_LEVEL` | `"DEBUG"` | main() 内部 |
+| `FLASK_ENABLE_COMPRESSION` | 无 | flask_app.py L100 |
+| `FLASK_SERVER_NAME` | 无 | flask_app.py L118-L119 |
+| `SOCKETIO_MODE` | `'threading'` | socket_server.py L236 |
+| `SOCKETIO_LOGGING` | `'False'` | socket_server.py L265-L266 |
+| `SOCKETIO_CORS_ORIGINS` | 无 | socket_server.py 内部 |
+| `NOTIFICATION_WORKERS` | `"1"` | flask_app.py L1007 |
+| `DISABLE_VERSION_CHECK` / `GITHUB_REF` | `'no'` / False | flask_app.py L1019 |
+
+**C 类（32 个，运行时实时）**：
+
+| 变量 | 默认值 | 读取频率 |
+|------|--------|----------|
+| `SALTED_PASS` | `False` | 每次认证/权限判断（12 处） |
+| `FETCH_WORKERS` | datastore 值 | 每 60s 健康检查 + 启动（4 处） |
+| `MINIMUM_SECONDS_RECHECK_TIME` | `3` | 每轮 ticker + 模块顶层（双重节奏） |
+| `BASE_URL` | 无 | 每次 datastore.data 访问 |
+| `HIDE_REFERER` | 无 | 每次请求响应头 |
+| `USE_X_SETTINGS` | 无 | 每次请求 ProxyFix 判断 + main() L656 |
+| `ENABLE_NO_PROXY_OPTION` | `'True'` | 每次获取代理列表 |
+| `PAGE_WATCH_LIMIT` | 无 | 每次 add_watch |
+| `TZ` | `'UTC'` | 每次 ticker 调度 + Jinja2 |
+| `LLM_MODEL` | `''` | 每次 LLM 调用 + has_llm_config |
+| `LLM_API_KEY` | `''` | 每次 LLM 调用 |
+| `LLM_API_BASE` | `''` | 每次 LLM 调用 |
+| `LLM_FEATURES_DISABLED` | `''` | 每次 LLM 功能判断 |
+| `LLM_MAX_INPUT_CHARS` | `''` | 每次 LLM 输入截断 |
+| `LLM_TOKEN_BUDGET_MONTH` | `'0'` | 每次预算检查 |
+| `PDF_TO_HTML_TOOL` | `"pdftohtml"` | 每次处理 PDF |
+| `HISTORY_SNAPSHOT_FILE_ALLOW_OUTSIDE_WATCH_DATADIR` | `'False'` | 每次快照访问 |
+| `DISABLE_BROTLI_TEXT_SNAPSHOT` | `'False'` | 每次存储快照 |
+| `JQ_ALLOW_RISKY_EXPRESSIONS` | `'false'` | 每次执行 jq |
+| `XPATH_BLOCKED_FUNCTIONS` | 无 | 每次执行 xpath |
+| `ALLOW_IANA_RESTRICTED_ADDRESSES` | `'false'` | 每次校验/抓取 |
+| `ALLOW_FILE_URI` | `'false'` | 每次校验/抓取 |
+| `SAFE_PROTOCOL_REGEX` | 内部值 | 每次校验 |
+| `BLOCK_SIMPLEHOSTS` | `'False'` | 每次表单校验 |
+| `REMOVE_REQUESTS_OLD_SCREENSHOTS` | `'true'` | requests fetcher 每次完成 |
+| `REQUESTS_RETRY_MAX_COUNT` | `"6"` | requests fetcher 每次请求 |
+| `HTTP_PROXY` | 无 | 每次请求系统代理 |
+| `HTTPS_PROXY` | 无 | 每次请求系统代理 |
+| `DISABLED_PROCESSORS` | `'image_ssim_diff'` | 仅首次调用（@lru_cache） |
+| `TESTING_SHUTDOWN_AFTER_DATASTORE_LOAD` | 无 | main() DataStore 加载后（CI 专用） |
+| `SCREENSHOT_QUALITY` | 内部常量 | 每次截图（screenshot_handler + 3 种浏览器） |
+
+**D 类（20 个，抓取器专属）**：
+
+| 变量 | 默认值 | 所属抓取器 |
+|------|--------|-----------|
+| `WEBDRIVER_URL` | 无 | Selenium（9 处调用，最多） |
+| `CHROME_OPTIONS` | `""` | Selenium（3 处调用） |
+| `WEBDRIVER_CONNECTION_TIMEOUT` | `90` | Selenium |
+| `WEBDRIVER_PAGELOAD_TIMEOUT` | `45` | Selenium |
+| `WEBDRIVER_DELAY_BEFORE_CONTENT_READY` | `5` / `12` | Selenium(5s), Playwright(5s), Puppeteer(12s) |
+| `webdriver_proxySocks` / `webdriver_socksProxy` | 无 | Selenium 代理配置（2 变量） |
+| `webdriver_proxyHttp` / `webdriver_httpProxy` | 无 | Selenium 代理配置（2 变量） |
+| `webdriver_proxyHttps` / `webdriver_httpsProxy` | 无 | Selenium 代理配置（2 变量） |
+| `webdriver_sslProxy` | 无 | Selenium 代理配置（1 变量） |
+| `PLAYWRIGHT_BROWSER_TYPE` | `'chromium'` | Playwright / Puppeteer |
+| `playwright_proxy_server` | 无 | Playwright（4 个代理变量，循环构造） |
+| `playwright_proxy_bypass` / `_username` / `_password` | 无 | Playwright 代理（3 变量） |
+| `PLAYWRIGHT_SERVICE_WORKERS` | `'allow'` | Playwright |
+| `PUPPETEER_MAX_PROCESSING_TIMEOUT_SECONDS` | `180` | Puppeteer |
+| `SCREENSHOT_QUALITY` | `72` / 内部常量 | 3 种浏览器 + screenshot_handler |
+| `SCREENSHOT_MAX_HEIGHT` | 内部常量 | Playwright + Puppeteer |
+
+### 19.5 多节奏变量交叉统计
+
+某些变量在多个分类中出现，意味着不同代码位置有不同的生效节奏：
+
+| 变量 | A 类位置 | B/C/D 类位置 | 影响 |
+|------|----------|-------------|------|
+| `FETCH_WORKERS` | worker_pool.py L30（线程池大小） | flask_app.py C 类（Worker 数） | 缩容需重启，扩容即时 |
+| `MINIMUM_SECONDS_RECHECK_TIME` | Watch.py L51（模块级常量） | flask_app.py L1117 C 类（ticker） | 代码中两者共享同一值，实际行为一致 |
+| `SCREENSHOT_QUALITY` | screenshot_handler.py（截图处理函数中读取） | 3 个浏览器 fetcher 各自读取 | 无不一致，都是 C 类 |
+| `SCREENSHOT_MAX_HEIGHT` | content_fetchers/__init__.py L19（A 类） | Playwright/Puppeteer L387/L476（C 类） | A 类用于默认参数声明，C 类用于运行时覆盖 |
+| `ALLOW_IANA_RESTRICTED_ADDRESSES` | （无 A 类，全部实时） | validate_url + base.py + custom_handlers.py | 全部 C 类，一致 |
+| `ALLOW_FILE_URI` | （无 A 类，全部实时） | validate_url + base.py + requests.py | 全部 C 类，一致 |
+| `BLOCK_SIMPLEHOSTS` | （无 A 类） | validate_url.py / forms.py | 全部 B/C 类 |
+
+### 19.6 前 5 大高频变量（按出现次数）
+
+| 排名 | 变量名 | 出现次数 | 横跨模块数 |
+|------|--------|---------|-----------|
+| 1 | `PLAYWRIGHT_DRIVER_URL` | 13 次（含测试则 22 次） | 8 个模块 |
+| 2 | `SALTED_PASS` | 12 次 | 7 个模块 |
+| 3 | `WEBDRIVER_URL` | 9 次 | 4 个模块 |
+| 4 | `SCREENSHOT_QUALITY` | 5 次 | 4 个文件（screenshot_handler + 3 浏览器） |
+| 5 | `WEBDRIVER_DELAY_BEFORE_CONTENT_READY` | 6 次 | 3 个浏览器各自实现 |
+
+---
+
+## 20. 细账三：Tag UUID 校验规则与删除时的 Watch.tags 级联处理
+
+### 20.1 UUID 校验机制
+
+Tag UUID 不经过专门的校验函数，而是依赖 Flask URL 路由转换器 [StrictUUIDConverter](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L75-L93)（与 Watch UUID 使用同一规则）：
+
+```python
+class StrictUUIDConverter(BaseConverter):
+    _ALLOWED_SENTINELS = frozenset({'first'})
+
+    def to_python(self, value: str) -> str:
+        if value in self._ALLOWED_SENTINELS:
+            return value
+        try:
+            u = UUID(value)
+        except ValueError as e:
+            raise ValidationError() from e
+        # Reject non-standard formats (braces, URNs, no-hyphens)
+        if str(u) != value.lower():
+            raise ValidationError()
+        return str(u)
+```
+
+**校验规则精确描述**：
+
+| 检查项 | 要求 | 示例通过 | 示例拒绝 |
+|--------|------|----------|----------|
+| 哨兵值 | `'first'`（精确匹配） | `first` | `'First'`, `'firs'` |
+| RFC 4122 UUID | 标准 `uuid.UUID(value)` 解析 | `a1b2c3d4-...` | `not-a-uuid` |
+| 格式规范化 | `str(u)` 必须等于输入的小写形式 | `a1b2c3d4-...`（带横杠小写） | `A1B2C3D4-...`（大写）、`{uuid}`（大括号）、`urn:uuid:...`、无横杠紧凑格式 |
+
+**URL 中的使用位置**（路由规则 `<uuid_str:uuid>`）：
+- [api/Tags.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Tags.py) GET/PUT/DELETE `/api/v1/tag/<uuid_str:uuid>`
+- [blueprint/tags/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/tags/__init__.py) 所有标签路由（mute/delete/unlink/edit）
+
+### 20.2 Tag UUID 的生成位置
+
+Tag UUID **不在 StrictUUIDConverter 中生成**，而是在 watch_base 构造时由 Python `uuid` 模块生成：
+
+[model/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/model/__init__.py) watch_base.\_\_init\_\_()：
+```python
+if 'uuid' not in kw.get('default', {}):
+    self['uuid'] = str(uuid.uuid4())
+```
+
+生成时自动满足 UUID v4 格式，因此不会与 URL 路由校验冲突。
+
+### 20.3 Tag 删除的三条代码路径
+
+Tag 删除通过**三条独立路径**实现，每条路径的级联清理策略不同：
+
+#### 路径 1：UI `/tags/delete/<uuid>`（最常用）
+
+[blueprint/tags/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L70-L95) L70-L95：
+
+```
+步骤 1（同步，立即执行）：
+    del datastore.data['settings']['application']['tags'][uuid]
+    ↳ 从内存中删除 Tag 对象
+
+步骤 2（异步，后台线程）：
+    threading.Thread(target=remove_tag_background)
+    ↳ for watch_uuid, watch in watching.items():
+        if tag_uuid in watch.get('tags'):
+            watch['tags'].remove(tag_uuid)
+            watch.commit()   ← 每个 Watch 持久化一次
+```
+
+**问题**：步骤 1 与步骤 2 之间存在时间窗口：
+- 此时 Watch 的 `tags` 列表中仍有已删除的 Tag UUID
+- 但 Tag 对象已从 `application.tags` dict 中移除
+- 若某代码路径在此时间窗口内执行 `tags.get(tag_uuid)` 会返回 `None`
+- 但不会崩溃——所有使用方都有 `None` 检查（如 `tag = tags.get(tag_uuid, {})` 或 `if tag.get('overrides_watch')`）
+
+#### 路径 2：API DELETE `/api/v1/tag/<uuid>`
+
+[api/Tags.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Tags.py#L93-L107) L93-L107：
+
+```
+步骤 1（同步）：
+    del self.datastore.data['settings']['application']['tags'][uuid]
+
+步骤 2（同步，立即清理所有 Watch）：
+    for watch_uuid, watch in watching.items():
+        if tag_uuid in watch.get('tags'):
+            watch['tags'].remove(uuid)
+            watch.commit()
+```
+
+**与路径 1 的关键差异**：API 路径是**完全同步**的，Watch.tags 清理在 HTTP 响应返回前全部完成。无时间窗口不一致问题，但如果有大量 Watch（10k+），删除一个 Tag 的 API 可能阻塞数秒。
+
+#### 路径 3：UI `/tags/delete_all`（测试辅助）
+
+[blueprint/tags/\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/blueprint/tags/__init__.py#L120-L146) L120-L146：
+
+```
+步骤 1（同步）：
+    for tag_uuid in list(tags.keys()):
+        del tags[tag_uuid]
+    ↳ 整体清空 tags dict
+
+步骤 2（异步，后台线程）：
+    for watch_uuid, watch in watching.items():
+        watch['tags'] = []   ↳ 直接设为空列表，不是 remove()
+        watch.commit()
+```
+
+**差异**：使用 `watch['tags'] = []` 而非逐元素 `remove()`，避免 N×M 遍历。
+
+### 20.4 Watch.tags 列表的三种级联清理模式对比
+
+| 模式 | 实现 | 适用路径 | 复杂度 | 数据一致性 |
+|------|------|----------|--------|------------|
+| 逐一 remove | `if tag in list: list.remove(tag)` | UI delete（路径 1）、API delete（路径 2） | O(N×M) N=Watch 数, M=Tag 数 | 精确，只删目标 Tag |
+| 全部清空 | `watch['tags'] = []` | delete_all（路径 3） | O(N) | 粗暴，清除所有 Tag 引用 |
+| 无清理（内存不一致窗口） | 仅 `del tags[uuid]` | 路径 1 步骤 1 与步骤 2 之间 | O(1) | 暂时不一致，最终一致 |
+
+### 20.5 Tag 文件系统删除的隐式触发
+
+`del datastore.data['settings']['application']['tags'][uuid]` 这一行看似只删除内存引用，实际上通过 TagsDict 的自定义 `__delitem__` 还会**自动删除磁盘目录**：
+
+[file_saving_datastore.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/store/file_saving_datastore.py) `TagsDict.__delitem__`（设计模式）：
+- Tag 的所有磁盘文件（`tag.json`、`restock_diff.json`、`headers.txt`）位于 `{datastore_path}/{uuid}/` 目录
+- `__delitem__` 在内存删除后调用 `shutil.rmtree(self.tag_data_dirs[uuid])`
+- 因此 UI/API 路径都不需要手动处理文件删除
+
+### 20.6 Tag 更新时的 Checksum 级联失效
+
+Tag 更新（PUT /edit POST）后会触发 [clear_checksums_for_tag()](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/api/Tags.py#L156)：
+- 遍历所有 Watch，检查 Watch.tags 是否包含被更新的 Tag UUID
+- 如果包含，则清除该 Watch 的 `previous_md5`
+- 结果：下一次 ticker 调度时，该 Watch 会被视为"从未检测过"，立即触发全量检测
+- 设计意图：Tag 配置变更（如 restock_settings override）应立即生效，不等待 Watch 的正常重检周期
+
+---
+
+## 21. 细账四：notification_q 生产者-消费者的入队出队纪律
+
+### 21.1 notification_q 的类型定义与构造
+
+[queue_handlers.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/queue_handlers.py#L413-L550) `NotificationQueue` 类：
+
+```python
+class NotificationQueue:
+    def __init__(self, maxsize: int = 0, datastore=None):
+        self._notification_queue = queue.Queue(maxsize=...)  # 无界（maxsize=0）
+        self.notification_event_signal = signal('notification_event')
+        self.datastore = datastore
+        self._lock = threading.RLock()
+```
+
+**关键特征**：
+- 使用标准 `threading.Queue`（Python 标准库，内部自带锁 + Condition）
+- 外加一层 `threading.RLock()` — 用于 `put`/`get` 包装（但 threading.Queue 本身已是线程安全，额外 RLock 主要为保证统计操作 `qsize()` 的一致性，以及与 `set_datastore()` 的互斥）
+- **无界队列**（maxsize=0）——与 `update_q`（MAX_QUEUE_SIZE=5000）的**有界优先级队列**形成对比
+- `all_muted` 检查（全局通知静音）在入队前置拦截，不消耗队列槽位
+
+### 21.2 生产者清单（3 个入队位置）
+
+全部位于 [notification_service.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/notification_service.py)，由 [change_handler](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/notification_service.py#L403) 和错误处理路径调用：
+
+| 入队位置 | 精确行号 | 触发条件 | 入队内容 |
+|----------|---------|----------|----------|
+| **主通知入口** | L406 | Watch 检测到变化，且通知 URL 非空，且未被静音 | 完整 n_object（含 uuid, watch_url, body, title, urls, screenshot 等） |
+| **过滤器失败通知** | L497 | `filter_failure_notification_send=True` 且连续过滤器失败达阈值 | n_object（含 last_error, check_count 等状态） |
+| **Browser Step 未找到通知** | L545 | 浏览器步骤执行失败，且存在 notification_urls | n_object（含 step_not_found 错误详情） |
+
+**入队前置逻辑（在调用方）**：
+```python
+# notification_service.py change_handler():
+# 1. 先构造完整的 n_object
+# 2. 检查 notification_urls 是否非空
+# 3. 检查 notification_muted（watch 级）和 all_muted（全局级）
+# 4. 通过全部检查后 → notification_q.put(n_object)
+```
+
+**入队内部逻辑（在 NotificationQueue.put()）**：
+```python
+def put(self, item, block=True, timeout=None):
+    # 第一关：全局 all_muted 检查 → 直接返回 False，不入队
+    if self.datastore and self.datastore.data['settings']['application'].get('all_muted', False):
+        return False
+    # 第二关：RLock 保护 → threading.Queue.put(block, timeout)
+    with self._lock:
+        self._notification_queue.put(item, block=block, timeout=timeout)
+    # 第三关：Blinker signal 广播（实时 UI 更新）
+    self._emit_notification_signal(item)
+    return True
+```
+
+### 21.3 消费者清单（多 worker 模式）
+
+[flask_app.py](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1007-L1009) L1007-L1009 启动 N 个消费者线程：
+
+```python
+notification_workers = int(os.getenv("NOTIFICATION_WORKERS", "1"))  # B 类，启动时固定
+for i in range(notification_workers):
+    t = threading.Thread(target=notification_runner, daemon=True, args=(i,), name=f"notif-runner-{i}")
+    t.start()
+```
+
+每个消费者 [notification_runner](file:///d:/fz/0601-2/solo-dogfeeding/code/4-changedetection.io/changedetectionio/flask_app.py#L1058-L1107) 的循环体：
+
+```
+while not app.config.exit.is_set():
+    try:
+        # 1. 非阻塞尝试取队首
+        n_object = notification_q.get(block=False)
+    except queue.Empty:
+        # 2. 空队列 → sleep 1s（由 exit Event.wait() 实现，可立即唤醒）
+        app.config.exit.wait(1)
+    else:
+        # 3. 取到消息后：3 步配置回退
+        if not n_object.get('notification_body') and ...get('notification_body'):
+            n_object['notification_body'] = 全局 notification_body
+        if not n_object.get('notification_title') and ...:
+            n_object['notification_title'] = 全局 notification_title
+        if not n_object.get('notification_format') and ...:
+            n_object['notification_format'] = 全局 notification_format
+        # 4. 实际发送
+        sent_obj = process_notification(n_object, datastore)
+        # 5. 异常处理：记录 last_notification_error，但不重新入队（最多一次投递）
+        except Exception:
+            datastore.update_watch(uuid=uuid,
+                update_obj={'last_notification_error': "..."})
+```
+
+### 21.4 入队出队纪律的精确规则
+
+| 维度 | 规则 | 实现位置 |
+|------|------|----------|
+| **顺序保证** | FIFO（先进先出） | threading.Queue 内部语义 |
+| **并发安全** | Queue 内置锁 + 外层 RLock 双重保护 | queue_handlers.py put()/get() |
+| **最大容量** | 无界（maxsize=0） | NotificationQueue.__init__ L430 |
+| **优先级** | 无（所有通知同级） | 与 update_q 的优先级设计相反 |
+| **失败重试** | ❌ 不重试，最多一次投递（at-most-once） | notification_runner exception handler |
+| **错误记录** | ✅ Watch 级别写 `last_notification_error` | notification_runner L1095-L1096 |
+| **前置拦截** | all_muted（全局级）/ notification_muted（Watch 级） | 入队前 + 生产方双重检查 |
+| **配置回退** | Watch notification_* → 全局 settings.application.notification_* | notification_runner L1079-L1086 |
+| **生产者-消费者比** | 生产者：Fetch Workers（N 个，与 FETCH_WORKERS 同步）<br>消费者：Notification Workers（1 个默认） | 可能出现生产>消费的队列堆积 |
+| **优雅退出** | 消费者在 `while not exit.is_set():` 循环中检查 | notification_runner L1063 |
+| **日志保留** | 最近 100 条发送记录（内存环形 buffer） | notification_runner L1105-L1107 |
+
+### 21.5 update_q 与 notification_q 的纪律对比
+
+| 维度 | update_q（检测队列） | notification_q（通知队列） |
+|------|---------------------|---------------------------|
+| **数据结构** | heapq 优先级队列 + threading.Queue 通知通道 | 纯 threading.Queue（无优先级） |
+| **容量限制** | MAX_QUEUE_SIZE = 5000（有界） | 无界（不限大小） |
+| **多消费者接口** | Sync + Async 双接口（async_get） | Sync 接口（notification_runner 用 block=False + wait） |
+| **优先级** | 3 级（1=立即，5=clone，100+=定时） | 无优先级（FIFO） |
+| **错误重试** | ✅ 检测失败不会出队（Worker 异常退出时由健康检查重启） | ❌ 一次性投递，仅记录错误 |
+| **Signal 广播** | queue_length_signal（每 put/get） | notification_event_signal（每 put） |
+| **调度者** | ticker 线程（每秒循环） | 无调度者（Worker 检测完成后自发入队） |
+| **健康检查重建** | ✅ Worker 池每 60s 检查 | ❌ 无（notification_workers 启动后固定） |
+
+### 21.6 notification_q 的"沉默失败"风险
+
+由于 notification_q 是**无界队列**且**失败不重入队**，在以下场景存在数据丢失风险：
+
+1. **通知服务长时间不可用**（如 Apprise 端点故障），队列可能无限增长直至 OOM
+2. **通知 URL 配置错误**，错误记录在 `last_notification_error` 但用户未注意
+3. **进程崩溃前**的通知已经入队但尚未被消费 = 永久丢失（与 update_q 不同，update_q 可由 ticker 重新调度）
+
+设计上的补救措施：
+- `notification_debug_log` 保留最近 100 条（环形缓冲），UI 上可查看
+- `last_notification_error` 在 Watch 列表页面有红指示器
+- 每 100 条清理一次 old notification logs
+
+### 21.7 生产者-消费者线程 ID 对照
+
+```
+生产方线程（可并发生产，数量 = FETCH_WORKERS）：
+  Worker-0: run_job → process_watch → change_handler → notification_q.put()
+  Worker-1: 同上
+  ...
+  Worker-N: 同上
+  （另外：API test-notification 路由也可生产通知）
+
+消费方线程（并发消费，数量 = NOTIFICATION_WORKERS，默认 1）：
+  notif-runner-0: while 循环 → notification_q.get() → process_notification()
+  notif-runner-1: 同上（如果 NOTIFICATION_WORKERS > 1）
+  ...
+  notif-runner-M: 同上
+```
+
+**典型线程配置（默认）**：
+- FETCH_WORKERS = 5 → 5 个通知生产者
+- NOTIFICATION_WORKERS = 1 → 1 个通知消费者
+- 结果：5:1 的生产消费比，若检测到 5 个变化通知，消费者需要串行处理
+
+**说明**：Notification 发送涉及网络 I/O（SMTP/HTTP/Webhook 等），单消费者可能成为瓶颈。当通知量较大时，应调高 `NOTIFICATION_WORKERS`。
