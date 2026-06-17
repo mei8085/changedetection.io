@@ -25,13 +25,18 @@
 | `proxies.json` 代理 URL | ❌ 不暴露 | ✅ 完整明文 | ✅ 明文 | ✅ 明文 |
 | `headers`（全局） | ❌ 不暴露 | ✅ 完整明文 | ✅ 明文 | ✅ 明文 |
 | `headers`（Watch级） | ⚠️ 明文（`/api/v1/watch/<uuid>`） | ✅ 完整明文 | ✅ 明文 | ✅ 明文 |
+| `browser_steps[]`³ | ⚠️ 明文（`/api/v1/watch/<uuid>`） | ✅ 完整明文（编辑页） | ✅ 明文 | ✅ 明文 |
 | OpenAPI spec | 🌐 **公开无鉴权** | — | — | — |
 
-> **图例**: ✅ 明文 / ⚠️ 部分暴露 / ❌ 不暴露 / 🌐 完全公开
+> **图例**: ✅ 明文 / ⚠️ 部分暴露 / ❌ 不暴露 / 🌐 完全公开 / ❓ 未包含
 
 > **注1**: API 鉴权可通过 `api_access_token_enabled` 开关关闭，关闭后所有数据 API 完全公开。
 >
 > **注2**: Watch 级 `proxy` 字段存储的是 **proxy 选择名/key**（如 `"ui-0myproxy"`），不是完整代理 URL，因此不直接包含凭据。但通过 key 可在前端或 API 客户端反查对应的代理 URL。
+>
+> **注3**: `browser_steps[]` 中可能包含表单密码、API Key、JavaScript 代码等敏感操作，详见 3.5 节。
+>
+> **注4**: `proxies.json` 在备份中 **未包含**，备份函数只显式添加了 `changedetection.json`。
 
 ---
 
